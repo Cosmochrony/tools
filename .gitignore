@@ -1,0 +1,12 @@
+# Credentials — never commit. This repository is public.
+# tools/.env holds ZENODO_TOKEN, GH_TOKEN, NETLIFY_PAT and the ORCID keys.
+.env
+.env.*
+!.env.example
+
+# Local environments and editor state
+.venv/
+.idea/
+__pycache__/
+*.pyc
+.DS_Store
