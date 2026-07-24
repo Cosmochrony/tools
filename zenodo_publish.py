@@ -559,6 +559,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Parse LaTeX only, do not upload")
     parser.add_argument("--update", action="store_true", help="Update metadata in place (same DOI, no new version — PDF unchanged; use without flag for new version with PDF)")
     parser.add_argument("--no-cascade", action="store_true", help="Skip DOI cascade after publish")
+    parser.add_argument("--skip-checks", action="store_true",
+                        help="Bypass the pre-deposit check battery (not recommended)")
     args = parser.parse_args()
 
     paper_dir = args.paper_dir.resolve()
@@ -609,6 +611,30 @@ def main():
     if args.dry_run:
         print("\n[Dry run] Stopping here — no upload performed.")
         return
+
+    # ── Pre-deposit gate ───────────────────────────────────────────────────────
+    # A published Zenodo record cannot be deleted, so refuse to upload an artefact
+    # the battery rejects. An unavailable checker warns but never blocks a
+    # legitimate deposit; only actual findings do.
+    if not args.skip_checks:
+        try:
+            from predeposit_check import check as _predeposit_check
+            result = _predeposit_check(paper_dir, deposit=True)
+            problems = result["problems"]
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Warning: pre-deposit checks unavailable ({exc}); continuing")
+        else:
+            for note in result["notes"]:
+                print(f"  -- {note}")
+            if problems:
+                print("\nPre-deposit checks FAILED:")
+                for prob in problems:
+                    print(f"  !! {prob}")
+                sys.exit(
+                    "\nRefusing to deposit. Fix the above, or re-run with --skip-checks "
+                    "if you have judged them not to apply."
+                )
+            print("  Pre-deposit checks: PASS")
 
     # ── Find PDF ───────────────────────────────────────────────────────────────
     pdf_path = find_pdf(paper_dir)
