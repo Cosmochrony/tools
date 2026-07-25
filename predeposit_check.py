@@ -285,10 +285,19 @@ def check(paper_dir: Path, deposit: bool = False) -> dict:
     # ── abstract, as Zenodo will receive it ────────────────────────────────────
     try:
         sys.path.insert(0, str(REPO_ROOT / "tools"))
-        from zenodo_publish import extract_abstract, extract_macros, expand_macros
+        from zenodo_publish import (
+            extract_abstract,
+            extract_macros,
+            expand_macros,
+            resolve_inputs,
+        )
 
-        macros = extract_macros(raw_tex)
-        body = raw_tex
+        # Mirror the publisher exactly: papers routinely keep the abstract in a
+        # separate file pulled in with \input{abstract}, so the abstract (and any
+        # macro) must be sought in the fully-resolved source, not the main file alone.
+        full = resolve_inputs(raw_tex, tex_path.parent)
+        macros = extract_macros(full)
+        body = full
         doc = body.find(r"\begin{document}")
         if doc >= 0:
             body = body[:doc] + expand_macros(body[doc:], macros)
