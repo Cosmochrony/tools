@@ -459,8 +459,8 @@ class ZenodoClient:
 
 # ── BibTeX DOI cascade ─────────────────────────────────────────────────────────
 
-def update_bib_file(bib_path: Path, bib_key: str, doi: str) -> bool:
-    """Update \\doi{} inside the note field for bib_key. Returns True if changed."""
+def update_bib_file(bib_path: Path, bib_key: str, doi: str) -> tuple[bool, bool]:
+    """Return ``(found, changed)`` after checking one bibliography entry."""
     text = bib_path.read_text(encoding="utf-8")
     entry_re = re.compile(
         r"(@\w+\{" + re.escape(bib_key) + r"\b.*?\n\})",
@@ -468,23 +468,29 @@ def update_bib_file(bib_path: Path, bib_key: str, doi: str) -> bool:
     )
     m = entry_re.search(text)
     if not m:
-        return False
+        return False, False
     updated = re.sub(r"\\doi\{[^}]*\}", rf"\\doi{{{doi}}}", m.group(1))
     if updated == m.group(1):
-        return False
+        return True, False
     bib_path.write_text(text[: m.start()] + updated + text[m.end() :], encoding="utf-8")
-    return True
+    return True, True
 
 
 def doi_cascade(repo_root: Path, bib_key: str, doi: str):
     updated: list[Path] = []
+    found: list[Path] = []
     for bib in sorted(repo_root.rglob("cosmochrony-bibliography.bib")):
-        if update_bib_file(bib, bib_key, doi):
+        is_found, is_changed = update_bib_file(bib, bib_key, doi)
+        if is_found:
+            found.append(bib.relative_to(repo_root))
+        if is_changed:
             updated.append(bib.relative_to(repo_root))
     if updated:
         print(f"  Updated {len(updated)} bibliography file(s):")
         for p in updated:
             print(f"    {p}")
+    elif found:
+        print(f"  Found key in {len(found)} bibliography file(s); DOI already current.")
     else:
         print(f"  Warning: key '{bib_key}' not found in any cosmochrony-bibliography.bib")
 
