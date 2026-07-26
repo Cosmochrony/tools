@@ -523,7 +523,8 @@ def get_git_branch(paper_dir: Path) -> str | None:
 
 def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
                    version: str | None = None,
-                   publication_type: str | None = None) -> dict:
+                   publication_type: str | None = None,
+                   notes: str | None = None) -> dict:
     meta: dict = {
         "title": title,
         "description": abstract,
@@ -536,6 +537,8 @@ def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
     }
     if version:
         meta["version"] = version
+    if notes:
+        meta["notes"] = notes
     if web_url:
         meta["related_identifiers"] = [{
             "identifier": web_url,
@@ -607,6 +610,8 @@ def main():
     print(f"  Abstract: {abstract[:90].replace(chr(10), ' ')}…")
     print(f"  Keywords: {keywords}")
     print(f"  Version:  {version or '(none)'}")
+    if config.get("notes"):
+        print(f"  Notes:    {config['notes']}")
 
     if args.dry_run:
         print("\n[Dry run] Stopping here — no upload performed.")
@@ -662,7 +667,8 @@ def main():
         client.edit_deposition(dep_id)
 
         metadata = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
-                                  publication_type=config.get("publication_type"))
+                                  publication_type=config.get("publication_type"),
+                                  notes=config.get("notes"))
         print("Setting metadata…")
         client.set_metadata(dep_id, metadata)
 
@@ -699,7 +705,8 @@ def main():
     client.upload_file(dep, pdf_path)
 
     metadata = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
-                              publication_type=config.get("publication_type"))
+                              publication_type=config.get("publication_type"),
+                              notes=config.get("notes"))
     print("Setting metadata…")
     client.set_metadata(dep_id, metadata)
 
