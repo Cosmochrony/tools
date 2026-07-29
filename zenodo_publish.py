@@ -9,6 +9,10 @@ Config file required at paper_dir/zenodo.json:
         "bib_key":   "Beau2026b",                            <- BibTeX key in cosmochrony-bibliography.bib
         "web_url":   "https://cosmochrony.org/science/bell/", <- associated web page
         "main_tex":  "tex/Bell.tex",                          <- optional, auto-detected otherwise
+        "code_url":  "https://github.com/Cosmochrony/bell-paper/tree/main/code",
+                                                              <- optional; only needed when the paper has a
+                                                                 code/ directory and its git remote is not the
+                                                                 GitHub repo hosting it
         "zenodo_id": null,                                    <- filled automatically after first pub
         "doi":       null                                     <- filled automatically
     }
@@ -527,10 +531,42 @@ def get_git_branch(paper_dir: Path) -> str | None:
         return None
 
 
+def resolve_code_url(paper_dir: Path, config: dict) -> str:
+    """Return the GitHub URL of the paper's code directory, or "" when it has none.
+
+    A paper that ships reproduction code must expose it from its Zenodo record, so a reader
+    reaching the deposited PDF can reach the code without guessing a repository name. The URL
+    comes from zenodo.json's "code_url"; when that is absent it is derived from the paper's own
+    git remote, which is the normal case and keeps existing configs working. A paper that has a
+    code/ directory but no resolvable URL is a configuration error, not a silent skip.
+    """
+    code_url = (config.get("code_url") or "").strip()
+    has_code_dir = (paper_dir / "code").is_dir()
+    if code_url:
+        return code_url
+    if not has_code_dir:
+        return ""
+
+    remote = subprocess.run(
+        ["git", "-C", str(paper_dir), "config", "--get", "remote.origin.url"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    slug = re.sub(r"^(?:https://github\.com/|git@github\.com:)|(?:\.git)$", "", remote)
+    if remote and re.fullmatch(r"[\w.-]+/[\w.-]+", slug):
+        return f"https://github.com/{slug}/tree/main/code"
+
+    sys.exit(
+        f"Error: {paper_dir.name} has a code/ directory but no resolvable code URL.\n"
+        f"Its git remote is {remote or '(none)'}, which is not a GitHub repository.\n"
+        'Add "code_url": "https://github.com/Cosmochrony/<repo>/tree/main/code" to zenodo.json.'
+    )
+
+
 def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
                    version: str | None = None,
                    publication_type: str | None = None,
-                   notes: str | None = None) -> dict:
+                   notes: str | None = None,
+                   code_url: str | None = None) -> dict:
     meta: dict = {
         "title": title,
         "description": abstract,
@@ -545,13 +581,23 @@ def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
         meta["version"] = version
     if notes:
         meta["notes"] = notes
+    related: list[dict] = []
     if web_url:
-        meta["related_identifiers"] = [{
+        related.append({
             "identifier": web_url,
             "relation": "isSupplementedBy",
             "scheme": "url",
             "resource_type": "other",
-        }]
+        })
+    if code_url:
+        related.append({
+            "identifier": code_url,
+            "relation": "isSupplementedBy",
+            "scheme": "url",
+            "resource_type": "software",
+        })
+    if related:
+        meta["related_identifiers"] = related
     return meta
 
 
@@ -674,7 +720,17 @@ def main():
 
         metadata = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
                                   publication_type=config.get("publication_type"),
-                                  notes=config.get("notes"))
+                                  notes=config.get("notes"),
+                                  code_url=code_url)
+        # Zenodo's PUT replaces the whole metadata object, so an --update built only from the
+        # LaTeX and zenodo.json would silently drop every field maintained elsewhere — release
+        # notes set on the record are the usual casualty. Merge over the live metadata instead:
+        # rebuilt fields win, fields this script does not manage survive untouched.
+        live = (client.get_deposition(dep_id).get("metadata") or {})
+        dropped = sorted(set(live) - set(metadata))
+        metadata = {**live, **metadata}
+        if dropped:
+            print(f"  Preserved fields not managed by this script: {', '.join(dropped)}")
         print("Setting metadata…")
         client.set_metadata(dep_id, metadata)
 
@@ -712,7 +768,8 @@ def main():
 
     metadata = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
                               publication_type=config.get("publication_type"),
-                              notes=config.get("notes"))
+                              notes=config.get("notes"),
+                              code_url=code_url)
     print("Setting metadata…")
     client.set_metadata(dep_id, metadata)
 
