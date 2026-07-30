@@ -10,3 +10,20 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Common build-artefact baseline
+**/.DS_Store
+out/
+pdfs/
+media/
+**/__pycache__/
+*.py[cod]
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
