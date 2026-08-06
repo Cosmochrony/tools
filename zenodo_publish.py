@@ -123,6 +123,36 @@ def _replace_cmd_html(text: str, cmd: str, tag: str) -> str:
     return "".join(result)
 
 
+def _strip_texorpdfstring(text: str) -> str:
+    """\\texorpdfstring{latex}{plain} -> plain.
+
+    Uses extract_braced_at (depth-counting) rather than a `[^}]*` regex: the
+    latex argument routinely contains its own brace pairs once expand_macros
+    has run, since that function wraps every substitution in `{}` to preserve
+    TeX token boundaries (e.g. \\bstar -> {\\beta^*}). A non-recursive regex
+    stops at that inner `}` and leaves \\texorpdfstring unstripped, corrupting
+    downstream titles/abstracts (e.g. "delta-beta*delta-beta* Tension").
+    """
+    marker = r"\texorpdfstring"
+    result = []
+    pos = 0
+    while True:
+        idx = text.find(marker, pos)
+        if idx == -1:
+            result.append(text[pos:])
+            break
+        result.append(text[pos:idx])
+        try:
+            _latex_arg, after_first = extract_braced_at(text, idx + len(marker))
+            plain_arg, after_second = extract_braced_at(text, after_first)
+            result.append(plain_arg)
+            pos = after_second
+        except ValueError:
+            result.append(marker)
+            pos = idx + len(marker)
+    return "".join(result)
+
+
 def _apply_latex_subs(text: str, html: bool) -> str:
     """Apply common LaTeX → text/HTML substitutions (math already protected)."""
     # Non-breaking spaces
@@ -139,7 +169,7 @@ def _apply_latex_subs(text: str, html: bool) -> str:
         text = re.sub(r"\\textit\{([^}]*)\}", r"\1", text)
         text = re.sub(r"\\textbf\{([^}]*)\}", r"\1", text)
     # \texorpdfstring{latex}{plain} → plain
-    text = re.sub(r"\\texorpdfstring\{[^}]*\}\{([^}]*)\}", r"\1", text)
+    text = _strip_texorpdfstring(text)
     # \footnote{...} → remove
     text = re.sub(r"\\footnote\{[^}]*\}", "", text)
     # Title subtitle: \\[skip]\normalsize marks start of subtitle — drop subtitle for plain text
@@ -657,6 +687,7 @@ def main():
     # Version label: prefer the explicit semantic version in zenodo.json ("version": "1.1");
     # fall back to the git branch only for legacy configs that lack it.
     version = config.get("version") or get_git_branch(paper_dir)
+    code_url = resolve_code_url(paper_dir, config)
 
     print(f"  Title:    {title}")
     print(f"  Abstract: {abstract[:90].replace(chr(10), ' ')}…")
@@ -664,6 +695,8 @@ def main():
     print(f"  Version:  {version or '(none)'}")
     if config.get("notes"):
         print(f"  Notes:    {config['notes']}")
+    if code_url:
+        print(f"  Code:     {code_url}")
 
     if args.dry_run:
         print("\n[Dry run] Stopping here — no upload performed.")
