@@ -182,6 +182,12 @@ def _apply_latex_subs(text: str, html: bool) -> str:
     # Spacing commands
     text = re.sub(r"\\(?:quad|qquad|,|;|:)\b", " ", text)
     text = re.sub(r"\\(?:noindent|par|medskip|bigskip|smallskip|clearpage)\b\s*", "", text)
+    # \vspace{<dimen>}, \hspace{<dimen>} (and starred forms) → remove entirely,
+    # including the dimension argument: unlike \textbf{...} etc., the argument
+    # here is a length, not content, so the generic \cmd{arg}->arg fallback
+    # below would otherwise leak literal dimensions (e.g. "0.5em") into
+    # extracted text.
+    text = re.sub(r"\\[hv]space\*?\{[^}]*\}", "", text)
     # \text{...} family
     text = re.sub(r"\\text(?:rm|bf|it|sf|tt|sc|up|sl|md|normal|wider|bold)?\{([^}]*)\}", r"\1", text)
     # \textbf, \mathbf, etc. remaining
