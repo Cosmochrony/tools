@@ -155,6 +155,11 @@ def _strip_texorpdfstring(text: str) -> str:
 
 def _apply_latex_subs(text: str, html: bool) -> str:
     """Apply common LaTeX → text/HTML substitutions (math already protected)."""
+    # LaTeX double-quote ligatures (``text'') -> plain straight double quotes.
+    # This project's .tex convention is ``text'' (renders as curly quotes under
+    # pdflatex), but Zenodo's record fields are not LaTeX-typeset: left as-is,
+    # the literal backtick/apostrophe pairs show up verbatim on the record page.
+    text = text.replace("``", '"').replace("''", '"')
     # Non-breaking spaces
     text = text.replace("~", " ").replace(" ", " ")
     # Remove \cite variants
