@@ -73,6 +73,20 @@ def sh(cmd: str, cwd: Path | None = None) -> tuple[int, str]:
     return r.returncode, r.stdout.strip()
 
 
+def sh_raw(cmd: str, cwd: Path | None = None) -> tuple[int, str]:
+    """Like sh(), but preserves leading whitespace.
+
+    ``git status --porcelain`` encodes the index/worktree state in the first two
+    columns, so a plain ``.strip()`` eats the leading space of the *first* line
+    only. That silently truncates the first dirty path by one character, which
+    then fails the RELEASE_PATHS prefix test and is reported as an unrelated
+    change instead of an uncommitted release file. When the first dirty file is
+    the only modified release file, the guard passes a deposit it should refuse.
+    """
+    r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+    return r.returncode, r.stdout.rstrip("\n")
+
+
 def grep_count(pattern: str, path: Path) -> int | None:
     """Count matching lines, always with -a. None means grep produced no number."""
     rc, out = sh(f"grep -acE {json.dumps(pattern)} {json.dumps(str(path))}")
@@ -80,6 +94,29 @@ def grep_count(pattern: str, path: Path) -> int | None:
         return int(out)
     except ValueError:
         return None
+
+
+def read_pdf_metadata(path: Path) -> tuple[dict[str, str], str | None]:
+    """Read PDF document information through Poppler's structured output."""
+    try:
+        result = subprocess.run(
+            ["pdfinfo", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return {}, str(exc)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"pdfinfo exited {result.returncode}"
+        return {}, detail
+
+    metadata: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            metadata[key.strip()] = value.strip()
+    return metadata, None
 
 
 def is_dirty(path: Path, repo: Path) -> bool:
@@ -133,7 +170,7 @@ def check(paper_dir: Path, deposit: bool = False) -> dict:
                 "— never deposit a PDF whose source exists only locally"
             )
 
-    _, status = sh("git status --porcelain", paper_dir)
+    _, status = sh_raw("git status --porcelain", paper_dir)
     dirty = [
         line[3:]
         for line in status.splitlines()
@@ -277,9 +314,11 @@ def check(paper_dir: Path, deposit: bool = False) -> dict:
 
     # ── PDF metadata ───────────────────────────────────────────────────────────
     if pdf and pdf.exists():
-        data = pdf.read_bytes()
+        metadata, metadata_error = read_pdf_metadata(pdf)
+        if metadata_error:
+            problems.append(f"PDF metadata unreadable: {metadata_error}")
         for field in ("Title", "Author"):
-            if not re.search((r"/%s\s*\((.{4,}?)\)" % field).encode(), data, re.S):
+            if not metadata.get(field, "").strip():
                 problems.append(f"PDF metadata /{field} missing or empty")
 
     # ── abstract, as Zenodo will receive it ────────────────────────────────────
