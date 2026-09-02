@@ -671,6 +671,18 @@ def main():
         )
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    # A retired paper has no live deposit: its content was absorbed elsewhere and its own record was
+    # withdrawn. Its zenodo_id is therefore null, which would otherwise make this script create a
+    # spurious NEW deposition for material that is already published under another DOI.
+    if config.get("retired"):
+        superseded = config.get("superseded_by")
+        sys.exit(
+            f"Error: {paper_dir.name} is marked retired in zenodo.json and must not be deposited.\n"
+            + (f"Reason: {config['retired_reason']}\n" if config.get("retired_reason") else "")
+            + (f"Cite {superseded} instead.\n" if superseded else "")
+        )
+
     # Anchor the repo root to this script's location, not paper_dir.parent, so the
     # central pdfs/ archive and the DOI cascade work for nested paper directories
     # (e.g. condensed-matter/quantum-fisher-witness/) as well as top-level ones.
