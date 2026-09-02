@@ -43,6 +43,46 @@ def _token():
 TOKEN = _token()
 
 
+def _refresh_targets():
+    """Record ids whose cache entry must be bypassed this run.
+
+    A deposit leaves one record stale, not all of them. Refreshing everything costs 119 throttled
+    requests: measured at roughly 40 minutes, and Zenodo answered 34 of them with an error, so the
+    whole-corpus refresh produces a *worse* ledger than the cached run it replaced. Prefer naming the
+    record or the paper directory that was just published.
+
+        --refresh 19787221            one record
+        --refresh admissibility/o29   the record named by that paper's zenodo.json
+        --refresh all                 every record; slow and rate-limited, use deliberately
+    """
+    targets = set()
+    argv = sys.argv
+    for i, arg in enumerate(argv):
+        if arg != "--refresh":
+            continue
+        value = argv[i + 1] if i + 1 < len(argv) else None
+        if value is None or value.startswith("-"):
+            return {"__all__"}                      # bare --refresh keeps the old meaning
+        if value == "all":
+            return {"__all__"}
+        if value.isdigit():
+            targets.add(value)
+            continue
+        try:                                        # a paper directory
+            with open(os.path.join(ROOT, value, "zenodo.json"), encoding="utf-8") as fh:
+                targets.add(str(json.load(fh).get("zenodo_id")))
+        except Exception:
+            sys.exit(f"--refresh {value}: not a record id and not a paper directory with a zenodo.json")
+    return targets
+
+
+REFRESH = _refresh_targets()
+
+
+def _must_refresh(key):
+    return "__all__" in REFRESH or key in REFRESH
+
+
 def zenodo_latest(rec_id):
     """Return (version, publication_date, title, latest_id) for the latest version of a record.
 
@@ -50,10 +90,7 @@ def zenodo_latest(rec_id):
     with exponential back-off, and cached on disk so a rerun costs nothing.
     """
     key = str(rec_id)
-    # A deposit made after the cache was written leaves a stale version behind, which reports a
-    # correctly updated page as VERSION_MISMATCH and could equally mask a real one. Pass --refresh
-    # after publishing, or delete the entry.
-    if key in CACHE and "--refresh" not in sys.argv:
+    if key in CACHE and not _must_refresh(key):
         c = CACHE[key]
         return c["version"], c["date"], c["title"], c["latest_id"]
 
@@ -73,6 +110,7 @@ def zenodo_latest(rec_id):
             CACHE[key] = {"version": res[0], "date": res[1], "title": res[2], "latest_id": res[3]}
             with open(CACHE_PATH, "w", encoding="utf-8") as fh:
                 json.dump(CACHE, fh)
+            time.sleep(1.1)   # pace the NETWORK, not the loop: a cache hit must cost nothing
             return res
         except Exception as exc:
             last = exc
@@ -192,7 +230,6 @@ def main():
             entry["error"] = str(exc)
             ledger.append(entry)
             continue
-        time.sleep(1.1)
 
         entry.update({"zenodo_version": version, "zenodo_date": pub_date,
                       "zenodo_title": title, "latest_record": latest_id})
