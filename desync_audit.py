@@ -50,7 +50,10 @@ def zenodo_latest(rec_id):
     with exponential back-off, and cached on disk so a rerun costs nothing.
     """
     key = str(rec_id)
-    if key in CACHE:
+    # A deposit made after the cache was written leaves a stale version behind, which reports a
+    # correctly updated page as VERSION_MISMATCH and could equally mask a real one. Pass --refresh
+    # after publishing, or delete the entry.
+    if key in CACHE and "--refresh" not in sys.argv:
         c = CACHE[key]
         return c["version"], c["date"], c["title"], c["latest_id"]
 
