@@ -101,10 +101,25 @@ def last_commit_date(path):
     return out.stdout.strip() or None
 
 
-def stated_versions(path):
+def declared_version(path):
+    """The version the page declares for its OWN paper, or None.
+
+    A page mentions other papers' versions all the time, so a bare scan for "version N.N" cannot
+    decide synchronisation. Only three places speak for the page itself, in decreasing authority:
+    the release banner, the Quick-facts version field, and the citation line.
+    """
     with open(path, encoding="utf-8", errors="replace") as fh:
         text = fh.read()
-    return sorted(set(re.findall(r"version\s+(\d+\.\d+(?:\.\d+)?)", text, flags=re.I)))
+    for pattern in (
+        r'data-release-version="([0-9][0-9.]*)"',
+        r'<div class="k">\s*(?:Version|Version courante|Current version|Version actuelle)\s*</div>'
+        r'\s*<div class="v">\s*(?:[^<]*?\bversion\s+)?([0-9][0-9.]*)',
+        r'\bversion\s+([0-9][0-9.]*)\s*,\s*20\d\d',
+    ):
+        m = re.search(pattern, text, flags=re.I)
+        if m:
+            return m.group(1)
+    return None
 
 
 def main():
@@ -131,6 +146,37 @@ def main():
         web_url = zj.get("web_url")
         entry = {"paper": rel_paper, "web_url": web_url, "zenodo_id": rec_id}
 
+        # A retired paper deliberately has no live record: its content was absorbed elsewhere and
+        # its own deposit was withdrawn. That is not the same as work never deposited, and its
+        # signpost page still has to point at the superseding record, so check that instead.
+        if zj.get("retired"):
+            entry["status"] = "RETIRED"
+            entry["superseded_by"] = zj.get("superseded_by")
+            entry["retired_reason"] = zj.get("retired_reason")
+            problems = []
+            if not zj.get("superseded_by"):
+                problems.append("zenodo.json declares retired without superseded_by")
+            if zj.get("zenodo_id") or zj.get("doi"):
+                problems.append("zenodo.json still names a record while marked retired")
+            pages = page_paths(web_url)
+            if not pages:
+                problems.append("no signpost page for the retired note")
+            for p in pages:
+                text = open(p, encoding="utf-8", errors="replace").read()
+                rel = os.path.relpath(p, SITE)
+                if zj.get("superseded_by") and zj["superseded_by"] not in text:
+                    problems.append(f"{rel} does not name the superseding DOI")
+                if "canonical" not in text:
+                    problems.append(f"{rel} has no canonical link to the superseding page")
+                if re.search(r'name="robots"[^>]*content="[^"]*\bindex\b', text):
+                    problems.append(f"{rel} is still indexable")
+            entry["problems"] = problems
+            if problems:
+                entry["status"] = "RETIRED_DEFECT"
+            ledger.append(entry)
+            print(f"  .. {rel_paper}: {entry['status']}", file=sys.stderr)
+            continue
+
         if not rec_id:
             entry["status"] = "NOT_DEPOSITED"
             ledger.append(entry)
@@ -156,17 +202,31 @@ def main():
 
         page_info = []
         stale = False
+        mismatch = unstated = False
         for p in pages:
             cd = last_commit_date(p)
-            sv = stated_versions(p)
+            dv = declared_version(p)
             page_stale = bool(cd and pub_date and cd < pub_date)
-            version_mismatch = bool(version and sv and version not in sv)
+            page_mismatch = bool(version and dv and dv != version)
+            page_unstated = bool(version and dv is None)
             stale = stale or page_stale
+            mismatch = mismatch or page_mismatch
+            unstated = unstated or page_unstated
             page_info.append({"page": os.path.relpath(p, SITE), "last_commit": cd,
-                              "stated_versions": sv, "older_than_deposit": page_stale,
-                              "version_not_stated": version_mismatch})
+                              "declared_version": dv, "older_than_deposit": page_stale,
+                              "version_mismatch": page_mismatch,
+                              "version_unstated": page_unstated})
         entry["pages"] = page_info
-        entry["status"] = "STALE" if stale else "OK"
+        # A page can carry today's commit date and still name the wrong version, so the date
+        # predicate alone does not enforce the synchronisation rule this audit exists to check.
+        if stale:
+            entry["status"] = "STALE"
+        elif mismatch:
+            entry["status"] = "VERSION_MISMATCH"
+        elif unstated:
+            entry["status"] = "VERSION_UNSTATED"
+        else:
+            entry["status"] = "OK"
         ledger.append(entry)
         print(f"  .. {rel_paper}: {entry['status']}", file=sys.stderr)
 
@@ -194,6 +254,23 @@ def main():
     print("\n-- NO_PAGE --")
     for e in buckets.get("NO_PAGE", []):
         print(f"  {e['paper']}  -> {e['web_url']}")
+
+    for label in ("VERSION_MISMATCH", "VERSION_UNSTATED"):
+        rows = buckets.get(label, [])
+        print(f"\n-- {label} ({len(rows)}) --")
+        for e in rows:
+            declared = sorted({p.get("declared_version") for p in e["pages"]}, key=lambda v: (v is None, v))
+            print(f"  {e['paper']}: zenodo v{e['zenodo_version']}, pages declare {declared}")
+
+    print("\n-- RETIRED --")
+    for e in buckets.get("RETIRED", []):
+        print(f"  {e['paper']}  -> superseded by {e.get('superseded_by')}")
+
+    print("\n-- RETIRED_DEFECT --")
+    for e in buckets.get("RETIRED_DEFECT", []):
+        print(f"  {e['paper']}")
+        for problem in e["problems"]:
+            print(f"      {problem}")
 
     print("\n-- NOT_DEPOSITED --")
     for e in buckets.get("NOT_DEPOSITED", []):
