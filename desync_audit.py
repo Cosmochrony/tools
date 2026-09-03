@@ -288,8 +288,10 @@ def main():
         print(f"{e['zenodo_date']}  v{e['zenodo_version']:<8} {e['paper']}")
         for p in e["pages"]:
             flag = "STALE" if p["older_than_deposit"] else "ok   "
-            vm = " version-not-stated" if p["version_not_stated"] else ""
-            print(f"      {flag} {p['last_commit']}  {p['page']}  stated={p['stated_versions']}{vm}")
+            vm = " version-not-stated" if p["version_unstated"] else ""
+            mm = " version-mismatch" if p["version_mismatch"] else ""
+            print(f"      {flag} {p['last_commit']}  {p['page']}  "
+                  f"declared={p['declared_version']}{vm}{mm}")
 
     print("\n-- NO_PAGE --")
     for e in buckets.get("NO_PAGE", []):
