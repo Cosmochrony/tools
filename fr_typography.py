@@ -49,10 +49,25 @@ SLOPPY = re.compile(r"(?:[ \t]|" + NBSP + r")*" + NBSP + r"(?:[ \t]|" + NBSP + r
 
 
 def normalise(fragment):
-    """Return (fixed fragment, number of repairs) for one non-markup, non-maths fragment."""
-    fragment, a = SLOPPY.subn(NBSP + r"\1", fragment)
-    fragment, b = LOOSE.subn(NBSP + r"\1", fragment)
-    return fragment, a + b
+    """Return (fixed fragment, number of repairs) for one non-markup, non-maths fragment.
+
+    SLOPPY also matches an occurrence that is ALREADY correct (its whitespace runs are
+    optional), so counting matches counts compliant sites as repairs: the pass then reports
+    the number of non-breaking spaces in the file rather than the number it wrote. Only a
+    match whose text actually changes is a repair.
+    """
+    repairs = 0
+
+    def _sub(m):
+        nonlocal repairs
+        want = NBSP + m.group(1)
+        if m.group(0) != want:
+            repairs += 1
+        return want
+
+    fragment = SLOPPY.sub(_sub, fragment)
+    fragment = LOOSE.sub(_sub, fragment)
+    return fragment, repairs
 
 
 def split_maths(text):
