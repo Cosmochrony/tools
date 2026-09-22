@@ -153,8 +153,50 @@ def _strip_texorpdfstring(text: str) -> str:
     return "".join(result)
 
 
+# LaTeX accent commands -> Unicode. Applied BEFORE the generic command strippers
+# (which would drop the backslash and leave "Schr\"odinger") and before the
+# ~ -> space substitution (which would break \~n).
+_ACCENT_COMBINING = {
+    '"': "\u0308", "'": "\u0301", "`": "\u0300", "^": "\u0302", "~": "\u0303",
+    "=": "\u0304", ".": "\u0307", "u": "\u0306", "v": "\u030C", "H": "\u030B",
+    "r": "\u030A", "c": "\u0327", "k": "\u0328", "d": "\u0323", "b": "\u0331",
+}
+_LIGATURES = {
+    "ss": "\u00df", "ae": "\u00e6", "AE": "\u00c6", "oe": "\u0153", "OE": "\u0152",
+    "aa": "\u00e5", "AA": "\u00c5", "o": "\u00f8", "O": "\u00d8",
+    "l": "\u0142", "L": "\u0141", "i": "i", "j": "j",
+}
+
+
+def _apply_accents(text: str) -> str:
+    """Convert LaTeX accent/ligature commands to composed Unicode characters."""
+    import unicodedata
+
+    # Symbol accents: \"o, \"{o}, \'e, \`e, \^e, \~n, \=o, \.z
+    def _sym(m):
+        return m.group(2) + _ACCENT_COMBINING[m.group(1)]
+
+    text = re.sub(r"""\\(["'`^~=.])\s*\{([a-zA-Z])\}""", _sym, text)
+    text = re.sub(r"""\\(["'`^~=.])\s*([a-zA-Z])""", _sym, text)
+    # Letter accents: braces required, so \correlation etc. are never touched
+    text = re.sub(r"\\([uvHrckdb])\s*\{([a-zA-Z])\}", _sym, text)
+    # Ligatures and stroked letters: \ss, \o{}, \aa, ... (optional empty braces)
+    # LaTeX swallows whitespace after a control word (stra\ss e -> strasse with
+    # sharp s, no space), but terminating braces end the command and a space
+    # after them is real (\ss{} e -> "ss e").
+    text = re.sub(
+        r"\\(ss|ae|AE|oe|OE|aa|AA|[oOlLij])(?![a-zA-Z])(\{\})?[ \t]*",
+        lambda m: _LIGATURES[m.group(1)] + (" " if m.group(2) and m.group(0).endswith((" ", "\t")) else ""),
+        text,
+    )
+    return unicodedata.normalize("NFC", text)
+
+
 def _apply_latex_subs(text: str, html: bool) -> str:
     """Apply common LaTeX → text/HTML substitutions (math already protected)."""
+    # Accents first: the strippers below remove backslashes, and the ~ rule
+    # below would otherwise consume the tilde of \~n.
+    text = _apply_accents(text)
     # LaTeX double-quote ligatures (``text'') -> plain straight double quotes.
     # This project's .tex convention is ``text'' (renders as curly quotes under
     # pdflatex), but Zenodo's record fields are not LaTeX-typeset: left as-is,
