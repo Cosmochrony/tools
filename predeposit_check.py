@@ -65,6 +65,16 @@ ERROR_RE = (
 # so searching for ^! alone finds nothing; ERROR_RE covers both shapes.
 
 BUILD_DIRS = ("out", "pdf", "build")
+# Status markers that must never survive onto a deposited title page. The cover
+# version check below stops at the version number, so "Version 2.0, candidate"
+# matched the branch and passed; W1 2.0 was deposited with "candidate" printed on
+# its title page. This looks at the whole \date{} block instead.
+COVER_STATUS = re.compile(
+    r"\b(candidate|draft|preliminary|provisional|tentative|wip|todo"
+    r"|not\s+deposited|work\s+in\s+progress)\b",
+    re.I,
+)
+
 RELEASE_PATHS = ("tex/", "README", "zenodo.json", "CITATION.cff", "compile.sh")
 
 
@@ -239,6 +249,14 @@ def check(paper_dir: Path, deposit: bool = False) -> dict:
     # A cover that self-labels a version must agree with the branch. Papers that
     # do not print a version at all are fine — the check only fires when one exists.
     date_block = re.search(r"\\date\{(.*?)\}", raw_tex, re.S)
+    if date_block:
+        marker = COVER_STATUS.search(date_block.group(1))
+        if marker:
+            problems.append(
+                f"the title page carries the status marker {marker.group(0)!r} in its "
+                f"\\date{{}} block ({' '.join(date_block.group(1).split())!r}) — "
+                "a deposited cover must not label itself unfinished"
+            )
     cover = re.search(r"Version\s+(\d+(?:\.\d+)*)", date_block.group(1)) if date_block else None
     if cover:
         info["cover_version"] = cover.group(1)
