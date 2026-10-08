@@ -481,6 +481,7 @@ class ZenodoClient:
         self.base = SANDBOX_URL if sandbox else ZENODO_URL
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
+        self.created_state: dict | None = None  # server-side state created by THIS run
 
     def _ok(self, resp: requests.Response) -> dict:
         if not resp.ok:
@@ -489,7 +490,9 @@ class ZenodoClient:
         return resp.json()
 
     def create_deposition(self) -> dict:
-        return self._ok(self.session.post(f"{self.base}/deposit/depositions", json={}))
+        dep = self._ok(self.session.post(f"{self.base}/deposit/depositions", json={}))
+        self.created_state = {"dep_id": dep["id"], "kind": "new deposition draft"}
+        return dep
 
     def get_deposition(self, dep_id: int) -> dict:
         return self._ok(self.session.get(f"{self.base}/deposit/depositions/{dep_id}"))
@@ -498,6 +501,8 @@ class ZenodoClient:
         self._ok(self.session.post(
             f"{self.base}/deposit/depositions/{dep_id}/actions/edit"
         ))
+        # The record is now in edit state because of THIS run: remember it before any further call.
+        self.created_state = {"dep_id": dep_id, "kind": "edit session"}
         return self.get_deposition(dep_id)
 
     def new_version(self, dep_id: int) -> dict:
@@ -505,7 +510,31 @@ class ZenodoClient:
             f"{self.base}/deposit/depositions/{dep_id}/actions/newversion"
         ))
         draft_url = resp["links"]["latest_draft"]
+        # The draft exists server-side because of THIS run: record its id before the follow-up GET.
+        self.created_state = {"dep_id": int(draft_url.rstrip("/").rsplit("/", 1)[-1]),
+                              "kind": "new-version draft"}
         return self._ok(self.session.get(draft_url))
+
+    def list_drafts(self) -> list[dict]:
+        """All unpublished depositions of the account (read-only)."""
+        out: list[dict] = []
+        for page in range(1, 21):
+            batch = self._ok(self.session.get(
+                f"{self.base}/deposit/depositions",
+                params={"status": "draft", "size": 100, "page": page, "all_versions": "true"},
+            ))
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+        return out
+
+    def discard(self, dep_id: int) -> requests.Response:
+        """Documented actions/discard: deletes a draft, or ends an edit session without publishing."""
+        return self.session.post(f"{self.base}/deposit/depositions/{dep_id}/actions/discard")
+
+    def get_record(self, rec_id: int) -> dict:
+        """Public record (the same API host, read-only)."""
+        return self._ok(self.session.get(f"{self.base}/records/{rec_id}"))
 
     def resolve_latest_version_recid(self, recid: int) -> int:
         """Resolve a Zenodo recid (concept or version) to the latest published version's recid.
@@ -686,6 +715,201 @@ def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
     return meta
 
 
+# ── Guarded deposit flows ──────────────────────────────────────────────────────
+
+class VerificationError(Exception):
+    """A pre- or post-publication check failed."""
+
+
+class PostPublishFailure(Exception):
+    """The record is published but its verification failed (never un-published automatically)."""
+
+
+def custom_repository(meta: dict | None) -> str | None:
+    return ((meta or {}).get("custom") or {}).get(CODE_REPOSITORY_FIELD)
+
+
+def refuse_if_unpublished_state(client, concept_id: int, latest_id: int, host: str):
+    """Refuse (nothing created) when a draft / edit session of this concept already exists."""
+    problems = []
+    try:
+        for d in client.list_drafts():
+            if str(d.get("conceptrecid")) == str(concept_id) or d.get("id") in (latest_id,):
+                problems.append(f"unpublished deposition {d.get('id')} (state {d.get('state')})")
+        latest = client.get_deposition(latest_id)
+        if latest.get("state") not in (None, "done"):
+            problems.append(f"record {latest_id} is already in state {latest.get('state')!r}")
+        link = (latest.get("links") or {}).get("latest_draft")
+        if link:
+            problems.append(f"record {latest_id} advertises a latest_draft: {link}")
+    except Exception as exc:  # noqa: BLE001 - fail closed: cannot prove there is no draft
+        sys.exit(f"Error: cannot determine whether a draft already exists ({exc}). "
+                 "Nothing was created. Refusing to proceed.")
+    if problems:
+        sys.exit(
+            "Error: an unpublished draft/edit session of this concept already exists:\n  "
+            + "\n  ".join(problems)
+            + f"\nNothing was created and nothing was discarded. Inspect https://{host}/deposit "
+            "and resolve it by hand (publish or discard it yourself), then re-run."
+        )
+
+
+def abort_and_cleanup(client, step: str, exc: BaseException, host: str):
+    """Report a failure, clean up ONLY the state created by this run, then exit non-zero."""
+    print(f"\n!! FAILED at step: {step}", file=sys.stderr)
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        print(f"!! HTTP status: {resp.status_code}; body: {resp.text[:300]}", file=sys.stderr)
+    print(f"!! Error: {exc}", file=sys.stderr)
+    state = client.created_state
+    if not state:
+        sys.exit("No server-side state had been created by this run; nothing to clean up.")
+    dep_id, kind = state["dep_id"], state["kind"]
+    print(f"!! This run created: {kind} {dep_id}", file=sys.stderr)
+    manual = f"https://{host}/deposit/{dep_id}"
+    if step == "publish":
+        # A failed publish call may still have published: never discard without proof it did not.
+        try:
+            st = client.get_deposition(dep_id).get("state")
+        except Exception as exc2:  # noqa: BLE001
+            sys.exit(f"!! CLEANUP SKIPPED: cannot read state of {dep_id} after failed publish ({exc2}). "
+                     f"Inspect {manual} by hand; it may be published or still a draft.")
+        if st == "done":
+            sys.exit(f"!! The publish call failed but {dep_id} is PUBLISHED (state done). "
+                     f"No cleanup done. Check https://{host}/record/{dep_id}.")
+    try:
+        r = client.discard(dep_id)
+        ok = r.ok
+        detail = f"HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as exc2:  # noqa: BLE001
+        ok, detail = False, str(exc2)
+    if ok:
+        sys.exit(f"Cleanup performed: POST actions/discard on {kind} {dep_id} ({detail}). "
+                 "Nothing published. Exiting non-zero.")
+    sys.exit(f"!! CLEANUP FAILED for {kind} {dep_id} ({detail}).\n"
+             f"!! MANUAL CLEANUP REQUIRED: discard it at {manual}. Nothing was published.")
+
+
+def verify_draft_code_repository(client, dep_id: int, expected: str | None):
+    """After the metadata PUT: the draft must carry the expected code repository."""
+    if not expected:
+        return
+    got = custom_repository(client.get_deposition(dep_id).get("metadata"))
+    if got != expected:
+        raise VerificationError(
+            f"draft {dep_id} custom[{CODE_REPOSITORY_FIELD!r}] is {got!r}, expected {expected!r}: "
+            "the deposit API did not keep the Software field; refusing to publish")
+    print(f"  Software field verified on draft: PASS ({expected})")
+
+
+def verify_published_code_repository(client, rec_id: int, expected: str | None, host: str):
+    if not expected:
+        return
+    try:
+        got = custom_repository(client.get_record(rec_id).get("metadata"))
+    except Exception as exc:  # noqa: BLE001
+        got = f"<unreadable: {exc}>"
+    if got != expected:
+        print(f"  Software field on published record: FAIL (got {got!r}, expected {expected!r})",
+              file=sys.stderr)
+        raise PostPublishFailure(
+            f"\n!! RECORD {rec_id} IS PUBLISHED but its Software field is wrong or unverifiable.\n"
+            f"!! Not un-publishing. Inspect https://{host}/record/{rec_id}; fix with a reviewed "
+            "metadata-only edit (--update) or by hand in the Zenodo UI.")
+    print(f"  Software field on published record: PASS ({expected})")
+
+
+def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, env_label: str,
+                   host: str) -> tuple[int, str | None]:
+    """--update: metadata-only edit in place. Returns (dep_id, doi)."""
+    dep_id = client.resolve_latest_version_recid(int(zenodo_id))
+    if dep_id != int(zenodo_id):
+        print(f"\nConcept record {zenodo_id} → latest version {dep_id} [{env_label}]")
+    refuse_if_unpublished_state(client, int(zenodo_id), dep_id, host)
+    step = "edit"
+    try:
+        print(f"Editing metadata of record {dep_id} in place [{env_label}]…")
+        client.edit_deposition(dep_id)
+        step = "read live metadata"
+        # Zenodo's PUT replaces the whole metadata object, so an --update built only from the
+        # LaTeX and zenodo.json would silently drop every field maintained elsewhere. Merge over
+        # the live metadata instead: rebuilt fields win, unmanaged fields survive untouched.
+        live = (client.get_deposition(dep_id).get("metadata") or {})
+        dropped = sorted(set(live) - set(metadata_built))
+        live_custom = live.get("custom") or {}
+        metadata = {**live, **metadata_built}
+        if live_custom or metadata.get("custom"):
+            # Custom fields are merged key by key so that fields set by hand survive; a PUT
+            # that omits custom therefore cannot clear an existing code:codeRepository.
+            metadata["custom"] = {**live_custom, **(metadata.get("custom") or {})}
+        expected = code_url or live_custom.get(CODE_REPOSITORY_FIELD)
+        if dropped:
+            print(f"  Preserved fields not managed by this script: {', '.join(dropped)}")
+        step = "metadata PUT"
+        print("Setting metadata…")
+        client.set_metadata(dep_id, metadata)
+        step = "verify draft metadata"
+        verify_draft_code_repository(client, dep_id, expected)
+        step = "publish"
+        print("Publishing…")
+        result = client.publish(dep_id)
+    except Exception as exc:  # noqa: BLE001
+        abort_and_cleanup(client, step, exc, host)
+    verify_published_code_repository(client, dep_id, expected, host)
+    return dep_id, result.get("doi")
+
+
+def deposit_new(client, pdf_path: Path, metadata: dict, code_url: str, zenodo_id,
+                env_label: str, host: str, on_published=None) -> dict:
+    """New version (zenodo_id set) or first publication. Returns the publish response."""
+    step = "start"
+    try:
+        if zenodo_id:
+            step = "resolve latest version"
+            latest_recid = client.resolve_latest_version_recid(int(zenodo_id))
+            if latest_recid != int(zenodo_id):
+                print(f"\nConcept record {zenodo_id} → latest version {latest_recid} [{env_label}]")
+        else:
+            latest_recid = None
+    except Exception as exc:  # noqa: BLE001
+        abort_and_cleanup(client, step, exc, host)
+    if zenodo_id:
+        refuse_if_unpublished_state(client, int(zenodo_id), latest_recid, host)
+    try:
+        if zenodo_id:
+            step = "newversion"
+            print(f"New version of record {latest_recid} [{env_label}]…")
+            dep = client.new_version(latest_recid)
+            dep_id = dep["id"]
+            step = "delete old files"
+            for f in dep.get("files", []):
+                client.delete_file(dep_id, f["id"])
+                print(f"  Removed old file: {f['filename']}")
+        else:
+            step = "create deposition"
+            print(f"\nNew deposition [{env_label}]…")
+            dep = client.create_deposition()
+            dep_id = dep["id"]
+        print(f"  Deposition ID: {dep_id}")
+        step = "upload"
+        print(f"Uploading {pdf_path.name} …")
+        client.upload_file(dep, pdf_path)
+        step = "metadata PUT"
+        print("Setting metadata…")
+        client.set_metadata(dep_id, metadata)
+        step = "verify draft metadata"
+        verify_draft_code_repository(client, dep_id, code_url)
+        step = "publish"
+        print("Publishing…")
+        result = client.publish(dep_id)
+    except Exception as exc:  # noqa: BLE001
+        abort_and_cleanup(client, step, exc, host)
+    if on_published:
+        on_published(result)
+    verify_published_code_repository(client, result.get("id", dep_id), code_url, host)
+    return result
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -814,109 +1038,65 @@ def main():
     env_label = "sandbox" if args.sandbox else "production"
     zenodo_id = config.get("zenodo_id")
 
+    host = "sandbox.zenodo.org" if args.sandbox else "zenodo.org"
+    metadata = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
+                              publication_type=config.get("publication_type"),
+                              notes=config.get("notes"),
+                              code_url=code_url)
+
     # ── --update: metadata-only edit in place via legacy deposit API (same DOI) ─
     # Note: file replacement in place is not possible via the Zenodo REST API;
     # the file bucket remains locked for published records. Use new version for files.
     if args.update and zenodo_id:
-        # zenodo_id is the concept_recid; resolve it to the latest published version's
-        # recid (the edit action requires a version-specific deposit id).
-        dep_id = client.resolve_latest_version_recid(int(zenodo_id))
-        if dep_id != int(zenodo_id):
-            print(f"\nConcept record {zenodo_id} → latest version {dep_id} [{env_label}]")
-        print(f"Editing metadata of record {dep_id} in place [{env_label}]…")
-        client.edit_deposition(dep_id)
-
-        metadata = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
-                                  publication_type=config.get("publication_type"),
-                                  notes=config.get("notes"),
-                                  code_url=code_url)
-        # Zenodo's PUT replaces the whole metadata object, so an --update built only from the
-        # LaTeX and zenodo.json would silently drop every field maintained elsewhere — release
-        # notes set on the record are the usual casualty. Merge over the live metadata instead:
-        # rebuilt fields win, fields this script does not manage survive untouched.
-        live = (client.get_deposition(dep_id).get("metadata") or {})
-        dropped = sorted(set(live) - set(metadata))
-        live_custom = live.get("custom") or {}
-        metadata = {**live, **metadata}
-        if live_custom or metadata.get("custom"):
-            # Custom fields (Software section, journal, ...) are merged key by key so that
-            # fields set on the record by hand survive; the code repository is rebuilt.
-            metadata["custom"] = {**live_custom, **(metadata.get("custom") or {})}
-        if dropped:
-            print(f"  Preserved fields not managed by this script: {', '.join(dropped)}")
-        print("Setting metadata…")
-        client.set_metadata(dep_id, metadata)
-
-        print("Publishing…")
-        result = client.publish(dep_id)
-        doi = result.get("doi") or config.get("doi", "")
-        host = "sandbox.zenodo.org" if args.sandbox else "zenodo.org"
+        try:
+            dep_id, doi = deposit_update(client, metadata, code_url, int(zenodo_id), env_label, host)
+        except PostPublishFailure as exc:
+            sys.exit(str(exc))
+        doi = doi or config.get("doi", "")
         print(f"\nUpdated! (metadata only — files unchanged)")
         print(f"  DOI:    {doi}")
         print(f"  Record: https://{host}/record/{dep_id}")
         return
 
     # ── New version or first publication via legacy deposit API ────────────────
-    if zenodo_id:
-        # zenodo_id is the concept_recid; resolve it to the latest published version's recid
-        # (the newversion API requires a deposit ID, which is version-specific).
-        latest_recid = client.resolve_latest_version_recid(int(zenodo_id))
-        if latest_recid != int(zenodo_id):
-            print(f"\nConcept record {zenodo_id} → latest version {latest_recid} [{env_label}]")
-        print(f"New version of record {latest_recid} [{env_label}]…")
-        dep = client.new_version(latest_recid)
-        dep_id = dep["id"]
-        for f in dep.get("files", []):
-            client.delete_file(dep_id, f["id"])
-            print(f"  Removed old file: {f['filename']}")
-    else:
-        print(f"\nNew deposition [{env_label}]…")
-        dep = client.create_deposition()
-        dep_id = dep["id"]
+    published: dict = {}
 
-    print(f"  Deposition ID: {dep_id}")
-
-    print(f"Uploading {pdf_path.name} …")
-    client.upload_file(dep, pdf_path)
-
-    metadata = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
-                              publication_type=config.get("publication_type"),
-                              notes=config.get("notes"),
-                              code_url=code_url)
-    print("Setting metadata…")
-    client.set_metadata(dep_id, metadata)
-
-    print("Publishing…")
-    result = client.publish(dep_id)
-
-    doi = result["doi"]
-    rec_id = result["id"]
-    concept_doi = result.get("conceptdoi") or result.get("metadata", {}).get("conceptdoi")
-    concept_recid = result.get("conceptrecid") or result.get("metadata", {}).get("conceptrecid")
-    host = "sandbox.zenodo.org" if args.sandbox else "zenodo.org"
-    print(f"\nPublished!")
-    print(f"  Version DOI:   {doi} (ephemeral, not stored)")
-    print(f"  Concept DOI:   {concept_doi}")
-    print(f"  Concept recid: {concept_recid}")
-    print(f"  Record: https://{host}/record/{rec_id}")
-
-    if not concept_doi or not concept_recid:
-        raise RuntimeError(
-            "Zenodo response did not include conceptdoi/conceptrecid; refusing to overwrite "
-            "zenodo.json with version-specific identifiers. Inspect the publish response and "
-            "update manually."
+    def save_local_state(result: dict):
+        # Runs right after publish and BEFORE verification, so a later verification failure
+        # cannot make a re-run create a duplicate deposition.
+        doi = result["doi"]
+        concept_doi = result.get("conceptdoi") or result.get("metadata", {}).get("conceptdoi")
+        concept_recid = result.get("conceptrecid") or result.get("metadata", {}).get("conceptrecid")
+        print(f"\nPublished!")
+        print(f"  Version DOI:   {doi} (ephemeral, not stored)")
+        print(f"  Concept DOI:   {concept_doi}")
+        print(f"  Concept recid: {concept_recid}")
+        print(f"  Record: https://{host}/record/{result['id']}")
+        if not concept_doi or not concept_recid:
+            raise RuntimeError(
+                "Zenodo response did not include conceptdoi/conceptrecid; refusing to overwrite "
+                "zenodo.json with version-specific identifiers. Inspect the publish response and "
+                "update manually."
+            )
+        config["zenodo_id"] = int(concept_recid)
+        config["doi"] = concept_doi
+        config_path.write_text(
+            json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
         )
+        print(f"  Saved zenodo_id + concept DOI → {config_path.relative_to(repo_root)}")
+        published["concept_doi"] = concept_doi
 
-    config["zenodo_id"] = int(concept_recid)
-    config["doi"] = concept_doi
-    config_path.write_text(
-        json.dumps(config, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    print(f"  Saved zenodo_id + concept DOI → {config_path.relative_to(repo_root)}")
+    try:
+        result = deposit_new(client, pdf_path, metadata, code_url, zenodo_id, env_label, host,
+                             on_published=save_local_state)
+    except PostPublishFailure as exc:
+        sys.exit(str(exc) + "\n!! zenodo.json was saved; PDF archive and DOI cascade were SKIPPED: "
+                 "run them by hand once the record is fixed.")
+    concept_doi = published["concept_doi"]
 
     # Archive the published PDF into the central pdfs/ store (systematic, every deposit).
-    archive_pdf(repo_root, pdf_path, tex_path.stem, version, rec_id)
+    archive_pdf(repo_root, pdf_path, tex_path.stem, version, result["id"])
 
     if not args.no_cascade:
         bib_key = config.get("bib_key")
