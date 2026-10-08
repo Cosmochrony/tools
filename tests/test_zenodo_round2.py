@@ -262,6 +262,16 @@ class UpdatePreservesLiveMetadata(unittest.TestCase):
         self.assertNotIn('"version": "1.0"', out.split("Whole-metadata diff")[1])
 
 
+class ScratchCopyOutsideTheWorkspace(unittest.TestCase):
+    def test_a_paper_directory_outside_the_workspace_runs(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        scratch = Path(tempfile.mkdtemp()).resolve()
+        paper = make_paper(scratch)
+        code, out, _ = run_main([str(paper), "--dry-run"], {}, root, Factory())
+        self.assertIsNone(code, code)
+        self.assertIn("Dry run", out)
+
+
 class VersionLabelGuard(unittest.TestCase):
     ENV = {"ZENODO_TOKEN": PROD_TOKEN}
 

@@ -4,19 +4,40 @@
 Usage (production):
     export ZENODO_TOKEN=...            # the script reads the PROCESS ENVIRONMENT only; it does NOT load
                                        # tools/.env itself (export it first, e.g. `set -a; . tools/.env; set +a`)
-    python tools/zenodo_publish.py bell-paper/ [--update] [--no-cascade] [--dry-run]
+    python tools/zenodo_publish.py bell-paper/ [--no-cascade] [--dry-run]            # new version / first publication
+    python tools/zenodo_publish.py bell-paper/ --update --set-code-url [--yes-apply-diff [DIGEST]]
+    python tools/zenodo_publish.py bell-paper/ --finish-after-fail                   # offline
+    python tools/zenodo_publish.py bell-paper/ --reconcile JOURNAL --outcome published|not-published   # offline
 
 Sandbox (never touches a production id, DOI, pdfs/ or bibliography; see tools/README.md):
-    ZENODO_SANDBOX_TOKEN=... python tools/zenodo_publish.py PAPER/ --sandbox --sandbox-state /tmp/state.json
+    ZENODO_SANDBOX_TOKEN=... python tools/zenodo_publish.py PAPER/ --sandbox --sandbox-state /tmp/new-state.json
     (--sandbox reads ONLY ZENODO_SANDBOX_TOKEN, with no fallback to ZENODO_TOKEN; the production token is
-     never sent to the sandbox host, nor the sandbox token to production.)
+     never sent to the sandbox host, nor the sandbox token to production. The state file must not exist.)
 
-Guards (all offline-tested): a run REFUSES when a draft/edit session of the concept already exists, and on
-any failure cleans up ONLY the server state this run certainly created (an uncertain outcome is reported
-and searched for, never assumed away; ambiguity discards nothing); every request has bounded timeouts, only
-GETs are retried; the Software field (code:codeRepository) is verified on the draft before publishing and on
-the public record afterwards; zenodo.json is saved the moment a publication is confirmed. After a
-post-publish FAIL, `--finish-after-fail` runs the skipped PDF archive and DOI cascade offline.
+Guards (all offline-tested; the server semantics they rely on are listed as UNPROVEN in tools/README.md):
+  * Run journal: before any write request leaves, and after each step, the known state is written atomically
+    to <--state-dir>/<paper>-<timestamp>.run.json (default: the user cache directory, never the workspace).
+    While a journal says RUNNING / UNRECONCILED / DRAFT-LEFT-BEHIND, every later run for that paper or concept
+    REFUSES to start ("DO NOT RE-RUN"); --reconcile records, locally and on the operator's word, what was found.
+  * A run REFUSES when a draft/edit session of the concept already exists, and on any failure cleans up ONLY the
+    server state this run certainly created (an uncertain outcome is reported and searched for, never assumed
+    away; ambiguity discards nothing). The cleanup call comes from an explicit kind table (CLEANUP_CALLS):
+    edit session -> POST actions/discard, unpublished draft -> DELETE; both UNVERIFIED until the sandbox pilot.
+  * --update PRESERVES the live metadata: the PUT is the live record with only the fields named by
+    --set-version/--set-title/--set-abstract/--set-keywords/--set-notes/--set-web-url/--set-publication-type/
+    --set-code-url (or --apply-local-metadata=a,b) replaced; the whole-metadata diff is printed first and
+    needs --yes-apply-diff (optionally pinning the diff's sha256 prefix).
+  * The version label is guarded independently of the pre-deposit gate and of --skip-checks: never
+    main/master/HEAD, equal to the branch, zenodo.json and CITATION.cff, different from the live version.
+    The pre-deposit gate itself fails closed when it cannot run.
+  * Every request has bounded timeouts, only GETs are retried; the Software field (code:codeRepository) is
+    verified on the draft before publishing and on the public record afterwards; zenodo.json is saved the
+    moment a publication is confirmed; the sha256 of the PDF actually uploaded is recorded in the journal.
+  * The PDF archive never overwrites a file (identical -> "already archived"; different -> refused with both
+    digests) and only archives the PDF that was uploaded. After a post-publish FAIL, --finish-after-fail runs
+    the skipped archive and DOI cascade offline under the same rules.
+  * No token ever appears in a message; a token with whitespace or control characters is refused unseen;
+    every numeric environment setting is validated before any request.
 
 Config file required at paper_dir/zenodo.json:
     {
@@ -1992,6 +2013,14 @@ def run_cascade(repo_root: Path, config: dict, concept_doi: str, no_cascade: boo
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
+def _rel(path: Path, root: Path) -> str:
+    """Path relative to the workspace when it lies inside it (a pilot may use a scratch copy outside)."""
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Publish a Cosmochrony paper to Zenodo",
@@ -2170,7 +2199,7 @@ def main(argv=None):
 
     # ── Parse LaTeX ────────────────────────────────────────────────────────────
     tex_path = find_main_tex(paper_dir, config)
-    print(f"Parsing  {tex_path.relative_to(repo_root)}")
+    print(f"Parsing  {_rel(tex_path, repo_root)}")
 
     raw = resolve_inputs(
         tex_path.read_text(encoding="utf-8"),
@@ -2246,7 +2275,7 @@ def main(argv=None):
             sys.exit("Error: zenodo.json has no zenodo_id/doi: the publication was not saved locally, "
                      "so there is nothing to finish. Set them by hand from the record first.")
         pdf_path = find_pdf(paper_dir)
-        print(f"  PDF:      {pdf_path.relative_to(repo_root)}  (must be the PDF that was uploaded)")
+        print(f"  PDF:      {_rel(pdf_path, repo_root)}  (must be the PDF that was uploaded)")
         found = latest_published_journal(state_dir, paper_dir)
         jdata = found[1] if found else {}
         if jdata.get("concept_id") not in (None, "") and str(jdata["concept_id"]) != str(zid):
@@ -2301,7 +2330,7 @@ def main(argv=None):
 
     # ── Find PDF ───────────────────────────────────────────────────────────────
     pdf_path = find_pdf(paper_dir)
-    print(f"  PDF:      {pdf_path.relative_to(repo_root)}")
+    print(f"  PDF:      {_rel(pdf_path, repo_root)}")
 
     try:
         client = ZenodoClient(token, sandbox=args.sandbox)
@@ -2350,7 +2379,7 @@ def main(argv=None):
         config["zenodo_id"] = int(concept_recid)
         config["doi"] = concept_doi
         _atomic_write_text(config_path, json.dumps(config, indent=2, ensure_ascii=False) + "\n")
-        print(f"  Saved zenodo_id + concept DOI → {config_path.relative_to(repo_root)}")
+        print(f"  Saved zenodo_id + concept DOI → {_rel(config_path, repo_root)}")
         published["concept_doi"] = concept_doi
         journal.update(phase="local state saved")
 
