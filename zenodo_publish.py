@@ -12,7 +12,8 @@ Config file required at paper_dir/zenodo.json:
         "code_url":  "https://github.com/Cosmochrony/bell-paper/tree/main/code",
                                                               <- optional; only needed when the paper has a
                                                                  code/ directory and its git remote is not the
-                                                                 GitHub repo hosting it
+                                                                 GitHub repo hosting it; sent as the record's
+                                                                 Software "Repository URL" (code:codeRepository)
         "zenodo_id": null,                                    <- filled automatically after first pub
         "doi":       null                                     <- filled automatically
     }
@@ -56,6 +57,7 @@ PUBLICATION_TYPE = "preprint"
 
 ZENODO_URL = "https://zenodo.org/api"
 SANDBOX_URL = "https://sandbox.zenodo.org/api"
+CODE_REPOSITORY_FIELD = "code:codeRepository"  # InvenioRDM CodeMeta custom field
 
 
 # ── LaTeX parsing ──────────────────────────────────────────────────────────────
@@ -672,15 +674,15 @@ def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
             "scheme": "url",
             "resource_type": "other",
         })
-    if code_url:
-        related.append({
-            "identifier": code_url,
-            "relation": "isSupplementedBy",
-            "scheme": "url",
-            "resource_type": "software",
-        })
     if related:
         meta["related_identifiers"] = related
+    if code_url:
+        # The code link belongs in the record's "Software" section ("Repository URL"), not in
+        # the related-works list. The legacy deposit API forwards metadata["custom"] verbatim
+        # into the InvenioRDM custom_fields (zenodo-rdm legacy/deserializers/schemas.py), and
+        # "code:codeRepository" is the CodeMeta URL field behind that section; the section is
+        # rendered on publication/preprint records too (e.g. record 15666809).
+        meta["custom"] = {CODE_REPOSITORY_FIELD: code_url}
     return meta
 
 
@@ -764,6 +766,14 @@ def main():
         print(f"  Code:     {code_url}")
 
     if args.dry_run:
+        # Show the exact metadata a deposit would send (new-version / first-publication path;
+        # an --update additionally merges these over the live record). No network access.
+        dry_meta = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
+                                  publication_type=config.get("publication_type"),
+                                  notes=config.get("notes"),
+                                  code_url=code_url)
+        print("\n  Metadata that would be sent:")
+        print(json.dumps(dry_meta, indent=2, ensure_ascii=False))
         print("\n[Dry run] Stopping here — no upload performed.")
         return
 
@@ -826,7 +836,12 @@ def main():
         # rebuilt fields win, fields this script does not manage survive untouched.
         live = (client.get_deposition(dep_id).get("metadata") or {})
         dropped = sorted(set(live) - set(metadata))
+        live_custom = live.get("custom") or {}
         metadata = {**live, **metadata}
+        if live_custom or metadata.get("custom"):
+            # Custom fields (Software section, journal, ...) are merged key by key so that
+            # fields set on the record by hand survive; the code repository is rebuilt.
+            metadata["custom"] = {**live_custom, **(metadata.get("custom") or {})}
         if dropped:
             print(f"  Preserved fields not managed by this script: {', '.join(dropped)}")
         print("Setting metadata…")
