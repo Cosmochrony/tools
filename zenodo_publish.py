@@ -1,43 +1,65 @@
 #!/usr/bin/env python3
 """zenodo_publish.py — Automated Zenodo publication for Cosmochrony papers.
 
+PRODUCTION USE REMAINS NO-GO UNTIL A SUCCESSFUL SANDBOX PILOT (tools/pilot/README-PILOT.md). Everything below is
+tested offline against doubles of the Zenodo API and has never been observed against a server.
+
 Usage (production):
     export ZENODO_TOKEN=...            # the script reads the PROCESS ENVIRONMENT only; it does NOT load
                                        # tools/.env itself (export it first, e.g. `set -a; . tools/.env; set +a`)
     python tools/zenodo_publish.py bell-paper/ [--no-cascade] [--dry-run]            # new version / first publication
-    python tools/zenodo_publish.py bell-paper/ --update --set-code-url [--yes-apply-diff [DIGEST]]
-    python tools/zenodo_publish.py bell-paper/ --finish-after-fail                   # offline
-    python tools/zenodo_publish.py bell-paper/ --reconcile JOURNAL --outcome published|not-published   # offline
+    python tools/zenodo_publish.py bell-paper/ --update --set-code-url               # prints the diff, creates nothing
+    python tools/zenodo_publish.py bell-paper/ --update --set-code-url --yes-apply-diff DIGEST12+   # applies THAT diff
+    python tools/zenodo_publish.py bell-paper/ --finish-after-fail [--journal PATH]  # offline
+    python tools/zenodo_publish.py --reconcile JOURNAL --outcome published --record-id N --concept-id C --concept-doi D
+    python tools/zenodo_publish.py --reconcile JOURNAL --outcome not-published (--record-url URL | --i-checked-the-account --reason TXT)
+    python tools/zenodo_publish.py --reconcile JOURNAL --quarantine --reason TXT     # unreadable journal: rename, never delete
 
 Sandbox (never touches a production id, DOI, pdfs/ or bibliography; see tools/README.md):
-    ZENODO_SANDBOX_TOKEN=... python tools/zenodo_publish.py PAPER/ --sandbox --sandbox-state /tmp/new-state.json
-    (--sandbox reads ONLY ZENODO_SANDBOX_TOKEN, with no fallback to ZENODO_TOKEN; the production token is
-     never sent to the sandbox host, nor the sandbox token to production. The state file must not exist.)
+    python tools/pilot/sandbox_launch.py -- PAPER/ --sandbox --sandbox-state /tmp/new-state.json --state-dir DIR
+    (--sandbox reads ONLY ZENODO_SANDBOX_TOKEN, with no fallback to ZENODO_TOKEN; the production token is never sent
+     to the sandbox host, nor the sandbox token to production. The state file must not exist. sandbox_launch.py
+     reads the sandbox token from the terminal: a token must never be typed on a command line.)
 
 Guards (all offline-tested; the server semantics they rely on are listed as UNPROVEN in tools/README.md):
   * Run journal: before any write request leaves, and after each step, the known state is written atomically
-    to <--state-dir>/<paper>-<timestamp>.run.json (default: the user cache directory, never the workspace).
-    While a journal says RUNNING / UNRECONCILED / DRAFT-LEFT-BEHIND, every later run for that paper or concept
-    REFUSES to start ("DO NOT RE-RUN"); --reconcile records, locally and on the operator's word, what was found.
+    (temp + fsync + os.replace + directory fsync) to <--state-dir>/<paper>-<timestamp>.run.json (default: the
+    user cache directory, never the workspace). While a journal says RUNNING / UNRECONCILED / DRAFT-LEFT-BEHIND /
+    PUBLISHED-UNSAVED, every later run for that paper (same realpath), that concept (same host) or that
+    bib_key/title/zenodo.json (same host) REFUSES to start ("DO NOT RE-RUN"). PUBLISHED-UNSAVED means the
+    publication SUCCEEDED but zenodo.json is not saved and read back; it is cured with --reconcile ... --outcome
+    published --record-id N --concept-id C --concept-doi D, which writes ONLY the paper directory recorded in the
+    journal. Every value written to a journal is redacted of tokens first.
   * A run REFUSES when a draft/edit session of the concept already exists, and on any failure cleans up ONLY the
     server state this run certainly created (an uncertain outcome is reported and searched for, never assumed
     away; ambiguity discards nothing). The cleanup call comes from an explicit kind table (CLEANUP_CALLS):
     edit session -> POST actions/discard, unpublished draft -> DELETE; both UNVERIFIED until the sandbox pilot.
   * --update PRESERVES the live metadata: the PUT is the live record with only the fields named by
     --set-version/--set-title/--set-abstract/--set-keywords/--set-notes/--set-web-url/--set-publication-type/
-    --set-code-url (or --apply-local-metadata=a,b) replaced; the whole-metadata diff is printed first and
-    needs --yes-apply-diff (optionally pinning the diff's sha256 prefix).
+    --set-code-url (or --apply-local-metadata=a,b) replaced (--set-web-url replaces only the web-page entry of
+    related_identifiers); the whole-metadata diff is printed first and --yes-apply-diff must carry at least 12 hex
+    characters of the sha256 of exactly that printed diff (a bare flag is refused).
   * The version label is guarded independently of the pre-deposit gate and of --skip-checks: never
-    main/master/HEAD, equal to the branch, zenodo.json and CITATION.cff, different from the live version.
-    The pre-deposit gate itself fails closed when it cannot run.
-  * Every request has bounded timeouts, only GETs are retried; the Software field (code:codeRepository) is
-    verified on the draft before publishing and on the public record afterwards; zenodo.json is saved the
-    moment a publication is confirmed; the sha256 of the PDF actually uploaded is recorded in the journal.
-  * The PDF archive never overwrites a file (identical -> "already archived"; different -> refused with both
-    digests) and only archives the PDF that was uploaded. After a post-publish FAIL, --finish-after-fail runs
-    the skipped archive and DOI cascade offline under the same rules.
-  * No token ever appears in a message; a token with whitespace or control characters is refused unseen;
-    every numeric environment setting is validated before any request.
+    main/master/HEAD, a plausible string, equal to the branch, zenodo.json and CITATION.cff, different from the
+    live version. The pre-deposit gate itself fails closed when it cannot run.
+  * Every request has bounded timeouts, only GETs are retried; numeric settings have upper bounds validated at
+    startup; the Software field (code:codeRepository) is verified on the draft before publishing and on the public
+    record afterwards; zenodo.json is saved the moment a publication is confirmed; the PDF is read ONCE and its
+    sha256 (journaled before the upload) is that of the bytes uploaded and archived; a PDF with no recorded digest is
+    never uploaded; a checksum in the upload answer is compared with the local digest.
+  * The PDF archive never overwrites a file (identical -> "already archived"; different, symlink or directory ->
+    refused), is written under a unique temp name, fsynced, verified and hard-linked, never leaves a partial file
+    under the final name, and only archives the PDF that was uploaded. The DOI cascade runs only after the archive
+    step succeeded. After a post-publish FAIL, --finish-after-fail runs the skipped steps offline, bound to ONE
+    deposit journal (its version is the archive label, its PDF digest the identity, a sandbox journal or a concept
+    mismatch is refused).
+  * No token ever appears in a message or a journal; a token with whitespace or control characters is refused
+    unseen; every numeric environment setting is validated before any request.
+
+UNPROVEN (never observed on a server): the semantics of DELETE vs actions/discard, custom acceptance for
+workingpaper, latest_draft on clean published records, X-Total/Link headers, status=draft including edit
+sessions, inheritance of code:codeRepository, checksums in the publish response and in the upload answer, the
+whole-live-metadata PUT round trip, redirect targets, concurrent drafts by another actor.
 
 Config file required at paper_dir/zenodo.json:
     {
@@ -598,7 +620,7 @@ def register_secret(value) -> None:
 
 _BEARER = re.compile(r"(?i)\bbearer\s+\S+")
 _TOKEN_QUERY = re.compile(r"(?i)\b(access_token|token|api_key|apikey)=[^&\s\"'<>]+")
-_AUTH_HEADER = re.compile(r"(?i)\bauthorization(['\"]?\s*[:=]\s*['\"]?)(?!bearer\b)\S+")
+_AUTH_HEADER = re.compile(r"(?i)\bauthorization(['\"]?\s*[:=]\s*['\"]?)(?!bearer\b)\S+(?:[ \t]+\S+)?")
 
 
 def redact(text) -> str:
@@ -1094,10 +1116,10 @@ def quarantine_journal(path: Path, reason: str) -> Path:
     except OSError as exc:
         raise ReconcileRefused(f"cannot stat {path} ({redact(exc)})") from exc
     try:
-        json.loads(path.read_text(encoding="utf-8"))
+        readable = isinstance(json.loads(path.read_text(encoding="utf-8")), dict)
     except (OSError, ValueError):
-        pass
-    else:
+        readable = False
+    if readable:
         raise ReconcileRefused(f"{path} is a readable journal: use --outcome published|not-published")
     print(f"Unreadable journal: {path} ({size} bytes). It will be renamed, not deleted.")
     target = path.with_name(path.name + QUARANTINE_SUFFIX)
@@ -1112,6 +1134,11 @@ def quarantine_journal(path: Path, reason: str) -> Path:
     return target
 
 
+def journal_kind(data: dict) -> str:
+    """'deposit' or 'update' (older journals are classified by their intent)."""
+    return data.get("kind") or ("update" if (data.get("intent") or {}).get("update") else "deposit")
+
+
 def select_deposit_journal(state_dir: Path, paper_dir: Path, explicit=None):
     """The journal ``--finish-after-fail`` is bound to: the NEWEST production journal of this paper that is a
     deposit (not --update) and carries a PDF digest and a publication (PUBLISHED, PUBLISHED-RECONCILED or
@@ -1119,11 +1146,11 @@ def select_deposit_journal(state_dir: Path, paper_dir: Path, explicit=None):
     shadow it. ``explicit`` (--journal PATH) overrides the choice but is held to the same rules.
     Returns (path, data) or (None, None)."""
     def eligible(data):
-        return (data and _realpath(data.get("paper_dir_real") or data.get("paper_dir") or "") == _realpath(paper_dir)
-                and not data.get("sandbox") and data.get("kind", "update" if (data.get("intent") or {}).get("update")
-                                                        else "deposit") == "deposit"
-                and (data.get("pdf") or {}).get("sha256")
-                and data.get("outcome") in PUBLISHED_OUTCOMES + (UNSAVED_OUTCOME,))
+        return bool(data and _realpath(data.get("paper_dir_real") or data.get("paper_dir") or "") == _realpath(paper_dir)
+                    and not data.get("sandbox")
+                    and journal_kind(data) == "deposit"
+                    and (data.get("pdf") or {}).get("sha256")
+                    and data.get("outcome") in PUBLISHED_OUTCOMES + (UNSAVED_OUTCOME,))
     if explicit is not None:
         data = read_journal_strict(explicit)
         if data.get("sandbox"):
@@ -2652,20 +2679,9 @@ def main(argv=None):
     state_dir = None
     if networked or args.finish_after_fail:
         state_dir = validate_state_dir(args.state_dir or default_state_dir(), repo_root, paper_dir)
-    identity = journal_identity(config)
-    if networked:
-        blocking = find_blocking_journals(state_dir, paper_dir, [zenodo_id], host, identity)
-        if blocking:
-            die(blocking_message(blocking))
-
-    sandbox_slot = None
     if args.sandbox and networked:
-        sandbox_slot = SandboxStateSlot(validate_sandbox_state_path(args.sandbox_state, repo_root, paper_dir))
-        try:
-            sandbox_slot.reserve()       # writability probe BEFORE any request
-        except OSError as exc:
-            die(f"Error: --sandbox-state {sandbox_slot.path} cannot be created ({redact(exc)}). "
-                "Nothing was sent.")
+        # path validation only (outside the workspace, absent): nothing is created before the block check below
+        validate_sandbox_state_path(args.sandbox_state, repo_root, paper_dir)
 
     # ── Parse LaTeX ────────────────────────────────────────────────────────────
     tex_path = find_main_tex(paper_dir, config)
@@ -2684,11 +2700,22 @@ def main(argv=None):
             raw = raw[:doc_start] + expand_macros(raw[doc_start:], macros)
 
     title = extract_title(raw, macros)
+    # Block check: keyed on the paper directory (realpath), the concept (same host) and, so that a copy or
+    # another checkout of the same paper is recognised even for a first publication, on bib_key, title and
+    # zenodo.json content (same host). It runs before anything is created or sent.
     identity = journal_identity(config, title)
     if networked:
         blocking = find_blocking_journals(state_dir, paper_dir, [zenodo_id], host, identity)
         if blocking:
             die(blocking_message(blocking))
+    sandbox_slot = None
+    if args.sandbox and networked:
+        sandbox_slot = SandboxStateSlot(validate_sandbox_state_path(args.sandbox_state, repo_root, paper_dir))
+        try:
+            sandbox_slot.reserve()       # writability probe BEFORE any request
+        except OSError as exc:
+            die(f"Error: --sandbox-state {sandbox_slot.path} cannot be created ({redact(exc)}). "
+                "Nothing was sent.")
     abstract = extract_abstract(raw)
     keywords = extract_keywords(raw)
     # Version label: prefer the explicit semantic version in zenodo.json ("version": "1.1");
