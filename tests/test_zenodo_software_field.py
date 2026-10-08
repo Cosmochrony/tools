@@ -140,13 +140,13 @@ class UpdateFlow(unittest.TestCase):
 
     def test_update_without_code_url_cannot_clear_existing_repository(self):
         c = FakeClient(live_custom={F: "https://keep"}, published_custom="https://keep")
-        code, _, _ = run(self.upd, c, code_url="")
+        code, _, _ = run(self.upd, c, code_url="", fields=("title",))
         self.assertIsNone(code)
         self.assertEqual(c.meta_put["custom"][F], "https://keep")
 
     def test_update_detects_dropped_custom_and_cleans_edit_session(self):
         c = FakeClient(live_custom={F: "https://keep"}, put_keeps_custom=False)
-        code, _, _ = run(self.upd, c, code_url="")
+        code, _, _ = run(self.upd, c, code_url="", fields=("title",))
         self.assertNotEqual(code, None)
         self.assertNotIn("publish", c.names())
         self.assertEqual([x for x in c.calls if x[0] == "discard"], [("discard", 10)])

@@ -115,8 +115,13 @@ class FakeClient:
     def __init__(self, drafts=None, put_keeps_custom=True, published_custom=URL, live_custom=None,
                  fail_at=None, fail_exc=None, discard_status=201, latest_draft=None,
                  uncertain_at=None, late_drafts=None, state_after_publish="unsubmitted",
-                 record_state="done", draft_files=None, record_concept="5"):
+                 record_state="done", draft_files=None, record_concept="5", draft_state=None,
+                 unreadable_after_publish=False, record_version=None, record_headers=None):
         self.calls, self.created_state = [], None
+        self.journal, self.uploaded_pdf = None, None
+        self.draft_state, self.unreadable_after_publish = draft_state, unreadable_after_publish
+        self.record_version = record_version
+        self.discard_kinds = []
         self.drafts, self.put_keeps_custom = list(drafts or []), put_keeps_custom
         self.published_custom, self.live_custom = published_custom, live_custom or {}
         self.fail_at, self.fail_exc = fail_at, fail_exc
@@ -146,15 +151,21 @@ class FakeClient:
 
     def get_deposition(self, i):
         self._c("get_deposition", i)
+        if self.unreadable_after_publish and "publish" in self.names() and i != 10:
+            raise RuntimeError("read failed after publish")
         if i == 10 and self.created_state is None:
             rec = {"id": 10, "state": self.record_state, "conceptrecid": self.record_concept,
                    "links": {"latest_draft": self.latest_draft} if self.latest_draft else {},
                    "metadata": {"title": "t", "custom": dict(self.live_custom)}}
+            if self.record_version is not None:
+                rec["metadata"]["version"] = self.record_version
             return rec
         meta = dict(self.meta_put or {"title": "t", "custom": dict(self.live_custom)})
         if self.meta_put is not None and not self.put_keeps_custom:
             meta.pop("custom", None)
         state = self.state_after_publish if "publish" in self.names() else "unsubmitted"
+        if self.draft_state is not None and i != 10:
+            state = self.draft_state
         d = {"id": i, "state": state, "conceptrecid": "5", "metadata": meta,
              "files": [{"filename": n} for n in (self.files if self.draft_files is None else self.draft_files)]}
         if state == "done":
@@ -183,7 +194,7 @@ class FakeClient:
     def delete_file(self, *a):
         self._c("delete_file"); self.files = [n for n in self.files if n != "old.pdf"]
 
-    def upload_file(self, dep, path):
+    def upload_file(self, dep, path, expected_sha256=None):
         self._c("upload"); self.files.append(Path(path).name)
 
     def set_metadata(self, i, m):
@@ -194,7 +205,8 @@ class FakeClient:
         return {"id": i, "doi": "10.5281/zenodo.1", "conceptdoi": "10.5281/zenodo.0", "conceptrecid": "5",
                 "metadata": {}}
 
-    def discard(self, i):
+    def discard(self, i, kind=None):
+        self.discard_kinds.append(kind)
         self._c("discard", i); return Resp(self.discard_status)
 
     def get_record(self, i):
@@ -230,9 +242,9 @@ def new(client, code_url=URL, zid=5, pdf="/x/p.pdf", **k):
     return zp.deposit_new(client, Path(pdf), meta, code_url, zid, "production", HOST, **k)
 
 
-def upd(client, code_url=URL, **k):
+def upd(client, code_url=URL, fields=("code-url", "title"), confirm="", **k):
     meta = zp.build_metadata("T", "A", [], "https://w", "1.0", code_url=code_url)
-    return zp.deposit_update(client, meta, code_url, 5, "production", HOST, **k)
+    return zp.deposit_update(client, meta, code_url, 5, "production", HOST, fields=fields, confirm=confirm, **k)
 
 
 @contextlib.contextmanager
@@ -287,6 +299,7 @@ class Sim(FakeSession):
         self.pub_custom, self.put_keeps_custom, self.discard_status = URL, True, 201
         self.list_page_cap = 100
         self.published_ids = []
+        self.cleanup_calls = []
 
     def add_draft(self, dep_id, concept="5", state="unsubmitted"):
         self.drafts[dep_id] = {"id": dep_id, "conceptrecid": concept, "state": state, "files": [],
@@ -375,12 +388,12 @@ class Sim(FakeSession):
                 return Resp(201, {})
             if path.endswith("/actions/discard"):
                 i = int(path.split("/")[-3])
+                self.cleanup_calls.append(("POST", i))
+                if i != 10:                         # documented: discard ends an EDITING SESSION only
+                    return Resp(400, text="Deposition is not being edited")
                 self.discarded.append(i)
                 if self.discard_status < 400:
-                    if i == 10:
-                        self.drafts.pop(10, None)
-                    else:
-                        self.drafts.pop(i, None)
+                    self.drafts.pop(10, None)
                 return Resp(self.discard_status, text="discard answer")
             if path.endswith("/actions/publish"):
                 i = int(path.split("/")[-3])
@@ -422,12 +435,23 @@ class Sim(FakeSession):
                 return Resp(201, {"key": path.rsplit("/", 1)[-1]})
             mm = re.fullmatch(r"/api/deposit/depositions/(\d+)", path)
             if mm:
+                if m["put"] == "interrupt":
+                    raise KeyboardInterrupt()
                 i = int(mm.group(1))
                 meta = dict(kw["json"]["metadata"])
                 if not self.put_keeps_custom:
                     meta.pop("custom", None)
                 self.drafts[i]["metadata"] = meta
                 return Resp(200, self._dep_json(i))
+        if method == "DELETE" and re.fullmatch(r"/api/deposit/depositions/(\d+)", path):
+            i = int(path.rsplit("/", 1)[-1])
+            self.cleanup_calls.append(("DELETE", i))
+            if i == 10 or self.drafts.get(i, {}).get("state") == "done":
+                return Resp(403, text="published depositions cannot be deleted")
+            self.discarded.append(i)
+            if self.discard_status < 400:
+                self.drafts.pop(i, None)
+            return Resp(self.discard_status, text="discard answer")
         if method == "DELETE" and "/files/" in path:
             if m["delete"] == "500":
                 return Resp(500, text="boom")

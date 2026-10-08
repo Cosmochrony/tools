@@ -53,7 +53,21 @@ class Factory:
         return self.client
 
 
+_STATE_DIRS = {}
+
+
+def state_dir_for(root):
+    """One journal directory per fake workspace, OUTSIDE it (as the tool requires)."""
+    key = str(root)
+    if key not in _STATE_DIRS:
+        _STATE_DIRS[key] = Path(tempfile.mkdtemp()).resolve()
+    return _STATE_DIRS[key]
+
+
 def run_main(argv, env, root, factory=None, extra=()):
+    argv = list(argv)
+    if "--dry-run" not in argv and "--state-dir" not in argv and "--reconcile" not in argv:
+        argv += ["--state-dir", str(state_dir_for(root))]
     patches = [mock.patch.object(zp, "REPO_ROOT", root.resolve()),
                mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""), **env}, clear=True)]
     if factory is not None:
@@ -220,14 +234,14 @@ class C2SandboxIsolation(unittest.TestCase):
 
     def test_update_sandbox_run_changes_no_production_file(self):
         root, paper, state, before, after, f, (code, _, _) = self.sandbox_run(
-            extra=("--update", "--sandbox-zenodo-id", "77"), cfg={"zenodo_id": 5})
+            extra=("--update", "--set-title", "--yes-apply-diff", "--sandbox-zenodo-id", "77"), cfg={"zenodo_id": 5})
         self.assertIsNone(code, code)
         self.assertEqual(before, after)
         self.assertTrue(state.exists())
 
     def test_update_sandbox_without_sandbox_id_refuses_even_if_config_has_production_id(self):
         root, paper, state, before, after, f, (code, _, _) = self.sandbox_run(
-            extra=("--update",), cfg={"zenodo_id": 5})
+            extra=("--update", "--set-title"), cfg={"zenodo_id": 5})
         self.assertIn("--update needs", code)
         self.assertEqual(before, after)
         self.assertEqual(f.client.calls, [])
@@ -554,7 +568,7 @@ class C5Timeouts(unittest.TestCase):
         self.assertEqual(len(sess.calls), 1)
 
     def test_writes_are_never_retried(self):
-        for method, call in (("POST", lambda c: c.publish(1)), ("POST", lambda c: c.discard(1)),
+        for method, call in (("POST", lambda c: c.publish(1)), ("POST", lambda c: c.discard(1, "edit session")), ("DELETE", lambda c: c.discard(1, "new-version draft")),
                              ("PUT", lambda c: c.set_metadata(1, {})), ("DELETE", lambda c: c.delete_file(1, "f")),
                              ("POST", lambda c: c.edit_deposition(1)), ("POST", lambda c: c.create_deposition())):
             c, sess = real_client(ZENODO_GET_ATTEMPTS=5)
@@ -864,7 +878,7 @@ class RealClientOverFakeSession(unittest.TestCase):
         sim = Sim(upload="500")
         sim.discard_status = 500
         client, _ = run_new_real(sim)
-        self.assertEqual(len(sim.posted("/actions/discard")), 1)
+        self.assertEqual(sim.cleanup_calls, [("DELETE", 301)])
 
     def test_sandbox_flow_uses_the_sandbox_host_and_token(self):
         sim = Sim()
