@@ -440,7 +440,8 @@ class RunJournal(unittest.TestCase):
         (jpath,) = state_dir_for(root).glob("*.run.json")
         before_cfg = (paper / "zenodo.json").read_text()
         f = Factory()
-        code, out, _ = run_main([str(paper), "--reconcile", str(jpath), "--outcome", "not-published"],
+        code, out, _ = run_main([str(paper), "--reconcile", str(jpath), "--outcome", "not-published",
+                                 "--i-checked-the-account", "--reason", "looked at /deposit and the record"],
                                 {}, root, f)
         self.assertIsNone(code, code)
         self.assertEqual(f.built, [])
@@ -579,7 +580,10 @@ class SandboxStateSafety(unittest.TestCase):
     def test_failed_local_save_message_is_mode_aware(self):
         self.assertIn("SANDBOX", zp._manual_state_hint(True))
         self.assertNotIn("zenodo_id (concept recid) and doi in zenodo.json BY HAND", zp._manual_state_hint(True))
-        self.assertIn("BY HAND", zp._manual_state_hint(False))
+        prod = zp._manual_state_hint(False)
+        self.assertIn("PUBLISHED-UNSAVED", prod)
+        self.assertIn("--reconcile", prod)
+        self.assertIn("zenodo.json", prod)
 
 
 # ── R5: real requests objects ────────────────────────────────────────────────────────────────

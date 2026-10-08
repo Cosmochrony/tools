@@ -65,6 +65,7 @@ import argparse
 import collections.abc
 import copy
 import difflib
+import errno
 import hashlib
 import json
 import math
@@ -77,6 +78,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 # The Cosmochrony repository root (this script lives in <root>/tools/). Used as the
@@ -526,6 +528,7 @@ DEFAULT_CONNECT_TIMEOUT = 10.0
 DEFAULT_READ_TIMEOUT = 60.0
 DEFAULT_UPLOAD_READ_TIMEOUT = 900.0
 DEFAULT_GET_ATTEMPTS = 3          # GET only (idempotent); POST/PUT/DELETE are never retried
+MAX_GET_ATTEMPTS = 10             # upper bound validated at startup (F13)
 DEFAULT_RETRY_BACKOFF = 1.0       # 1, 2, 4 ... seconds, capped at 30
 MAX_LIST_PAGES = 50               # pagination cap; hitting it without an empty page fails closed
 LIST_PAGE_SIZE = 100
@@ -554,24 +557,28 @@ def _env_number(name: str, default: float, environ=None) -> float:
     return value
 
 
-# (name, default, minimum accepted, exclusive minimum). Attempt counts are clamped later, never refused.
+# (name, default, minimum accepted, exclusive minimum, maximum accepted or None). A value below 1 for an
+# attempt count is clamped to 1 later; ZENODO_VERIFY_ATTEMPTS above its cap is clamped (verify_attempts),
+# every other upper bound REFUSES at startup (F13).
 NUMERIC_ENV = (
-    ("ZENODO_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT, 0.0, True),
-    ("ZENODO_READ_TIMEOUT", DEFAULT_READ_TIMEOUT, 0.0, True),
-    ("ZENODO_UPLOAD_TIMEOUT", DEFAULT_UPLOAD_READ_TIMEOUT, 0.0, True),
-    ("ZENODO_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF, 0.0, False),
-    ("ZENODO_GET_ATTEMPTS", DEFAULT_GET_ATTEMPTS, None, False),
-    ("ZENODO_VERIFY_ATTEMPTS", DEFAULT_VERIFY_ATTEMPTS, None, False),
+    ("ZENODO_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT, 0.0, True, 300.0),
+    ("ZENODO_READ_TIMEOUT", DEFAULT_READ_TIMEOUT, 0.0, True, 3600.0),
+    ("ZENODO_UPLOAD_TIMEOUT", DEFAULT_UPLOAD_READ_TIMEOUT, 0.0, True, 86400.0),
+    ("ZENODO_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF, 0.0, False, 60.0),
+    ("ZENODO_GET_ATTEMPTS", DEFAULT_GET_ATTEMPTS, None, False, float(MAX_GET_ATTEMPTS)),
+    ("ZENODO_VERIFY_ATTEMPTS", DEFAULT_VERIFY_ATTEMPTS, None, False, None),
 )
 
 
 def validate_numeric_env(environ=None) -> None:
-    """Parse EVERY tunable numeric setting at startup, before any request (R11). Exits on a bad value."""
-    for name, default, minimum, exclusive in NUMERIC_ENV:
+    """Parse EVERY tunable numeric setting at startup, before any request (R11, F13). Exits on a bad value."""
+    for name, default, minimum, exclusive, maximum in NUMERIC_ENV:
         value = _env_number(name, default, environ)
         if minimum is not None and (value <= minimum if exclusive else value < minimum):
             sys.exit(f"Error: environment variable {name} must be "
                      f"{'>' if exclusive else '>='} {minimum:g}, got {value:g}")
+        if maximum is not None and value > maximum:
+            sys.exit(f"Error: environment variable {name} must be <= {maximum:g}, got {value:g}")
 
 
 # ── Secrets never reach a message (R10) ────────────────────────────────────────
@@ -589,12 +596,43 @@ def register_secret(value) -> None:
         _SECRETS.add(value)
 
 
+_BEARER = re.compile(r"(?i)\bbearer\s+\S+")
+_TOKEN_QUERY = re.compile(r"(?i)\b(access_token|token|api_key|apikey)=[^&\s\"'<>]+")
+_AUTH_HEADER = re.compile(r"(?i)\bauthorization(['\"]?\s*[:=]\s*['\"]?)(?!bearer\b)\S+")
+
+
 def redact(text) -> str:
-    """str(text) with every registered secret and any ``Bearer ...`` string replaced."""
+    """str(text) with every registered secret, any ``Bearer ...`` string, any ``access_token=...`` query
+    parameter and any ``Authorization: <value>`` header replaced. This is the ONLY redaction function:
+    messages, HTTP bodies, exception texts and every value persisted in a run journal go through it."""
     out = str(text)
     for secret in sorted(_SECRETS, key=len, reverse=True):
         out = out.replace(secret, "[REDACTED]")
-    return re.sub(r"(?i)\bbearer\s+\S+", "Bearer [REDACTED]", out)
+    out = _BEARER.sub("Bearer [REDACTED]", out)
+    out = _TOKEN_QUERY.sub(lambda m: m.group(1) + "=[REDACTED]", out)
+    return _AUTH_HEADER.sub(lambda m: "Authorization" + m.group(1) + "[REDACTED]", out)
+
+
+def redact_obj(obj):
+    """``redact`` applied to every string (keys and values) of a JSON-like structure."""
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return {redact(k) if isinstance(k, str) else k: redact_obj(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [redact_obj(v) for v in obj]
+    return obj
+
+
+def register_environment_secrets(environ=None) -> None:
+    """Register the exact tokens loaded in this process (both variables, whatever the mode), so that a token of
+    the other environment is also masked if it ever appears in a message or a journal."""
+    environ = os.environ if environ is None else environ
+    for name in (PRODUCTION_TOKEN_VAR, SANDBOX_TOKEN_VAR):
+        raw = environ.get(name)
+        if isinstance(raw, str) and len(raw.strip()) >= 8:
+            register_secret(raw)
+            register_secret(raw.strip())
 
 
 def die(message) -> "NoReturn":  # noqa: F821
@@ -609,11 +647,21 @@ def _redacting_excepthook(etype, value, tb):
 
 # ── File digests ───────────────────────────────────────────────────────────────
 
-def file_digests(path) -> dict:
-    """sha256, md5 (Zenodo's file checksum) and size of the bytes currently in ``path``."""
-    data = Path(path).read_bytes()
-    return {"name": Path(path).name, "sha256": hashlib.sha256(data).hexdigest(),
+def bytes_digests(data: bytes, name: str) -> dict:
+    """sha256, md5 (Zenodo's file checksum) and size of ``data``."""
+    return {"name": name, "sha256": hashlib.sha256(data).hexdigest(),
             "md5": hashlib.md5(data, usedforsecurity=False).hexdigest(), "size": len(data)}
+
+
+def file_digests(path) -> dict:
+    """sha256, md5 and size of the bytes currently in ``path`` (read once)."""
+    return bytes_digests(Path(path).read_bytes(), Path(path).name)
+
+
+def read_pdf_once(path) -> tuple:
+    """(bytes, digests): the PDF is read ONCE; the digest, the upload and the archive all use these bytes."""
+    data = Path(path).read_bytes()
+    return data, bytes_digests(data, Path(path).name)
 
 
 class ZenodoAPIError(Exception):
@@ -668,12 +716,20 @@ def resolve_token(sandbox: bool, environ=None) -> str:
 
 # ── Durable run journal ────────────────────────────────────────────────────────
 
-# A run's known state is written atomically (temp + os.replace) BEFORE any publication-related write is
-# sent and after each step, to a directory OUTSIDE the workspace (--state-dir). While a journal of a paper
-# (or of its concept) says RUNNING / UNRECONCILED / DRAFT-LEFT-BEHIND, every later run refuses to start.
-BLOCKING_OUTCOMES = ("RUNNING", "UNRECONCILED", "DRAFT-LEFT-BEHIND")
+# A run's known state is written atomically (unique temp + fsync + os.replace + directory fsync) BEFORE any
+# publication-related write is sent and after each step, to a directory OUTSIDE the workspace (--state-dir).
+# While a journal of a paper (or of its concept) says RUNNING / UNRECONCILED / DRAFT-LEFT-BEHIND /
+# PUBLISHED-UNSAVED, every later run refuses to start.
+#
+# PUBLISHED-UNSAVED is set the moment a publication is known to have succeeded (the publish answer, or a read
+# showing state 'done') and becomes PUBLISHED only after zenodo.json has been written AND read back (sandbox:
+# after the sandbox state file was committed). A failed local save, a Ctrl-C right after publish returns, a
+# crash: the journal stays PUBLISHED-UNSAVED and blocks, so a re-run cannot publish twice.
+UNSAVED_OUTCOME = "PUBLISHED-UNSAVED"
+BLOCKING_OUTCOMES = ("RUNNING", "UNRECONCILED", "DRAFT-LEFT-BEHIND", UNSAVED_OUTCOME)
 PUBLISHED_OUTCOMES = ("PUBLISHED", "PUBLISHED-RECONCILED")
 JOURNAL_SUFFIX = ".run.json"
+QUARANTINE_SUFFIX = ".quarantined"
 
 
 class JournalError(Exception):
@@ -690,13 +746,73 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
+def _realpath(p) -> str:
+    return os.path.realpath(str(p))
+
+
+def _fsync_file(fh) -> None:
+    """Flush ``fh`` to disk: fsync, then (macOS) F_FULLFSYNC as well, best effort."""
+    fh.flush()
+    os.fsync(fh.fileno())
+    try:
+        import fcntl
+        fcntl.fcntl(fh.fileno(), fcntl.F_FULLFSYNC)      # macOS: also flush the drive cache
+    except (ImportError, AttributeError, OSError):
+        pass
+
+
+def _fsync_dir(directory: Path) -> None:
+    """fsync the directory so a rename/link survives a power loss. A filesystem that cannot fsync a
+    directory (EINVAL/ENOTSUP) is tolerated; any other error is raised."""
+    fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+    finally:
+        os.close(fd)
+
+
+def _temp_sibling(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
-    with open(tmp, "w", encoding="utf-8") as fh:
+    """Replace ``path`` atomically: unique temp in the same directory, fsync, os.replace, fsync of the directory."""
+    tmp = _temp_sibling(path)
+    with open(tmp, "x", encoding="utf-8") as fh:
         fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
+        _fsync_file(fh)
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def _create_exclusive_text(path: Path, text: str) -> None:
+    """Create ``path`` with ``text`` only if it does not exist: the content is written and fsynced under a unique
+    temp name, then hard-linked to ``path`` (os.link fails with FileExistsError if it exists, never
+    overwrites); the temp name this call created is then released. A partial file is never visible under ``path``."""
+    tmp = _temp_sibling(path)
+    with open(tmp, "x", encoding="utf-8") as fh:
+        fh.write(text)
+        _fsync_file(fh)
+    try:
+        os.link(tmp, path)
+    finally:
+        os.unlink(tmp)           # the temp THIS call just created (not a stray found on disk)
+    _fsync_dir(path.parent)
+
+
+def _journal_text(data: dict) -> str:
+    """The ONLY serialisation of a journal: every string is redacted BEFORE it is written (F7)."""
+    return json.dumps(redact_obj(data), indent=2, ensure_ascii=False) + "\n"
+
+
+def config_fingerprint(config: dict) -> str:
+    """sha256 of the canonical zenodo.json content (used, with bib_key and title, to recognise the same paper
+    from another path)."""
+    return hashlib.sha256(json.dumps(config, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 class Journal:
@@ -705,27 +821,31 @@ class Journal:
 
     @classmethod
     def create(cls, state_dir: Path, paper_dir: Path, host: str, sandbox: bool, intent: dict,
-               version=None, concept_id=None) -> "Journal":
+               version=None, concept_id=None, identity=None) -> "Journal":
         state_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         base = re.sub(r"[^A-Za-z0-9_.-]", "_", paper_dir.name)
         if concept_id:
             base += f"-c{re.sub(r'[^0-9A-Za-z]', '_', str(concept_id))}"
         path = state_dir / f"{base}-{stamp}-{os.getpid()}-{uuid.uuid4().hex[:6]}{JOURNAL_SUFFIX}"
-        data = {"schema": 1, "paper": paper_dir.name, "paper_dir": str(paper_dir), "host": host,
-                "sandbox": bool(sandbox), "intent": intent, "version": version,
+        identity = identity or {}
+        data = {"schema": 2, "paper": paper_dir.name, "paper_dir": str(paper_dir),
+                "paper_dir_real": _realpath(paper_dir), "host": host,
+                "sandbox": bool(sandbox), "kind": "update" if (intent or {}).get("update") else "deposit",
+                "intent": intent, "version": version,
+                "bib_key": identity.get("bib_key"), "title": identity.get("title"),
+                "config_sha256": identity.get("config_sha256"),
                 "phase": "start", "outcome": "RUNNING", "deposition_id": None, "record_id": None,
                 "concept_id": None if concept_id in (None, "") else str(concept_id),
                 "pdf": None, "writes_sent": 0, "last_write": None, "started_at": _now(), "notes": []}
         journal = cls(path, data)
-        if path.exists():
-            raise JournalError(f"journal {path} already exists")
-        journal._write()
+        data["updated_at"] = _now()
+        _create_exclusive_text(path, _journal_text(data))      # exclusive: never over an existing journal
         return journal
 
     def _write(self) -> None:
         self.data["updated_at"] = _now()
-        _atomic_write_text(self.path, json.dumps(self.data, indent=2, ensure_ascii=False) + "\n")
+        _atomic_write_text(self.path, _journal_text(self.data))
 
     def update(self, **fields) -> None:
         """Merge and persist. A write failure here (after an answer) is LOUD but never masks the outcome."""
@@ -751,16 +871,22 @@ class Journal:
                                "refusing to send a publication-related request") from exc
 
     def mark_published(self, dep_id, body: dict) -> None:
+        """A publication is known to have succeeded. Outcome PUBLISHED-UNSAVED (BLOCKING) until the local
+        state is saved and read back (``mark_saved``)."""
         body = body if isinstance(body, dict) else {}
         meta = body.get("metadata") or {}
         files = [{"filename": f.get("filename") or f.get("key"), "checksum": f.get("checksum"),
                   "filesize": f.get("filesize")} for f in (body.get("files") or []) if isinstance(f, dict)]
-        self.update(outcome="PUBLISHED", phase="published", deposition_id=dep_id,
+        self.update(outcome=UNSAVED_OUTCOME, phase="published; local state not yet saved", deposition_id=dep_id,
                     record_id=body.get("id", dep_id), doi=body.get("doi"),
                     concept_id=str(body.get("conceptrecid") or meta.get("conceptrecid")
                                    or self.data.get("concept_id") or "") or None,
                     concept_doi=body.get("conceptdoi") or meta.get("conceptdoi"),
                     published_files=files)
+
+    def mark_saved(self, **extra) -> None:
+        """The local state was written and read back: the block is lifted."""
+        self.update(outcome="PUBLISHED", phase="local state saved", **extra)
 
     def outcome(self) -> str:
         return self.data.get("outcome")
@@ -777,14 +903,26 @@ def load_journals(state_dir: Path) -> list:
         return out
     for path in sorted(state_dir.glob(f"*{JOURNAL_SUFFIX}")):
         try:
-            out.append((path, json.loads(path.read_text(encoding="utf-8"))))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             out.append((path, None))
+            continue
+        out.append((path, data if isinstance(data, dict) else None))
     return out
 
 
-def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), host=None) -> list:
+def journal_identity(config: dict, title=None) -> dict:
+    return {"bib_key": config.get("bib_key"), "title": title, "config_sha256": config_fingerprint(config)}
+
+
+def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), host=None, identity=None) -> list:
+    """Blocking journals that concern this paper. A journal matches when ANY of these holds (all documented):
+    the same paper directory (realpath); the same concept id on the same host; on the same host, the same
+    bib_key, the same title or the same zenodo.json content hash (so a copy/another checkout of the paper is
+    recognised even for a first publication, when no concept id exists yet)."""
     concepts = {str(c) for c in concept_ids if c not in (None, "")}
+    identity = identity or {}
+    here = _realpath(paper_dir)
     blocking = []
     for path, data in load_journals(state_dir):
         if data is None:
@@ -793,11 +931,19 @@ def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), hos
             continue
         if data.get("outcome") not in BLOCKING_OUTCOMES:
             continue
-        same_paper = data.get("paper_dir") == str(paper_dir)
-        same_concept = bool(concepts) and str(data.get("concept_id")) in concepts \
-            and (host is None or data.get("host") == host)
-        if same_paper or same_concept:
-            blocking.append((path, data))
+        why = []
+        if data.get("paper_dir") and _realpath(data.get("paper_dir_real") or data["paper_dir"]) == here:
+            why.append("same paper directory")
+        if concepts and str(data.get("concept_id")) in concepts \
+                and (host is None or data.get("host") == host):
+            why.append("same concept")
+        if data.get("host") == host:
+            for key, label in (("bib_key", "same bib_key"), ("title", "same title"),
+                               ("config_sha256", "same zenodo.json content")):
+                if identity.get(key) and data.get(key) == identity[key]:
+                    why.append(label)
+        if why:
+            blocking.append((path, dict(data, matched_by=why)))
     return blocking
 
 
@@ -809,52 +955,190 @@ def blocking_message(blocking: list) -> str:
         lines.append(f"    outcome={data.get('outcome')} phase={data.get('phase')!r} host={data.get('host')} "
                      f"deposition={data.get('deposition_id')} concept={data.get('concept_id')} "
                      f"pdf_sha256={(data.get('pdf') or {}).get('sha256')}")
+        if data.get("matched_by"):
+            lines.append(f"    matched by: {', '.join(data['matched_by'])}")
         host = data.get("host") or PRODUCTION_HOST
         for note in (data.get("notes") or [])[-3:]:
             lines.append(f"    note: {note}")
+        if data.get("outcome") == "UNREADABLE":
+            lines.append("    this journal cannot be read: its content is unknown. After checking "
+                         "https://zenodo.org/deposit yourself:")
+            lines.append(f"      zenodo_publish.py --reconcile {path} --quarantine --reason \"what you checked\" "
+                         "(renames it to *.quarantined in the same directory; nothing is deleted)")
+            continue
         lines.append(f"    inspect: https://{host}/deposit  and  https://{host}/record/{data.get('deposition_id')}")
-    lines.append("Then state what you found, locally and without any network access from this tool:")
-    lines.append("  zenodo_publish.py <paper_dir> --reconcile <journal> --outcome published --record-id N "
-                 "[--concept-id C --concept-doi D]")
-    lines.append("  zenodo_publish.py <paper_dir> --reconcile <journal> --outcome not-published "
-                 "(only after any leftover draft was discarded by hand)")
+        if data.get("outcome") == UNSAVED_OUTCOME:
+            lines.append("    The publication SUCCEEDED but the local state was not saved: a re-run would publish a "
+                         "duplicate. Write it down with (this tool writes only the paper directory recorded in "
+                         "the journal, nothing is sent):")
+            lines.append(f"      zenodo_publish.py --reconcile {path} --outcome published --record-id N "
+                         "--concept-id C --concept-doi D")
+            continue
+        lines.append("    Then state what you found, locally and without any network access from this tool:")
+        lines.append(f"      zenodo_publish.py --reconcile {path} --outcome published --record-id N "
+                     "--concept-id C --concept-doi D")
+        lines.append(f"      zenodo_publish.py --reconcile {path} --outcome not-published "
+                     "(--record-url URL | --i-checked-the-account --reason \"...\") "
+                     "(only after any leftover draft was discarded by hand)")
     return "\n".join(lines)
 
 
-def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None, concept_doi=None) -> dict:
-    """Operator-asserted, local only. Returns the updated journal data."""
+class ReconcileRefused(Exception):
+    """A reconcile request that must not be applied (message for the operator)."""
+
+
+def read_journal_strict(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        sys.exit(f"Error: cannot read the journal {path} ({exc})")
-    if not path.name.endswith(JOURNAL_SUFFIX):
-        sys.exit(f"Error: {path} is not a run journal (*{JOURNAL_SUFFIX})")
-    if data.get("outcome") not in BLOCKING_OUTCOMES:
-        sys.exit(f"Error: the journal {path.name} is not unreconciled (outcome {data.get('outcome')!r}).")
-    if outcome == "published":
-        if not record_id:
-            sys.exit("Error: --outcome published needs --record-id N (the record you inspected).")
-        data.update(outcome="PUBLISHED-RECONCILED", record_id=record_id, operator_asserted=True)
-        if concept_id:
-            data["concept_id"] = str(concept_id)
-        if concept_doi:
-            data["concept_doi"] = concept_doi
-    else:
-        data.update(outcome="NOT-PUBLISHED-RECONCILED", operator_asserted=True)
-    data["reconciled_at"] = _now()
-    data.setdefault("notes", []).append(f"{_now()} reconciled by the operator: {outcome}")
-    _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        raise ReconcileRefused(
+            f"cannot read the journal {path} ({redact(exc)}). If it is corrupt, after checking the account "
+            f"yourself: --reconcile {path} --quarantine --reason \"...\" (renames it, deletes nothing)") from exc
+    if not isinstance(data, dict):
+        raise ReconcileRefused(f"the journal {path} is not a JSON object. Use --quarantine (see --help).")
     return data
 
 
-def latest_published_journal(state_dir: Path, paper_dir: Path):
+def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None, concept_doi=None,
+                      record_url=None, checked_account=False, reason=None, paper_dir_arg=None) -> dict:
+    """Operator-asserted, local only. Returns the updated journal data.
+
+    It writes ONLY the paper directory recorded in the journal (a ``paper_dir_arg`` that is a different
+    directory is refused), and only after checking that zenodo.json's bib_key and zenodo_id are consistent with
+    the journal. ``not-published`` needs evidence (a record URL, or --i-checked-the-account with a reason)."""
+    if not path.name.endswith(JOURNAL_SUFFIX):
+        raise ReconcileRefused(f"{path} is not a run journal (*{JOURNAL_SUFFIX})")
+    data = read_journal_strict(path)
+    if data.get("outcome") not in BLOCKING_OUTCOMES:
+        raise ReconcileRefused(f"the journal {path.name} is not unreconciled (outcome {data.get('outcome')!r}).")
+    jdir = data.get("paper_dir")
+    if not jdir:
+        raise ReconcileRefused(f"the journal {path.name} records no paper directory: it cannot be reconciled "
+                               "against any zenodo.json")
+    if paper_dir_arg is not None and _realpath(paper_dir_arg) != _realpath(data.get("paper_dir_real") or jdir):
+        raise ReconcileRefused(
+            f"the journal belongs to the paper directory {jdir}, not {paper_dir_arg}: refusing. A reconcile "
+            "writes only the paper directory recorded in the journal.")
+    host = data.get("host") or PRODUCTION_HOST
+    evidence = {}
+    if outcome == "published":
+        if not record_id:
+            raise ReconcileRefused("--outcome published needs --record-id N (the record you inspected).")
+        cid = str(concept_id or data.get("concept_id") or "") or None
+        cdoi = concept_doi or data.get("concept_doi")
+        writes_config = not data.get("sandbox") and data.get("kind") != "update"
+        if writes_config:
+            if not cid or not cdoi:
+                raise ReconcileRefused(
+                    "a production deposit is only reconciled as published together with the identifiers to save: "
+                    "pass --concept-id C --concept-doi D (the concept record id and DOI you read on the record "
+                    "page); they are written to the zenodo.json of the paper directory recorded in the journal.")
+            cfg_path = Path(jdir) / "zenodo.json"
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ReconcileRefused(f"cannot read {cfg_path} ({redact(exc)})") from exc
+            if data.get("bib_key") and cfg.get("bib_key") != data["bib_key"]:
+                raise ReconcileRefused(f"{cfg_path} has bib_key {cfg.get('bib_key')!r} but the journal was "
+                                       f"written for {data['bib_key']!r}: not the same paper, nothing written.")
+            if cfg.get("zenodo_id") not in (None, "") and str(cfg["zenodo_id"]) != str(cid):
+                raise ReconcileRefused(f"{cfg_path} already has zenodo_id {cfg['zenodo_id']} but you assert "
+                                       f"concept {cid}: another concept, nothing written.")
+            if str(cfg.get("zenodo_id")) != str(cid) or cfg.get("doi") != cdoi:
+                cfg["zenodo_id"], cfg["doi"] = int(cid), cdoi
+                _atomic_write_text(cfg_path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+            check = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if str(check.get("zenodo_id")) != str(cid) or check.get("doi") != cdoi:
+                raise ReconcileRefused(f"{cfg_path} does not hold the identifiers after writing: check it by hand")
+            evidence["config_written"] = str(cfg_path)
+        data.update(outcome="PUBLISHED-RECONCILED", record_id=record_id, operator_asserted=True)
+        if cid:
+            data["concept_id"] = str(cid)
+        if cdoi:
+            data["concept_doi"] = cdoi
+    else:
+        if data.get("outcome") == UNSAVED_OUTCOME:
+            raise ReconcileRefused(
+                "the journal says the publish call SUCCEEDED (PUBLISHED-UNSAVED): it cannot be reconciled as "
+                "not-published. Use --outcome published with the record id, concept id and concept DOI.")
+        if record_url:
+            if not str(record_url).startswith(f"https://{host}/"):
+                raise ReconcileRefused(f"--record-url must be a https://{host}/... URL (the page you inspected)")
+            evidence["record_url"] = record_url
+        elif checked_account and reason:
+            evidence.update(checked_account=True)
+        else:
+            raise ReconcileRefused(
+                "--outcome not-published clears the block on the operator's word alone: give --record-url URL "
+                "(the record/draft page you inspected) or --i-checked-the-account together with "
+                "--reason \"free text\".")
+        data.update(outcome="NOT-PUBLISHED-RECONCILED", operator_asserted=True)
+    if reason:
+        evidence["reason"] = reason
+    data["operator_evidence"] = evidence
+    data["reconciled_at"] = _now()
+    data.setdefault("notes", []).append(f"{_now()} reconciled by the operator: {outcome} {evidence}")
+    _atomic_write_text(path, _journal_text(data))
+    return data
+
+
+def quarantine_journal(path: Path, reason: str) -> Path:
+    """Rename an UNREADABLE journal to <name>.quarantined (same directory, never deleted, never over a file).
+    Prints the path and the size of the corrupt content first. A readable journal is refused."""
+    if not path.name.endswith(JOURNAL_SUFFIX):
+        raise ReconcileRefused(f"{path} is not a run journal (*{JOURNAL_SUFFIX})")
+    if not reason or not reason.strip():
+        raise ReconcileRefused("--quarantine needs --reason \"what you checked on the account\"")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ReconcileRefused(f"cannot stat {path} ({redact(exc)})") from exc
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    else:
+        raise ReconcileRefused(f"{path} is a readable journal: use --outcome published|not-published")
+    print(f"Unreadable journal: {path} ({size} bytes). It will be renamed, not deleted.")
+    target = path.with_name(path.name + QUARANTINE_SUFFIX)
+    n = 0
+    while target.exists() or target.is_symlink():
+        n += 1
+        target = path.with_name(f"{path.name}{QUARANTINE_SUFFIX}.{n}")
+    os.rename(path, target)
+    _fsync_dir(path.parent)
+    note = target.with_name(target.name + ".note.txt")
+    _create_exclusive_text(note, redact(f"quarantined {_now()}: {reason}\n"))
+    return target
+
+
+def select_deposit_journal(state_dir: Path, paper_dir: Path, explicit=None):
+    """The journal ``--finish-after-fail`` is bound to: the NEWEST production journal of this paper that is a
+    deposit (not --update) and carries a PDF digest and a publication (PUBLISHED, PUBLISHED-RECONCILED or
+    PUBLISHED-UNSAVED); journals of other kinds, sandbox journals and runs that published nothing never
+    shadow it. ``explicit`` (--journal PATH) overrides the choice but is held to the same rules.
+    Returns (path, data) or (None, None)."""
+    def eligible(data):
+        return (data and _realpath(data.get("paper_dir_real") or data.get("paper_dir") or "") == _realpath(paper_dir)
+                and not data.get("sandbox") and data.get("kind", "update" if (data.get("intent") or {}).get("update")
+                                                        else "deposit") == "deposit"
+                and (data.get("pdf") or {}).get("sha256")
+                and data.get("outcome") in PUBLISHED_OUTCOMES + (UNSAVED_OUTCOME,))
+    if explicit is not None:
+        data = read_journal_strict(explicit)
+        if data.get("sandbox"):
+            die(f"Error: the journal {explicit.name} is a SANDBOX journal: --finish-after-fail never uses one. "
+                "Nothing was archived.")
+        if not eligible(data):
+            die(f"Error: the journal {explicit.name} is not a published production deposit of {paper_dir.name} "
+                "with a recorded PDF digest. Nothing was archived.")
+        return explicit, data
     best = None
     for path, data in load_journals(state_dir):
-        if data and data.get("paper_dir") == str(paper_dir) and data.get("outcome") in PUBLISHED_OUTCOMES \
-                and not data.get("sandbox"):
-            if best is None or str(data.get("updated_at")) >= str(best[1].get("updated_at")):
+        if eligible(data):
+            if best is None or str(data.get("started_at")) >= str(best[1].get("started_at")):
                 best = (path, data)
-    return best
+    return best if best else (None, None)
 
 
 def do_not_rerun_notice(client, host: str, dep_id=None) -> str:
@@ -862,8 +1146,9 @@ def do_not_rerun_notice(client, host: str, dep_id=None) -> str:
     where = f" Journal: {j.path}." if j is not None else ""
     return (f"!! DO NOT RE-RUN this deposit: its publication cannot be excluded (deposition {dep_id}).{where} "
             f"Inspect https://{host}/record/{dep_id} and https://{host}/deposit first. If it is published "
-            "state so with --reconcile <journal> --outcome published --record-id N; if it is not, discard any "
-            "leftover draft by hand, then --reconcile <journal> --outcome not-published.")
+            "state so with --reconcile <journal> --outcome published --record-id N --concept-id C "
+            "--concept-doi D; if it is not, discard any leftover draft by hand, then --reconcile <journal> "
+            "--outcome not-published (--record-url URL | --i-checked-the-account --reason \"...\").")
 
 
 # ── Cleanup calls: kind -> (method, path). Selectable, explicit, never guessed ─────────────
@@ -936,6 +1221,7 @@ class ZenodoClient:
         # Durable run journal (see Journal); None in unit tests that do not need one.
         self.journal = None
         self.uploaded_pdf: dict | None = None
+        self.uploaded_pdf_bytes: bytes | None = None
 
     # ── transport ──
     def _check_url(self, url: str) -> None:
@@ -1094,13 +1380,16 @@ class ZenodoClient:
         resp = self._request("DELETE", f"{self.base}/deposit/depositions/{dep_id}/files/{file_id}")
         self._check(resp)
 
-    def upload_file(self, deposition: dict, file_path: Path, expected_sha256: str | None = None) -> dict:
+    def upload_file(self, deposition: dict, file_path: Path, expected_sha256: str | None = None,
+                    data: bytes | None = None) -> dict:
         """Upload via S3 bucket API (new depositions and new versions). A failure raises.
 
-        The file is read ONCE; the bytes sent are the bytes digested. With ``expected_sha256`` (the digest
-        the journal recorded) a file that changed in between is refused."""
+        The bytes sent are the bytes digested: ``data`` (read once by the caller, who also journaled their
+        digest and will archive the same bytes) or, without it, the file read here. With ``expected_sha256``
+        (the digest the journal recorded) different bytes are refused."""
         bucket_url = deposition["links"]["bucket"]
-        data = Path(file_path).read_bytes()
+        if data is None:
+            data = Path(file_path).read_bytes()
         digest = hashlib.sha256(data).hexdigest()
         if expected_sha256 is not None and digest != expected_sha256:
             raise VerificationError(f"{Path(file_path).name} changed between the digest and the upload "
@@ -1125,6 +1414,11 @@ class ZenodoClient:
         if not resp.ok and is_definitive_refusal(ZenodoAPIError(resp)) and j is not None:
             j.update(outcome="RUNNING", phase=f"publish refused by the server (HTTP {resp.status_code})",
                      note="the server refused the publish request: nothing was published")
+        if resp.ok and j is not None:
+            # Signal-safe order: a success answer is recorded as a BLOCKING outcome before anything else can
+            # be interrupted (until now the journal said UNRECONCILED, also blocking).
+            j.update(outcome=UNSAVED_OUTCOME, phase="publish answered; local state not yet saved",
+                     deposition_id=dep_id)
         body = self._ok(resp)
         if j is not None:
             j.mark_published(dep_id, body)
@@ -1170,21 +1464,46 @@ def doi_cascade(repo_root: Path, bib_key: str, doi: str):
 
 
 class ArchiveRefused(Exception):
-    """The archive step would overwrite a different file, or the PDF is not the one that was uploaded."""
+    """The archive step would overwrite a different file, or the PDF is not the one that was uploaded, or the
+    copy could not be written and verified."""
+
+
+class ArchiveResult(NamedTuple):
+    path: Path
+    status: str            # 'archived' (written now) or 'identical' (already there, same sha256)
+
+
+def stray_archive_files(dest_dir: Path, dest_name: str) -> list:
+    """(path, size) of leftover temp files of an interrupted archive write. Only REPORTED, never deleted."""
+    if not dest_dir.is_dir():
+        return []
+    out = []
+    for p in sorted(dest_dir.glob(f".{dest_name}.*.tmp")):
+        try:
+            out.append((p, p.stat().st_size))
+        except OSError:
+            out.append((p, None))
+    return out
 
 
 def archive_pdf(repo_root: Path, pdf_path: Path, name_stem: str, version: str | None, rec_id,
-                expected_sha256: str | None = None) -> Path:
+                expected_sha256: str | None = None, data: bytes | None = None) -> ArchiveResult:
     """Copy the just-published PDF into the central <root>/pdfs/ archive, NEVER over an existing file.
 
     The archive name follows the repository convention <MainTexBasename>_<version>.pdf
-    (e.g. program_1.69.pdf). Falls back to the Zenodo record id when no git-branch
-    version label is available.
+    (e.g. program_1.69.pdf). Falls back to the Zenodo record id when no version label is available.
 
-    ``expected_sha256`` is the digest of the PDF that was UPLOADED: a different PDF is refused. An existing
-    destination is compared by sha256: identical -> reported and accepted, different -> ArchiveRefused with
-    both digests and nothing written."""
-    src = file_digests(pdf_path)
+    ``data`` (the bytes that were digested and uploaded, held in memory) is what gets written; without it the
+    file is read ONCE here. ``expected_sha256`` is the digest of the PDF that was UPLOADED: different bytes are
+    refused. An existing destination is compared by full sha256: identical -> ArchiveResult 'identical',
+    different -> ArchiveRefused with both digests and nothing written; a symlink or directory at the
+    destination is refused. The copy is written under a unique temp name next to the destination, fsynced and
+    verified, then hard-linked to the final name (os.link fails if the name exists): a failed write never
+    leaves a truncated file under the final name. A leftover temp file from an earlier failure is REPORTED
+    (path, size) and never deleted by this tool."""
+    if data is None:
+        data = Path(pdf_path).read_bytes()
+    src = bytes_digests(data, Path(pdf_path).name)
     if expected_sha256 is not None and src["sha256"] != expected_sha256:
         raise ArchiveRefused(
             f"{pdf_path} (sha256 {src['sha256']}) is not the PDF that was uploaded (sha256 {expected_sha256}): "
@@ -1192,24 +1511,54 @@ def archive_pdf(repo_root: Path, pdf_path: Path, name_stem: str, version: str | 
     label = version or str(rec_id)
     dest_dir = repo_root / "pdfs"
     dest = dest_dir / f"{name_stem}_{label}.pdf"
-    if dest.exists():
+    if dest_dir.is_symlink() or (dest_dir.exists() and not dest_dir.is_dir()):
+        raise ArchiveRefused(f"{dest_dir} is a symbolic link or not a directory: refusing to archive into it.")
+    if dest.is_symlink():
+        raise ArchiveRefused(f"{dest} is a symbolic link: refusing to archive through it. Nothing was written.")
+    if dest.is_dir():
+        raise ArchiveRefused(f"{dest} is a directory: refusing to archive. Nothing was written.")
+    for stray, size in stray_archive_files(dest_dir, dest.name):
+        print(f"  !! stray partial archive file from an earlier failed write: {stray} ({size} bytes); "
+              "it is NOT deleted by this tool: inspect it and remove it yourself.", file=sys.stderr)
+
+    def judge_existing() -> ArchiveResult:
         existing = file_digests(dest)
         if existing["sha256"] == src["sha256"]:
-            print(f"  Already archived, identical → {dest.relative_to(repo_root)} (sha256 {src['sha256']})")
-            return dest
+            print(f"  Already archived, identical → {_rel(dest, repo_root)} (sha256 {src['sha256']})")
+            return ArchiveResult(dest, "identical")
         raise ArchiveRefused(
             f"{dest} already exists with sha256 {existing['sha256']} but the PDF to archive has sha256 "
             f"{src['sha256']}: refusing to overwrite an archive. Nothing was written.")
+
+    if dest.exists():
+        return judge_existing()
     dest_dir.mkdir(exist_ok=True)
-    data = Path(pdf_path).read_bytes()
-    with open(dest, "xb") as fh:                      # exclusive create: cannot replace a file
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
+    tmp = dest_dir / f".{dest.name}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with open(tmp, "xb") as fh:
+            fh.write(data)
+            _fsync_file(fh)
+    except OSError as exc:
+        size = tmp.stat().st_size if tmp.exists() else 0
+        raise ArchiveRefused(
+            f"writing the archive copy failed ({redact(exc)}). A partial temp file ({size} bytes) was left at "
+            f"{tmp}: it is NOT deleted, inspect it. Nothing exists under the final name {dest.name}.") from exc
+    if file_digests(tmp)["sha256"] != src["sha256"]:
+        raise ArchiveRefused(f"the archive copy {tmp} does not match the source after writing; it is left in "
+                             f"place (not deleted) and nothing was created under {dest.name}.")
+    try:
+        os.link(tmp, dest)                                 # exclusive: fails if the name exists
+    except FileExistsError:
+        os.unlink(tmp)                                     # our own, complete, just-created temp
+        if dest.is_symlink() or dest.is_dir():
+            raise ArchiveRefused(f"{dest} appeared as a symbolic link or directory: refusing.")
+        return judge_existing()
+    os.unlink(tmp)                                         # our own temp; the final name now holds the bytes
+    _fsync_dir(dest_dir)
     if file_digests(dest)["sha256"] != src["sha256"]:
-        raise ArchiveRefused(f"the archived copy {dest} does not match the source after writing")
-    print(f"  Archived PDF → {dest.relative_to(repo_root)} (sha256 {src['sha256']})")
-    return dest
+        raise ArchiveRefused(f"the archived copy {dest} does not match the source after linking")
+    print(f"  Archived PDF → {_rel(dest, repo_root)} (sha256 {src['sha256']})")
+    return ArchiveResult(dest, "archived")
 
 
 # ── Metadata builder ───────────────────────────────────────────────────────────
@@ -1304,6 +1653,7 @@ def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
 # ── Version-label guard (independent of the pre-deposit gate and of --skip-checks) ──────────
 
 FORBIDDEN_LABELS = ("main", "master", "head")
+VERSION_SHAPE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,63}")
 UPDATABLE_FIELDS = {"version": "version", "title": "title", "abstract": "description", "keywords": "keywords",
                     "notes": "notes", "web-url": "related_identifiers", "publication-type": "publication_type",
                     "code-url": "custom"}
@@ -1347,8 +1697,10 @@ def check_version_label(outgoing, paper_dir: Path, config: dict, branch_rule: bo
         raise VersionLabelError("no version label (neither zenodo.json 'version' nor a version branch)")
     if v.lower() in FORBIDDEN_LABELS:
         raise VersionLabelError(f"the version label {v!r} must never be published (it is not a version)")
-    if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]*", v):
-        raise VersionLabelError(f"the version label {v!r} is not a plausible version string")
+    if not VERSION_SHAPE.fullmatch(v) or ".." in v:
+        raise VersionLabelError(f"the version label {v!r} is not a plausible version string "
+                                "(letters, digits and . _ + - only, starting with a letter or digit, at most 64 "
+                                "characters, no '..': it becomes part of an archive file name)")
     if config.get("version") is not None and str(config["version"]).strip() != v:
         raise VersionLabelError(f"outgoing version {v!r} != zenodo.json version {config['version']!r}")
     if branch_rule:
@@ -1368,8 +1720,39 @@ def check_version_label(outgoing, paper_dir: Path, config: dict, branch_rule: bo
 
 # ── --update: preserve the live metadata, change only what was explicitly requested ─────────
 
+CONFIRM_MIN_HEX = 12
+CONFIRM_SHAPE = re.compile(rf"[0-9a-f]{{{CONFIRM_MIN_HEX},64}}")
+
+
 class NothingToUpdate(Exception):
     pass
+
+
+def merge_related_web_url(live_list, entry: dict) -> list:
+    """The live ``related_identifiers`` with ONLY the web-page entry replaced or inserted; every other entry
+    (cites, isSupplementedBy of another resource, ...) is kept untouched and in place.
+
+    The entry to replace is the live one with the same identifier and relation; failing that, the single live
+    entry with the same relation and scheme whose resource_type equals ``entry``'s (a live entry that states no
+    resource_type matches too). Several candidates are ambiguous: refused. None: the entry is appended."""
+    items = copy.deepcopy(live_list) if isinstance(live_list, list) else []
+    dicts = [i for i, e in enumerate(items) if isinstance(e, dict)]
+    exact = [i for i in dicts if items[i].get("identifier") == entry.get("identifier")
+             and items[i].get("relation") == entry.get("relation")]
+    if exact:
+        items[exact[0]] = copy.deepcopy(entry)
+        return items
+    same_role = [i for i in dicts if items[i].get("relation") == entry.get("relation")
+                 and items[i].get("scheme") == entry.get("scheme")
+                 and items[i].get("resource_type") in (None, entry.get("resource_type"))]
+    if len(same_role) > 1:
+        raise ValueError(f"{len(same_role)} live related identifiers have the same relation/scheme/resource_type "
+                         "as the web page entry: cannot tell which one is the web url; edit it by hand")
+    if same_role:
+        items[same_role[0]] = copy.deepcopy(entry)
+    else:
+        items.append(copy.deepcopy(entry))
+    return items
 
 
 def build_update_payload(live: dict, built: dict, fields, code_url: str = "") -> dict:
@@ -1383,6 +1766,11 @@ def build_update_payload(live: dict, built: dict, fields, code_url: str = "") ->
             if not code_url:
                 raise ValueError("--set-code-url was requested but this paper has no code_url")
             payload["custom"] = {**(live.get("custom") or {}), CODE_REPOSITORY_FIELD: code_url}
+        elif field == "web-url":
+            entries = built.get("related_identifiers") or []
+            if len(entries) != 1:
+                raise ValueError("field 'web-url' was requested but the local state has no web_url")
+            payload[key] = merge_related_web_url(live.get(key), entries[0])
         elif key in built:
             payload[key] = copy.deepcopy(built[key])
         else:
@@ -1502,8 +1890,8 @@ def snapshot_before_first_publication(client, host: str):
     try:
         client.pre_run_draft_ids = {d.get("id") for d in client.list_drafts()}
     except Exception as exc:  # noqa: BLE001
-        sys.exit(f"Error: cannot snapshot the existing drafts ({exc}); without it an uncertain creation "
-                 "could not be attributed safely. Nothing was created. Refusing to proceed.")
+        die(f"Error: cannot snapshot the existing drafts ({redact(exc)}); without it an uncertain creation "
+            "could not be attributed safely. Nothing was created. Refusing to proceed.")
     client.concept_id = None
 
 
@@ -1527,7 +1915,7 @@ def locate_own_state(client, state: dict):
         try:
             dep = client.get_deposition(rid)
         except Exception as exc:  # noqa: BLE001
-            return "unknown", None, [rid], f"cannot read record {rid} ({exc})"
+            return "unknown", None, [rid], f"cannot read record {rid} ({redact(exc)})"
         if dep.get("state") == "done":
             return "none", None, [], f"record {rid} is in state 'done': no edit session exists"
         return "own", rid, [], ""
@@ -1536,7 +1924,7 @@ def locate_own_state(client, state: dict):
     try:
         drafts = client.list_drafts()
     except Exception as exc:  # noqa: BLE001
-        return "unknown", None, [], f"cannot list the drafts ({exc})"
+        return "unknown", None, [], f"cannot list the drafts ({redact(exc)})"
     cands = [d for d in drafts
              if d.get("id") not in snapshot
              and d.get("state") in UNPUBLISHED_STATES
@@ -1647,7 +2035,7 @@ def _cleanup(client, step: str, exc: BaseException, host: str, on_published):
                     on_published(dep)
                 except Exception as exc3:  # noqa: BLE001
                     save_error = exc3
-                    msg += (f"\n!! LOCAL STATE NOT SAVED ({redact(exc3)}). " + _manual_state_hint(sandbox)
+                    msg += (f"\n!! LOCAL STATE NOT SAVED ({redact(exc3)}). " + _manual_state_hint(sandbox, client)
                             + " DO NOT re-run the deposit: it would publish twice.")
             return msg, dep, save_error
     else:
@@ -1685,11 +2073,17 @@ def _cleanup(client, step: str, exc: BaseException, host: str, on_published):
             f"(--reconcile <journal> --outcome not-published).", None, None)
 
 
-def _manual_state_hint(sandbox: bool) -> str:
+def _manual_state_hint(sandbox: bool, client=None) -> str:
+    j = journal_of(client) if client is not None else None
+    ref = str(j.path) if j is not None else "<journal>"
     if sandbox:
         return ("This was a SANDBOX run: do NOT touch any production zenodo.json. The result is in the run "
-                "journal and was printed in full above.")
-    return "Set zenodo_id (concept recid) and doi in zenodo.json BY HAND."
+                f"journal ({ref}), which stays {UNSAVED_OUTCOME} and blocks later runs until you "
+                f"`--reconcile {ref} --outcome published --record-id N`.")
+    return (f"The run journal ({ref}) says {UNSAVED_OUTCOME} and BLOCKS every later run of this paper. Settle it "
+            f"with `--reconcile {ref} --outcome published --record-id N --concept-id C --concept-doi D`, "
+            "which writes zenodo_id and doi into the zenodo.json of the paper directory recorded in the "
+            "journal (nothing is sent); if you set them by hand first, run the same command to lift the block.")
 
 
 def abort_and_cleanup(client, step: str, exc: BaseException, host: str, on_published=None):
@@ -1758,7 +2152,7 @@ def verify_published_code_repository(client, rec_id: int, expected: str | None, 
         try:
             got = custom_repository(client.get_record(rec_id).get("metadata"))
         except Exception as exc:  # noqa: BLE001
-            got = f"<unreadable: {exc}>"
+            got = f"<unreadable: {redact(exc)}>"
         if _norm_url(got) == _norm_url(expected):
             print(f"  Software field on published record: PASS ({expected})")
             return
@@ -1772,13 +2166,34 @@ def verify_published_code_repository(client, rec_id: int, expected: str | None, 
         "metadata-only edit (--update) or by hand in the Zenodo UI.")
 
 
+def verify_upload_answer(answer, digest: dict):
+    """Compare the checksum Zenodo returns for the uploaded file (``md5:<hex>``, or a bare md5/sha256 hex) with
+    the local digest of the bytes sent. Raises VerificationError on a mismatch. Returns a note for the journal
+    (None when the answer carries no checksum: that is UNPROVEN to happen, see README)."""
+    if not isinstance(answer, dict) or not answer.get("checksum"):
+        return None
+    raw = str(answer["checksum"]).strip().lower()
+    algo, _, value = raw.rpartition(":")
+    if algo in ("", "md5") and len(value) == 32:
+        want, name = digest["md5"], "md5"
+    elif algo in ("", "sha256") and len(value) == 64:
+        want, name = digest["sha256"], "sha256"
+    else:
+        return f"checksum returned in an unrecognised form ({redact(raw)}): not compared"
+    if value != want:
+        raise VerificationError(f"Zenodo returned {name} {value} for the uploaded file but the bytes sent have "
+                                f"{name} {want}: the stored file is not the one sent; refusing to publish")
+    return f"{name} {value} matches the bytes sent"
+
+
 def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, env_label: str,
                    host: str, on_published=None, fields=(), confirm=None) -> tuple[int, str | None]:
     """--update: metadata-only edit in place. Returns (dep_id, doi).
 
     The PUT is the LIVE metadata with ONLY ``fields`` replaced. Before anything is created the whole-metadata
-    unified diff live -> to-be-sent is printed; without ``confirm`` (None) the run stops there. ``confirm`` ''
-    accepts the diff printed in this run; a hex string must be a prefix of the printed diff's sha256."""
+    unified diff live -> to-be-sent is printed; without ``confirm`` (None) the run stops there. ``confirm`` must
+    be a hex prefix (at least 12 characters) of the sha256 of the diff printed in this run (the UTF-8 bytes of
+    the printed diff text); an empty, short or non-matching value refuses."""
     fields = frozenset(fields)
     step = "resolve latest version"
     try:
@@ -1804,9 +2219,14 @@ def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, 
     print(diff)
     print(f"  diff sha256: {digest}")
     if confirm is None:
-        die("Diff printed above. Nothing was created. Re-run with --yes-apply-diff (or --yes-apply-diff "
-            f"{digest[:16]} to pin this exact diff) to apply it.")
-    if confirm and not digest.startswith(str(confirm).lower()):
+        die("Diff printed above. Nothing was created. Read it, then re-run with "
+            f"--yes-apply-diff {digest[:16]} (the sha256 prefix of THIS diff) to apply exactly it.")
+    pin = str(confirm).strip().lower()
+    if not CONFIRM_SHAPE.fullmatch(pin):
+        die(f"Error: --yes-apply-diff needs the sha256 prefix of the diff you reviewed (at least "
+            f"{CONFIRM_MIN_HEX} hex characters; a bare flag or a short value is not a review). This diff's "
+            f"digest is {digest}. Nothing was created.")
+    if not digest.startswith(pin):
         die(f"Error: --yes-apply-diff {confirm} does not match the diff of this run (sha256 {digest}). "
             "The live record may have changed. Nothing was created.")
     step = "edit"
@@ -1884,15 +2304,19 @@ def deposit_new(client, pdf_path: Path, metadata: dict, code_url: str, zenodo_id
         print(f"  Deposition ID: {dep_id}")
         step = "upload"
         try:
-            digest = file_digests(pdf_path)
-        except OSError:
-            digest = None                # a real client then fails at the upload itself
-        client.uploaded_pdf = digest
+            pdf_bytes, digest = read_pdf_once(pdf_path)       # the PDF is read ONCE: digest, upload, archive
+        except OSError as exc:
+            raise VerificationError(f"cannot read the PDF {pdf_path} ({redact(exc)}): without a recorded "
+                                    "digest nothing is uploaded") from exc
+        client.uploaded_pdf, client.uploaded_pdf_bytes = digest, pdf_bytes
         j = journal_of(client)
         if j is not None:
             j.update(pdf=digest, phase="upload about to be sent", deposition_id=dep_id)
         print(f"Uploading {Path(pdf_path).name} …")
-        client.upload_file(dep, pdf_path, expected_sha256=digest["sha256"] if digest else None)
+        answer = client.upload_file(dep, pdf_path, expected_sha256=digest["sha256"], data=pdf_bytes)
+        note = verify_upload_answer(answer, digest)
+        if j is not None and note:
+            j.update(upload_checksum=note)
         step = "verify draft files"
         verify_draft_files(client, dep_id, Path(pdf_path).name)
         step = "metadata PUT"
@@ -1912,7 +2336,7 @@ def deposit_new(client, pdf_path: Path, metadata: dict, code_url: str, zenodo_id
         except BaseException as exc:  # noqa: BLE001 - Ctrl-C right after publish returns (R12) included
             save_error = exc
             print(f"!! PUBLISHED but LOCAL STATE NOT SAVED ({type(exc).__name__}: {redact(exc)}). "
-                  + _manual_state_hint(host == SANDBOX_HOST) + " DO NOT re-run the deposit: it would "
+                  + _manual_state_hint(host == SANDBOX_HOST, client) + " DO NOT re-run the deposit: it would "
                   "publish twice. " + do_not_rerun_notice(client, host, (result or {}).get("id", dep_id)),
                   file=sys.stderr)
             if not isinstance(exc, Exception):
@@ -1939,20 +2363,24 @@ class SandboxStateSlot:
             fh.write("")
 
     def commit(self, text: str) -> None:
-        if self.path.exists():
-            raise FileExistsError(f"{self.path} appeared in the meantime: refusing to overwrite it")
+        """Write the reserved temp and hard-link it to the final name: os.link fails with FileExistsError if the
+        name exists (no exists-then-replace window), so an existing file is never overwritten."""
         with open(self.tmp, "w", encoding="utf-8") as fh:
             fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(self.tmp, self.path)
+            _fsync_file(fh)
+        try:
+            os.link(self.tmp, self.path)
+        except FileExistsError as exc:
+            raise FileExistsError(f"{self.path} appeared in the meantime: refusing to overwrite it") from exc
+        os.unlink(self.tmp)                          # the reserved temp this slot created itself
+        _fsync_dir(self.path.parent)
 
 
-def record_sandbox_state(slot, host: str, paper: str, version, result: dict) -> None:
+def record_sandbox_state(slot, host: str, paper: str, version, result: dict) -> bool:
     """A sandbox run records its result HERE and nowhere else (never zenodo.json, pdfs/, bibliographies).
 
     The full result is ALWAYS printed; if the file cannot be written the message says so and never
-    suggests touching a production file."""
+    suggests touching a production file. Returns True only when the state file was committed."""
     if isinstance(slot, Path):
         slot = SandboxStateSlot(slot)
     data = {
@@ -1970,8 +2398,9 @@ def record_sandbox_state(slot, host: str, paper: str, version, result: dict) -> 
         print(f"!! [sandbox] the state file {slot.path} could NOT be written ({redact(exc)}). The full result "
               "is printed above and is in the run journal. This is a SANDBOX run: do NOT edit any production "
               "zenodo.json.", file=sys.stderr)
-        return
+        return False
     print(f"  [sandbox] result recorded in {slot.path} (production zenodo.json, pdfs/ and bibliographies untouched)")
+    return True
 
 
 def validate_state_dir(path: Path, repo_root: Path, paper_dir: Path) -> Path:
@@ -2052,25 +2481,46 @@ def build_parser() -> argparse.ArgumentParser:
                         help="--update: comma list of fields to take from local state "
                              f"({', '.join(UPDATABLE_FIELDS)}); equivalent to the --set-* flags")
     parser.add_argument("--yes-apply-diff", nargs="?", const="", default=None, metavar="DIGEST",
-                        help="--update: apply the printed diff (optionally pin its sha256 prefix)")
+                        help="--update: apply the printed diff. REQUIRES the sha256 prefix (at least 12 hex "
+                             "characters) of the diff you reviewed, printed as 'diff sha256: ...'; a bare flag or "
+                             "a shorter value is refused (breaking change of the third corrective pass)")
     parser.add_argument("--live-snapshot", type=Path, metavar="PATH",
                         help="--update --dry-run: JSON file (a deposition or its metadata) used as the live "
                              "record so the diff can be shown offline")
     parser.add_argument("--no-cascade", action="store_true", help="Skip DOI cascade after publish")
     parser.add_argument("--finish-after-fail", action="store_true",
                         help="Offline: after a post-publish FAIL (record published, zenodo.json saved), run the "
-                             "skipped PDF archive and DOI cascade; refuses unless the PDF has the sha256 recorded "
-                             "at upload time and never overwrites an archive; no network, no deposit")
+                             "skipped PDF archive and DOI cascade. Bound to ONE deposit journal (the newest "
+                             "production deposit journal of the paper that carries a PDF digest, or --journal): "
+                             "the archive label is that journal's version, the PDF must have its sha256, a "
+                             "sandbox journal or a concept mismatch is refused, an archive is never overwritten, "
+                             "the cascade runs only after the archive step succeeded; no network, no deposit")
+    parser.add_argument("--journal", type=Path, metavar="PATH",
+                        help="--finish-after-fail: the deposit journal to finish (default: the newest one)")
     parser.add_argument("--expect-pdf-sha256", metavar="HEX",
                         help="--finish-after-fail: digest of the uploaded PDF when no run journal records it")
     parser.add_argument("--reconcile", type=Path, metavar="JOURNAL",
-                        help="Record, locally, what you found on the server for an UNRECONCILED journal "
-                             "(needs --outcome); no network")
+                        help="Record, locally, what you found on the server for a blocking journal "
+                             "(needs --outcome, or --quarantine for an unreadable one); no network. Writes only "
+                             "the paper directory recorded IN THE JOURNAL")
     parser.add_argument("--outcome", choices=("published", "not-published"),
                         help="--reconcile: what you verified on the server")
     parser.add_argument("--record-id", type=int, metavar="N", help="--reconcile --outcome published: record id")
-    parser.add_argument("--concept-id", metavar="C", help="--reconcile published (production): concept recid")
-    parser.add_argument("--concept-doi", metavar="D", help="--reconcile published (production): concept DOI")
+    parser.add_argument("--concept-id", metavar="C",
+                        help="--reconcile published (production deposit): concept recid, written to zenodo.json")
+    parser.add_argument("--concept-doi", metavar="D",
+                        help="--reconcile published (production deposit): concept DOI, written to zenodo.json")
+    parser.add_argument("--record-url", metavar="URL",
+                        help="--reconcile not-published: the record/draft page you inspected")
+    parser.add_argument("--i-checked-the-account", action="store_true",
+                        help="--reconcile not-published without --record-url: you checked the account yourself "
+                             "(needs --reason)")
+    parser.add_argument("--reason", metavar="TEXT",
+                        help="--reconcile: free text stored in the journal (needed with "
+                             "--i-checked-the-account and --quarantine)")
+    parser.add_argument("--quarantine", action="store_true",
+                        help="--reconcile JOURNAL --quarantine --reason TEXT: rename an UNREADABLE journal to "
+                             "*.quarantined in its directory (prints its size and path; nothing is deleted)")
     parser.add_argument("--skip-checks", action="store_true",
                         help="Bypass the pre-deposit check battery only (never the version-label guard, "
                              "the journal block or the diff confirmation)")
@@ -2087,28 +2537,40 @@ def requested_fields(args, parser) -> set:
 
 
 def run_reconcile(args, parser) -> None:
-    if not args.outcome:
-        parser.error("--reconcile needs --outcome published|not-published")
     path = args.reconcile.expanduser().resolve()
-    data = reconcile_journal(path, args.outcome, args.record_id, args.concept_id, args.concept_doi)
+    if args.quarantine:
+        try:
+            target = quarantine_journal(path, args.reason or "")
+        except ReconcileRefused as exc:
+            die(f"Error: {exc}")
+        print(f"Quarantined: {path.name} -> {target.name} (same directory; nothing deleted). The journal no "
+              "longer blocks: make sure no draft or edit session is left at https://zenodo.org/deposit and that "
+              "the record is not published before the next run.")
+        return
+    if not args.outcome:
+        parser.error("--reconcile needs --outcome published|not-published (or --quarantine for an unreadable journal)")
+    try:
+        data = reconcile_journal(path, args.outcome, args.record_id, args.concept_id, args.concept_doi,
+                                 record_url=args.record_url, checked_account=args.i_checked_the_account,
+                                 reason=args.reason, paper_dir_arg=args.paper_dir)
+    except ReconcileRefused as exc:
+        die(f"Error: {exc}")
     host = data.get("host") or PRODUCTION_HOST
     print(f"Journal {path.name} reconciled locally: outcome {data['outcome']} (operator-asserted, nothing "
           "was checked or sent by this tool).")
     if args.outcome == "not-published":
-        print(f"Make sure no draft or edit session is left at https://{host}/deposit before the next run.")
+        print("Consequences: this journal no longer blocks. The next run for this paper MAY CREATE A NEW "
+              "DEPOSITION. If a publication did happen, it will be published a SECOND time and nothing in this "
+              "tool can detect it. Make sure no draft or edit session is left at "
+              f"https://{host}/deposit. Evidence stored in the journal: {data.get('operator_evidence')}")
         return
     if data.get("sandbox"):
         print("Sandbox journal: no production file is touched.")
-        return
-    if args.concept_id and args.concept_doi and args.paper_dir:
-        cfg_path = args.paper_dir.resolve() / "zenodo.json"
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        cfg["zenodo_id"], cfg["doi"] = int(args.concept_id), args.concept_doi
-        _atomic_write_text(cfg_path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-        print(f"Saved zenodo_id {args.concept_id} and doi {args.concept_doi} (operator-asserted) -> {cfg_path}")
+    elif data.get("operator_evidence", {}).get("config_written"):
+        print(f"Saved zenodo_id {data.get('concept_id')} and doi {data.get('concept_doi')} (operator-asserted) -> "
+              f"{data['operator_evidence']['config_written']} (the paper directory recorded in the journal)")
     else:
-        print("Set zenodo_id (concept recid) and doi in zenodo.json by hand, or repeat --reconcile with "
-              "--concept-id and --concept-doi and the paper directory.")
+        print("--update journal: there is no local state to save.")
 
 
 def finalize_journal(journal, client=None) -> None:
@@ -2125,7 +2587,14 @@ def finalize_journal(journal, client=None) -> None:
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    register_environment_secrets()        # the exact tokens loaded in this process are masked everywhere
 
+    if not args.reconcile and (args.outcome or args.quarantine or args.record_url or args.i_checked_the_account
+                               or args.reason or args.record_id or args.concept_id or args.concept_doi):
+        parser.error("--outcome/--quarantine/--record-id/--concept-id/--concept-doi/--record-url/"
+                     "--i-checked-the-account/--reason only make sense with --reconcile")
+    if args.journal and not args.finish_after_fail:
+        parser.error("--journal only makes sense with --finish-after-fail")
     if args.reconcile:
         run_reconcile(args, parser)
         return
@@ -2183,8 +2652,9 @@ def main(argv=None):
     state_dir = None
     if networked or args.finish_after_fail:
         state_dir = validate_state_dir(args.state_dir or default_state_dir(), repo_root, paper_dir)
+    identity = journal_identity(config)
     if networked:
-        blocking = find_blocking_journals(state_dir, paper_dir, [zenodo_id], host)
+        blocking = find_blocking_journals(state_dir, paper_dir, [zenodo_id], host, identity)
         if blocking:
             die(blocking_message(blocking))
 
@@ -2214,6 +2684,11 @@ def main(argv=None):
             raw = raw[:doc_start] + expand_macros(raw[doc_start:], macros)
 
     title = extract_title(raw, macros)
+    identity = journal_identity(config, title)
+    if networked:
+        blocking = find_blocking_journals(state_dir, paper_dir, [zenodo_id], host, identity)
+        if blocking:
+            die(blocking_message(blocking))
     abstract = extract_abstract(raw)
     keywords = extract_keywords(raw)
     # Version label: prefer the explicit semantic version in zenodo.json ("version": "1.1");
@@ -2269,18 +2744,39 @@ def main(argv=None):
         return
 
     # ── --finish-after-fail: the local steps a post-publish FAIL skipped (offline) ─────────────
+    # Bound to ONE deposit journal (paper, version, PDF sha256), never to the current configuration.
     if args.finish_after_fail:
         zid, concept_doi = config.get("zenodo_id"), config.get("doi")
         if not zid or not concept_doi:
             sys.exit("Error: zenodo.json has no zenodo_id/doi: the publication was not saved locally, "
-                     "so there is nothing to finish. Set them by hand from the record first.")
+                     "so there is nothing to finish. Reconcile the journal (it says PUBLISHED-UNSAVED) or set "
+                     "them from the record first.")
         pdf_path = find_pdf(paper_dir)
         print(f"  PDF:      {_rel(pdf_path, repo_root)}  (must be the PDF that was uploaded)")
-        found = latest_published_journal(state_dir, paper_dir)
-        jdata = found[1] if found else {}
-        if jdata.get("concept_id") not in (None, "") and str(jdata["concept_id"]) != str(zid):
-            die(f"Error: the journal {found[0].name} records concept {jdata['concept_id']} but zenodo.json "
-                f"says {zid}. Nothing was archived.")
+        try:
+            jpath, jdata = select_deposit_journal(state_dir, paper_dir,
+                                                  args.journal.expanduser().resolve() if args.journal else None)
+        except ReconcileRefused as exc:
+            die(f"Error: {exc}. Nothing was archived.")
+        jdata = jdata or {}
+        label = version
+        if jpath is not None:
+            print(f"  Journal:  {jpath}  (deposit of version {jdata.get('version')!r})")
+            if jdata.get("outcome") == UNSAVED_OUTCOME:
+                die(f"Error: the journal {jpath.name} is still {UNSAVED_OUTCOME}: reconcile it first "
+                    "(--reconcile ... --outcome published ...). Nothing was archived.")
+            if jdata.get("concept_id") not in (None, "") and str(jdata["concept_id"]) != str(zid):
+                die(f"Error: the journal {jpath.name} records concept {jdata['concept_id']} but zenodo.json "
+                    f"says {zid}. Nothing was archived.")
+            label = jdata.get("version")
+            if not label:
+                die(f"Error: the journal {jpath.name} records no version: the archive label cannot be derived. "
+                    "Nothing was archived.")
+        try:
+            check_version_label(label, paper_dir, config)
+        except VersionLabelError as exc:
+            die(f"Error: version label refused for the archive: {exc}. --finish-after-fail must run with the "
+                "paper at the DEPOSITED version (its branch, zenodo.json and CITATION.cff). Nothing was archived.")
         recorded = (jdata.get("pdf") or {}).get("sha256")
         given = args.expect_pdf_sha256.strip().lower() if args.expect_pdf_sha256 else None
         if recorded and given and recorded != given:
@@ -2288,20 +2784,23 @@ def main(argv=None):
                 "time. Nothing was archived.")
         expected_sha = recorded or given
         if not expected_sha:
-            die(f"Error: no digest of the uploaded PDF is known (no run journal with outcome PUBLISHED for "
-                f"{paper_dir.name} in {state_dir}). Pass --expect-pdf-sha256 HEX if you hold it. "
+            die(f"Error: no digest of the uploaded PDF is known (no published production deposit journal with a "
+                f"PDF digest for {paper_dir.name} in {state_dir}). Pass --expect-pdf-sha256 HEX if you hold it. "
                 "Nothing was archived.")
-        local = file_digests(pdf_path)
+        pdf_bytes, local = read_pdf_once(pdf_path)
         for rec in jdata.get("published_files") or []:
             checksum = str(rec.get("checksum") or "").split(":")[-1].lower()
             if rec.get("filename") == pdf_path.name and checksum and checksum != local["md5"]:
                 die(f"Error: the checksum Zenodo returned for {pdf_path.name} ({checksum}) differs from the "
                     f"local file's md5 ({local['md5']}). Nothing was archived.")
         try:
-            archive_pdf(repo_root, pdf_path, tex_path.stem, version, zid, expected_sha256=expected_sha)
-        except ArchiveRefused as exc:
-            die(f"Error: archive refused: {exc}")
-        run_cascade(repo_root, config, concept_doi, args.no_cascade)
+            archived = archive_pdf(repo_root, pdf_path, tex_path.stem, label, zid, expected_sha256=expected_sha,
+                                   data=pdf_bytes)
+        except (ArchiveRefused, OSError) as exc:
+            die(f"Error: archive refused: {redact(exc)}. The DOI cascade was NOT run.")
+        else:
+            if archived.status in ("archived", "identical"):
+                run_cascade(repo_root, config, concept_doi, args.no_cascade)
         return
 
     # ── Pre-deposit gate (fails CLOSED) ────────────────────────────────────────
@@ -2347,7 +2846,7 @@ def main(argv=None):
         journal = Journal.create(
             state_dir, paper_dir, host, args.sandbox,
             {"update": args.update, "fields": sorted(fields), "sandbox": args.sandbox,
-             "zenodo_id": zenodo_id, "no_cascade": args.no_cascade}, version, zenodo_id)
+             "zenodo_id": zenodo_id, "no_cascade": args.no_cascade}, version, zenodo_id, identity)
     except (OSError, JournalError) as exc:
         die(f"Error: the run journal cannot be created in {state_dir} ({redact(exc)}). Nothing was sent.")
     client.journal = journal
@@ -2368,8 +2867,8 @@ def main(argv=None):
         print(f"  Concept DOI:   {concept_doi}")
         print(f"  Concept recid: {concept_recid}")
         print(f"  Record: https://{host}/record/{result.get('id')}")
-        if journal.outcome() != "PUBLISHED":
-            journal.mark_published(result.get("id"), result)
+        if journal.outcome() not in (UNSAVED_OUTCOME, "PUBLISHED"):
+            journal.mark_published(result.get("id"), result)         # blocking until the file is saved
         if not concept_doi or not concept_recid:
             raise RuntimeError(
                 "Zenodo response did not include conceptdoi/conceptrecid; refusing to overwrite "
@@ -2379,15 +2878,28 @@ def main(argv=None):
         config["zenodo_id"] = int(concept_recid)
         config["doi"] = concept_doi
         _atomic_write_text(config_path, json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+        saved = json.loads(config_path.read_text(encoding="utf-8"))       # read back before lifting the block
+        if str(saved.get("zenodo_id")) != str(int(concept_recid)) or saved.get("doi") != concept_doi:
+            raise RuntimeError(f"{config_path} does not hold zenodo_id/doi after writing: check it by hand")
         print(f"  Saved zenodo_id + concept DOI → {_rel(config_path, repo_root)}")
         published["concept_doi"] = concept_doi
-        journal.update(phase="local state saved")
+        journal.mark_saved(config_sha256_after=config_fingerprint(saved))
 
     def save_sandbox_state(result: dict):
         print("\nPublished on the SANDBOX!")
-        if journal.outcome() != "PUBLISHED":
+        if journal.outcome() not in (UNSAVED_OUTCOME, "PUBLISHED"):
             journal.mark_published(result.get("id"), result)
-        record_sandbox_state(sandbox_slot, host, paper_dir.name, version, result)
+        if record_sandbox_state(sandbox_slot, host, paper_dir.name, version, result):
+            journal.mark_saved()
+        else:
+            print(f"!! [sandbox] the journal stays {UNSAVED_OUTCOME} (it holds the result) and blocks later runs "
+                  "of this paper until you --reconcile it.", file=sys.stderr)
+
+    def settle_update(result: dict):
+        # An --update has no local state to save: the publication is settled the moment it is confirmed.
+        if journal.outcome() not in (UNSAVED_OUTCOME, "PUBLISHED"):
+            journal.mark_published(result.get("id"), result)
+        journal.mark_saved()
 
     saver = save_sandbox_state if args.sandbox else save_local_state
 
@@ -2401,7 +2913,7 @@ def main(argv=None):
                          + (" (on the sandbox: --sandbox-zenodo-id)" if args.sandbox else "") + ".")
             try:
                 dep_id, doi = deposit_update(client, metadata, code_url, int(zenodo_id), env_label, host,
-                                             on_published=save_sandbox_state if args.sandbox else None,
+                                             on_published=save_sandbox_state if args.sandbox else settle_update,
                                              fields=fields, confirm=args.yes_apply_diff)
             except NothingToUpdate as exc:
                 print(f"Nothing to update: {exc}.")
@@ -2421,6 +2933,10 @@ def main(argv=None):
             result = deposit_new(client, pdf_path, metadata, code_url, zenodo_id, env_label, host,
                                  on_published=saver)
         except PostPublishFailure as exc:
+            if journal.outcome() == UNSAVED_OUTCOME:
+                sys.exit(str(exc) + f"\n!! The publication SUCCEEDED but the local state is not saved: the journal "
+                         f"({journal.path}) says {UNSAVED_OUTCOME} and blocks every re-run. "
+                         + _manual_state_hint(args.sandbox, client))
             sys.exit(str(exc) + "\n!! PDF archive and DOI cascade were SKIPPED (a sandbox run skips them "
                      "always). Once the record is fixed, run them with --finish-after-fail.")
         if args.sandbox:
@@ -2436,13 +2952,18 @@ def main(argv=None):
             die("!! PUBLISHED, but the digest of the uploaded PDF is unknown: the archive was SKIPPED. "
                 "Run --finish-after-fail --expect-pdf-sha256 HEX once you know it.")
         try:
-            archive_pdf(repo_root, pdf_path, tex_path.stem, version, result["id"],
-                        expected_sha256=uploaded["sha256"])
-        except ArchiveRefused as exc:
+            # The bytes that were digested and uploaded are the bytes archived (the PDF is not re-read).
+            archived = archive_pdf(repo_root, pdf_path, tex_path.stem, version, result["id"],
+                                   expected_sha256=uploaded["sha256"],
+                                   data=getattr(client, "uploaded_pdf_bytes", None))
+        except (ArchiveRefused, OSError) as exc:
             journal.update(phase="archive refused", note=f"archive refused: {exc}")
-            die(f"!! PUBLISHED (journal: PUBLISHED, zenodo.json saved) but the PDF archive was REFUSED: {exc}\n"
-                "!! The DOI cascade was skipped. Resolve it, then run --finish-after-fail.")
-        run_cascade(repo_root, config, concept_doi, args.no_cascade)
+            die(f"!! PUBLISHED (journal: PUBLISHED, zenodo.json saved) but the PDF archive failed or was "
+                f"REFUSED: {redact(exc)}\n"
+                "!! The DOI cascade was NOT run. Resolve it, then run --finish-after-fail.")
+        else:
+            if archived.status in ("archived", "identical"):
+                run_cascade(repo_root, config, concept_doi, args.no_cascade)
         journal.update(phase="complete")
         finalize_journal(journal, client)
     except BaseException:

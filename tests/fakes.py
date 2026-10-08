@@ -194,7 +194,7 @@ class FakeClient:
     def delete_file(self, *a):
         self._c("delete_file"); self.files = [n for n in self.files if n != "old.pdf"]
 
-    def upload_file(self, dep, path, expected_sha256=None):
+    def upload_file(self, dep, path, expected_sha256=None, data=None):
         self._c("upload"); self.files.append(Path(path).name)
 
     def set_metadata(self, i, m):
@@ -237,13 +237,47 @@ def run(fn, *a, **k):
     return code, out.getvalue(), err.getvalue()
 
 
-def new(client, code_url=URL, zid=5, pdf="/x/p.pdf", **k):
+_DEFAULT_PDF = []
+
+
+def default_pdf() -> str:
+    """A real PDF file for tests that do not care which one: a deposit with no readable PDF is refused before
+    the upload (no recorded digest = no upload)."""
+    if not _DEFAULT_PDF:
+        import tempfile
+        path = Path(tempfile.mkdtemp()) / "p.pdf"
+        path.write_bytes(b"%PDF-fake")
+        _DEFAULT_PDF.append(str(path))
+    return _DEFAULT_PDF[0]
+
+
+def new(client, code_url=URL, zid=5, pdf=None, **k):
+    pdf = pdf or default_pdf()
     meta = zp.build_metadata("T", "A", ["k"], "https://w", "1.0", code_url=code_url)
     return zp.deposit_new(client, Path(pdf), meta, code_url, zid, "production", HOST, **k)
 
 
+def reviewed_digest(client, meta, code_url, fields, host=HOST, zid=5, env_label="production") -> str:
+    """The "review step" of --update in tests: run the flow on a COPY of the client with no confirmation, read the
+    printed `diff sha256:` and return it. (--yes-apply-diff must carry that digest: a bare flag is refused.)"""
+    import copy
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            zp.deposit_update(copy.deepcopy(client), meta, code_url, zid, env_label, host, fields=fields, confirm=None)
+        except BaseException:      # noqa: BLE001 - the preview only needs the printed digest
+            pass
+    for line in out.getvalue().splitlines():
+        if line.strip().startswith("diff sha256:"):
+            return line.split()[-1]
+    return "0" * 64
+
+
 def upd(client, code_url=URL, fields=("code-url", "title"), confirm="", **k):
+    """confirm="" (default): review first (digest of the printed diff), then apply it; None: print only."""
     meta = zp.build_metadata("T", "A", [], "https://w", "1.0", code_url=code_url)
+    if confirm == "":
+        confirm = reviewed_digest(client, meta, code_url, fields)
     return zp.deposit_update(client, meta, code_url, 5, "production", HOST, fields=fields, confirm=confirm, **k)
 
 

@@ -64,8 +64,27 @@ def state_dir_for(root):
     return _STATE_DIRS[key]
 
 
-def run_main(argv, env, root, factory=None, extra=()):
+def _reviewed(argv, env, root, factory, extra):
+    """--yes-apply-diff must carry the digest of the diff the operator reviewed (a bare flag is refused). Tests
+    written with the bare flag get the two-step workflow here: a PREVIEW run on a copy of the client (no
+    --yes-apply-diff) prints the diff, its `diff sha256:` is read and passed to the real run."""
+    import copy
+    import re
+    if "--yes-apply-diff" not in argv or "--update" not in argv or factory is None:
+        return argv
+    i = argv.index("--yes-apply-diff")
+    if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+        return argv                                    # an explicit value: untouched
+    preview = argv[:i] + argv[i + 1:]
+    _, out, _ = run_main(preview, env, root, Factory(copy.deepcopy(factory.client)), extra=extra)
+    m = re.search(r"diff sha256: ([0-9a-f]{64})", out)
+    return argv[:i] + ["--yes-apply-diff", m.group(1)] + argv[i + 1:] if m else argv
+
+
+def run_main(argv, env, root, factory=None, extra=(), raw_confirm=False):
     argv = list(argv)
+    if not raw_confirm:
+        argv = _reviewed(argv, env, root, factory, extra)
     if "--dry-run" not in argv and "--state-dir" not in argv and "--reconcile" not in argv:
         argv += ["--state-dir", str(state_dir_for(root))]
     patches = [mock.patch.object(zp, "REPO_ROOT", root.resolve()),
@@ -651,7 +670,7 @@ class C7EarlySave(unittest.TestCase):
 
         def arch(*a, **k):
             order.append(("archive", json.loads(cfg_path.read_text())["zenodo_id"]))
-            return Path("x")
+            return zp.ArchiveResult(Path("x"), "archived")
 
         def casc(*a, **k):
             order.append(("cascade", json.loads(cfg_path.read_text())["zenodo_id"]))

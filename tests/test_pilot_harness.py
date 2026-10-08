@@ -175,8 +175,10 @@ class InjectedCases(unittest.TestCase):
         sim = SandboxSim()
         client, _ = real_client(sim, sandbox=True, token=SBX_TOKEN)
         meta = zp.build_metadata("T", "A", [], "https://w", "1.0", code_url=fakes.URL)
+        digest = fakes.reviewed_digest(client, meta, fakes.URL, ("title",), host="sandbox.zenodo.org",
+                                       env_label="sandbox")
         code, _, err = run(zp.deposit_update, client, meta, fakes.URL, 5, "sandbox",
-                           "sandbox.zenodo.org", fields=("title",), confirm="")
+                           "sandbox.zenodo.org", fields=("title",), confirm=digest)
         self.assertEqual(code[0], "KEYBOARDINTERRUPT")
         self.assertEqual(len(inj), 1)
         self.assertEqual(sim.cleanup_calls, [("POST", 10)])
