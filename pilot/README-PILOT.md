@@ -7,7 +7,8 @@ before any production deposit. Every step below is an instruction for the operat
 
 | File | Role |
 |---|---|
-| `checksums_before_after.sh` | **Read-only** snapshot / compare of the production state (paper `zenodo.json`, `pdfs/`, bibliographies, `git status` of the paper and of `tools`). Never deletes, refuses to overwrite a snapshot. |
+| `checksums_before_after.sh` | **Read-only** snapshot / compare of the production state (paper `zenodo.json`, `pdfs/`, bibliographies, `git status` of the paper and of `tools`). Never deletes, refuses to overwrite a snapshot, refuses a LABEL that is not a plain file name (no `/`, no `..`, no leading `.` or `-`). |
+| `sandbox_launch.py` | Runs `zenodo_publish.py` (or one `inject_failures.py` case) against the sandbox with the token **read from the terminal** (getpass) and kept in that Python process only: never in an argument vector, never exported to a child, environment reduced to `PATH`, `HOME` and the token. Refuses without `--sandbox` or if `ZENODO_TOKEN` exists. |
 | `inject_failures.py` | Scratch harness: wraps `ZenodoClient._request` (and, for two cases, `build_metadata` / `get_record`) **in memory** to inject one failure case F-a..F-i, then calls `zenodo_publish.main`. Refuses unless `--sandbox` is given, `ZENODO_TOKEN` is absent from the environment and every request URL is `https://sandbox.zenodo.org/...`. The tool file is never modified. |
 
 The tests of both (`tests/test_pilot_harness.py`) run offline against the `Sim` double.
@@ -29,17 +30,19 @@ The tests of both (`tests/test_pilot_harness.py`) run offline against the `Sim` 
 cd <WORKSPACE>                                   # the @cosmochrony directory
 SCR=<scratch directory OUTSIDE the workspace>    # e.g. a fresh directory under $TMPDIR
 mkdir -p "$SCR/journals" "$SCR/snap"
-read -rs SBX                                     # paste the sandbox token, nothing is echoed
+unset ZENODO_TOKEN                               # the launcher refuses if the production variable exists at all
 # One scratch copy of the paper (keeps .git, so the branch rule still applies). Never run the pilot on the
 # real paper directory: the sandbox must have nothing production to touch.
 cp -R <PAPER_DIR> "$SCR/paper"
 PAPER="$SCR/paper"
-RUN() { env -i PATH="$PATH" HOME="$HOME" ZENODO_SANDBOX_TOKEN="$SBX" "$@"; }   # the ONLY token in the process
+RUN() { python3 tools/pilot/sandbox_launch.py "$@"; }       # asks for the sandbox token (no echo) at each command
 SNAP() { sh tools/pilot/checksums_before_after.sh snapshot "$1" "<PAPER_DIR>" "<WORKSPACE>" "$SCR/snap"; }
 ```
 
-`env -i` leaves the production token out of the process, `--sandbox` reads only `ZENODO_SANDBOX_TOKEN`, and the
-harness refuses if `ZENODO_TOKEN` is present anyway. Run every command in the foreground. After each step run
+`RUN` is `sandbox_launch.py`: it takes the sandbox token from the terminal (not echoed, not in the history, **not in
+any argument vector**, not exported to a child process), `--sandbox` makes the tool read only
+`ZENODO_SANDBOX_TOKEN`, and both the launcher and the harness refuse if `ZENODO_TOKEN` is present. Every `RUN` call
+therefore starts with `--` before the tool's own arguments (see the commands below). Run every command in the foreground. After each step run
 `SNAP after-Pn` and `sh tools/pilot/checksums_before_after.sh compare "$SCR/snap/before.snapshot" "$SCR/snap/after-Pn.snapshot"`:
 **any difference in a production file is a NO-GO.** Take `SNAP before` once at the start.
 
@@ -52,15 +55,15 @@ refuses to start until `--reconcile` (see P6).
 
 ```sh
 python3 tools/zenodo_publish.py "$PAPER" --dry-run                      # prints the exact metadata incl. custom; the version-label verdict
-python3 tools/zenodo_publish.py "$PAPER" --sandbox --sandbox-state "$SCR/p0.json" --state-dir "$SCR/journals"   # refuses: ZENODO_SANDBOX_TOKEN not set
-python3 tools/zenodo_publish.py "$PAPER" --sandbox --sandbox-state "<WORKSPACE>/x.json"                          # refuses: inside the workspace
+python3 tools/zenodo_publish.py "$PAPER" --sandbox --sandbox-state "$SCR/p0.json" --state-dir "$SCR/journals"   # refuses: ZENODO_SANDBOX_TOKEN not set (the token check comes first)
+python3 tools/pilot/sandbox_launch.py -- "$PAPER" --sandbox --sandbox-state "<WORKSPACE>/x.json"                 # (enter any dummy text at the prompt) refuses: the state file lies inside the workspace
 python3 tools/zenodo_publish.py "$PAPER" --dry-run --update --set-title --live-snapshot <LIVE_JSON>             # the diff, offline
 ```
 
 ## P1 first publication
 
 ```sh
-RUN python3 tools/zenodo_publish.py "$PAPER" --sandbox --sandbox-state "$SCR/p1.json" --state-dir "$SCR/journals" --skip-checks
+RUN -- "$PAPER" --sandbox --sandbox-state "$SCR/p1.json" --state-dir "$SCR/journals" --skip-checks
 ```
 
 (`--skip-checks` only because the scratch copy is not the pushed paper; the version-label guard still runs.)
@@ -77,7 +80,7 @@ Bump the label on the scratch copy (branch **and** `zenodo.json` `version` and `
 rebuild or modify the PDF, then:
 
 ```sh
-RUN python3 tools/zenodo_publish.py "$PAPER" --sandbox --sandbox-zenodo-id <CONCEPT_RECID> \
+RUN -- "$PAPER" --sandbox --sandbox-zenodo-id <CONCEPT_RECID> \
     --sandbox-state "$SCR/p2.json" --state-dir "$SCR/journals" --skip-checks
 ```
 
@@ -92,9 +95,9 @@ nothing is verified in that case).
 `--update` now preserves the live metadata. First set "Programming language" by hand in the sandbox UI, then:
 
 ```sh
-RUN python3 tools/zenodo_publish.py "$PAPER" --update --set-code-url --sandbox --sandbox-zenodo-id <CONCEPT_RECID> \
+RUN -- "$PAPER" --update --set-code-url --sandbox --sandbox-zenodo-id <CONCEPT_RECID> \
     --sandbox-state "$SCR/p3a.json" --state-dir "$SCR/journals" --skip-checks      # prints the diff and stops
-RUN python3 tools/zenodo_publish.py "$PAPER" --update --set-code-url --yes-apply-diff <DIFF_SHA_PREFIX> --sandbox \
+RUN -- "$PAPER" --update --set-code-url --yes-apply-diff <DIFF_SHA_PREFIX_12_OR_MORE_HEX> --sandbox \
     --sandbox-zenodo-id <CONCEPT_RECID> --sandbox-state "$SCR/p3b.json" --state-dir "$SCR/journals" --skip-checks
 ```
 
@@ -113,7 +116,9 @@ Discard the draft by hand afterwards.
 
 For each of (i) a first-publication draft, (ii) a new-version draft, (iii) an edit session, (iv) a published
 record not in edit: try `POST .../actions/discard` and `DELETE .../depositions/<id>` and record the status code and
-the effect (use `curl` with the token read by `read -rs`, never written to a file). Then decide, and only then,
+the effect (use `curl` with the token read inside a subshell and handed to curl through a config on stdin, so it is in no
+argument vector and no file: `( read -rs SBX; printf 'header = "Authorization: Bearer %s"\n' "$SBX" | curl -sS -K - -X <METHOD> <URL> )`;
+`printf` is a shell builtin in bash and zsh, so nothing is exec'd with the token; never `export` it, never pass the token through curl's header option on the command line). Then decide, and only then,
 flip `CLEANUP_VERIFIED[kind]` and, if the table is wrong, `CLEANUP_CALLS[kind]` in `zenodo_publish.py` (a reviewed
 commit). Until then every cleanup message says its server semantics are UNVERIFIED.
 
@@ -122,7 +127,7 @@ commit). Until then every cleanup message says its server semantics are UNVERIFI
 Each case on a fresh scratch run (new `--sandbox-state`, journals reconciled between cases):
 
 ```sh
-RUN python3 tools/pilot/inject_failures.py --sandbox --case <F-x> -- "$PAPER" --sandbox --sandbox-zenodo-id <CONCEPT_RECID> \
+RUN --case <F-x> -- "$PAPER" --sandbox --sandbox-zenodo-id <CONCEPT_RECID> \
     --sandbox-state "$SCR/<F-x>.json" --state-dir "$SCR/journals" --skip-checks            # add --update ... for F-f
 ```
 
@@ -131,7 +136,7 @@ RUN python3 tools/pilot/inject_failures.py --sandbox --case <F-x> -- "$PAPER" --
 | F-a | real `newversion` request, answer dropped (Timeout) | `UNCERTAINTY`, search, attribution to this run, cleanup with the table call (check the real status code), or `NOTHING WAS DISCARDED` if ambiguous |
 | F-b | `newversion` never sent | `No new-version draft attributable`, nothing discarded, non-blocking journal |
 | F-c | real `publish`, answer dropped | poll sees `done`, state saved in the sandbox state file and journal, verification runs |
-| F-d | `publish` never sent | `ended in doubt ... NOTHING WAS DISCARDED`, `DO NOT RE-RUN`, journal `UNRECONCILED`, draft left; the **next** run refuses to start; discard the draft by hand, then `--reconcile <journal> --outcome not-published` |
+| F-d | `publish` never sent | `ended in doubt ... NOTHING WAS DISCARDED`, `DO NOT RE-RUN`, journal `UNRECONCILED`, draft left; the **next** run refuses to start; discard the draft by hand, then `--reconcile <journal> --outcome not-published --record-url ...` |
 | F-e | Ctrl-C (KeyboardInterrupt) at the upload | own draft cleaned up, exit 130 |
 | F-f | Ctrl-C at the `--update` PUT | edit session discarded (check the status code), exit 130 |
 | F-g / F-g2 | invalid `custom` key / value type | 400 at the PUT or a draft check failure, own draft cleaned up |
@@ -141,8 +146,10 @@ RUN python3 tools/pilot/inject_failures.py --sandbox --case <F-x> -- "$PAPER" --
 Reconcile an unresolved journal locally (the tool sends nothing):
 
 ```sh
-python3 tools/zenodo_publish.py "$PAPER" --reconcile "$SCR/journals/<JOURNAL>.run.json" --outcome not-published
-python3 tools/zenodo_publish.py "$PAPER" --reconcile "$SCR/journals/<JOURNAL>.run.json" --outcome published --record-id <ID>
+python3 tools/zenodo_publish.py --reconcile "$SCR/journals/<JOURNAL>.run.json" --outcome not-published \
+    --record-url "https://sandbox.zenodo.org/deposit/<ID>"      # or: --i-checked-the-account --reason "what you saw"
+python3 tools/zenodo_publish.py --reconcile "$SCR/journals/<JOURNAL>.run.json" --outcome published --record-id <ID>
+# an unreadable journal: python3 tools/zenodo_publish.py --reconcile <FILE> --quarantine --reason "..."  (renames, never deletes)
 ```
 
 Also observe the listing: `GET /deposit/depositions?status=draft&size=100&all_versions=true` with two or more drafts

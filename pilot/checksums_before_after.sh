@@ -10,16 +10,21 @@
 # and of every cosmochrony-bibliography.bib under the workspace; the listing of pdfs/; `git status
 # --porcelain` of the paper repository and of the tools repository.
 set -u
+set -C        # noclobber: a redirection never overwrites (nor follows a dangling symlink onto) an existing name
 
 die() { echo "checksums_before_after: $*" >&2; exit 2; }
 
 snapshot() {
     label=$1; paper=$2; root=$3; out=$4
+    # LABEL names a file inside OUT_DIR: letters, digits, dot, underscore, dash; no separator, no leading dot or dash
+    case "$label" in
+        ""|.*|-*|*[!A-Za-z0-9._-]*) die "invalid label (letters, digits, '.', '_', '-' only; not empty, no leading '.' or '-'): $label" ;;
+    esac
     [ -d "$paper" ] || die "paper directory not found: $paper"
     [ -d "$root" ] || die "workspace root not found: $root"
     [ -d "$out" ] || die "output directory not found: $out"
     dest="$out/$label.snapshot"
-    [ -e "$dest" ] && die "refusing to overwrite $dest"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then die "refusing to overwrite $dest"; fi
     {
         echo "## zenodo.json"
         shasum -a 256 "$paper/zenodo.json" 2>&1

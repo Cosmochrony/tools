@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Scratch harness for the sandbox pilot: inject ONE failure case into zenodo_publish.py, then run it.
 
-    env -i PATH="$PATH" HOME="$HOME" ZENODO_SANDBOX_TOKEN="$SBX" \\
-        python3 tools/pilot/inject_failures.py --sandbox --case F-a -- \\
+    python3 tools/pilot/sandbox_launch.py --case F-a -- \\
         "$SCR/paper" --sandbox --sandbox-state "$SCR/f-a.json" --sandbox-zenodo-id N \\
         --state-dir "$SCR/journals" --skip-checks
+
+(sandbox_launch.py reads the token from the terminal and calls this harness in-process: the token is never in
+an argument vector. Calling this file directly needs ZENODO_SANDBOX_TOKEN in the environment and is only for the
+offline tests.)
 
 Everything after `--` is handed to zenodo_publish.main unchanged. The tool file is NOT modified: the harness
 wraps ZenodoClient._request (and, for two cases, build_metadata / get_record) in memory only.
@@ -59,8 +62,8 @@ def check_preconditions(own_args, passthrough, environ=None) -> None:
     if "--sandbox" not in passthrough:
         refuse("the arguments after `--` must contain --sandbox")
     if environ.get("ZENODO_TOKEN"):
-        refuse("ZENODO_TOKEN (production) is present in the environment: run through `env -i` with "
-               "ZENODO_SANDBOX_TOKEN only")
+        refuse("ZENODO_TOKEN (production) is present in the environment: unset it and run through "
+               "tools/pilot/sandbox_launch.py")
     if own_args.case not in CASES:
         refuse(f"unknown case {own_args.case!r} (known: {', '.join(CASES)})")
 
