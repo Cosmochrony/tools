@@ -292,6 +292,21 @@ class BlockKeying(unittest.TestCase):
         self.assertEqual(len(some), 1)
         self.assertIn("same concept", some[0][1]["matched_by"])
 
+    def test_K2_a_journal_written_under_a_symlinked_path_matches_the_real_directory(self):
+        d = Path(tempfile.mkdtemp())
+        real_dir = Path(tempfile.mkdtemp()).resolve() / "paper"
+        real_dir.mkdir()
+        link = Path(tempfile.mkdtemp()).resolve() / "alias"
+        os.symlink(real_dir, link)
+        j = zp.Journal.create(d, link, "zenodo.org", False, {})          # recorded through the symlink
+        j.update(outcome="UNRECONCILED")
+        found = zp.find_blocking_journals(d, real_dir, [], "zenodo.org", {})
+        self.assertEqual(len(found), 1)
+        self.assertIn("same paper directory", found[0][1]["matched_by"])
+        j.data.pop("paper_dir_real")                                      # an older journal without the field
+        j.update()
+        self.assertEqual(len(zp.find_blocking_journals(d, real_dir, [], "zenodo.org", {})), 1)
+
     def test_identity_matching_is_host_aware_too(self):
         d = Path(tempfile.mkdtemp())
         ident = {"bib_key": "K", "title": "T", "config_sha256": "abc"}
@@ -415,6 +430,20 @@ class ReconcileSafety(unittest.TestCase):
         self.assertEqual(taken.read_text(), "earlier")
         self.assertEqual(Path(str(bad) + ".quarantined.1").read_text(), "[1]")
 
+    def test_the_config_written_by_a_reconcile_is_read_back(self):
+        root, paper, jp = self.unreconciled()
+        real = zp._atomic_write_text
+
+        def lying(path, text):
+            if Path(path).name == "zenodo.json":
+                text = text.replace('"zenodo_id": 5', '"zenodo_id": 6')
+            return real(path, text)
+        with mock.patch.object(zp, "_atomic_write_text", lying):
+            code, _, _ = run_main(["--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
+                                   "--concept-id", "5", "--concept-doi", "10.9/zzz"], {}, root)
+        self.assertIn("does not hold the identifiers", str(code))
+        self.assertEqual(json.loads(jp.read_text())["outcome"], "UNRECONCILED")
+
     def test_reconcile_flags_without_reconcile_are_refused(self):
         root, paper = workspace()
         code, _, _ = run_main([str(paper), "--skip-checks", "--quarantine"], ENV, root, Factory())
@@ -478,7 +507,8 @@ class SecretsNeverPersisted(unittest.TestCase):
         root, paper = workspace(zenodo_id=5, doi="10.0/c")
         leak = RuntimeError(f"the other environment's token {SBX_TOKEN} and ours {PROD_TOKEN} in a message")
         client = FakeClient(fail_at="newversion", fail_exc=leak)
-        code, out, err = run_main([str(paper), "--skip-checks"], ENV, root, Factory(client))
+        with mock.patch.object(zp, "_SECRETS", set()):          # nothing registered by an earlier test
+            code, out, err = run_main([str(paper), "--skip-checks"], ENV, root, Factory(client))
         for stream in (str(code), out, err):
             self.assertNotIn(SBX_TOKEN, stream)
             self.assertNotIn(PROD_TOKEN, stream)
@@ -597,22 +627,25 @@ class ArchiveRobustness(unittest.TestCase):
         with self.assertRaises(zp.ArchiveRefused):
             zp.archive_pdf(third, self.pdf, "P", "1.0", 5)
 
-    def test_a_name_that_appears_during_the_link_is_judged_by_digest(self):
-        real_link = os.link
+    def test_a_name_that_appears_while_the_copy_is_written_is_judged_by_digest_and_never_replaced(self):
+        real = zp.file_digests
+        state = {"first": True}
 
-        def racing_link(src, dst, *a, **k):
-            Path(dst).write_bytes(RACE[0])
-            return real_link(src, dst, *a, **k)                              # raises FileExistsError
+        def racing(path):
+            if state["first"] and Path(path).name.endswith(".tmp"):     # the verification of our temp copy
+                state["first"] = False
+                self.dest.write_bytes(RACE[0])                          # someone creates the name right now
+            return real(path)
         RACE = [b"%PDF-good"]
-        with mock.patch.object(zp.os, "link", racing_link):
+        with mock.patch.object(zp, "file_digests", racing):
             res = self.archive()
         self.assertEqual(res.status, "identical")
         self.dest.unlink()
-        RACE[0] = b"%PDF-other"
-        with mock.patch.object(zp.os, "link", racing_link):
+        RACE[0], state["first"] = b"%PDF-other", True
+        with mock.patch.object(zp, "file_digests", racing):
             with self.assertRaises(zp.ArchiveRefused):
                 self.archive()
-        self.assertEqual(self.dest.read_bytes(), b"%PDF-other")
+        self.assertEqual(self.dest.read_bytes(), b"%PDF-other")             # not replaced
 
     def test_the_directory_is_fsynced_after_the_link(self):
         synced = []
@@ -648,6 +681,13 @@ class ArchiveRobustness(unittest.TestCase):
             zp._create_exclusive_text(target, "new")
         self.assertEqual(target.read_text(), "EXISTING")
         self.assertEqual([p.name for p in d.iterdir()], ["j.run.json"])
+
+    def test_a_journal_is_created_through_the_exclusive_primitive(self):
+        d = Path(tempfile.mkdtemp())
+        with mock.patch.object(zp, "_create_exclusive_text", wraps=zp._create_exclusive_text) as spy:
+            j = zp.Journal.create(d, Path("/x/p"), "zenodo.org", False, {})
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(spy.call_args[0][0], j.path)
 
     def test_the_journal_directory_and_file_are_fsynced(self):
         synced = []
@@ -978,6 +1018,18 @@ class FinishBoundToTheJournal(unittest.TestCase):
         self.assertIn("cascade was NOT run", str(code))
         self.assertEqual(calls, [])
 
+    def test_a_newer_deposit_that_published_nothing_or_has_no_digest_does_not_shadow(self):
+        root, paper, jp = self.published_workspace()
+        write_journal(state_dir_for(root), "paper-failed.run.json", paper_dir=str(paper), kind="deposit",
+                      outcome="NOT-PUBLISHED", pdf={"name": "P.pdf", "sha256": "f" * 64}, version="9.9",
+                      started_at="2031-01-01T00:00:00+00:00")
+        write_journal(state_dir_for(root), "paper-nodigest.run.json", paper_dir=str(paper), kind="deposit",
+                      outcome="PUBLISHED", pdf=None, version="9.8", started_at="2032-01-01T00:00:00+00:00")
+        self.assertEqual(zp.select_deposit_journal(state_dir_for(root), paper)[0], jp)
+        (code, _, _), _ = self.finish(root, paper)
+        self.assertIsNone(code, code)
+        self.assertEqual(os.listdir(root / "pdfs"), ["P_1.0.pdf"])
+
     def test_journal_flag_only_with_finish(self):
         root, paper = workspace()
         code, _, _ = run_main([str(paper), "--skip-checks", "--journal", "x"], ENV, root, Factory())
@@ -1109,6 +1161,14 @@ class ReviewedDiffPin(unittest.TestCase):
         end = next(i for i, ln in enumerate(lines) if ln.strip().startswith("diff sha256:"))
         printed = "\n".join(lines[start:end])
         self.assertEqual(sha(printed.encode("utf-8")), digest)
+
+    def test_B5_without_the_flag_the_run_stops_with_the_instruction_to_pin_this_diff(self):
+        c = LiveClient()
+        root, paper, (code, out, _) = update_cli(c, "--set-title", raw_confirm=True)
+        digest = re.search(r"diff sha256: ([0-9a-f]{64})", out).group(1)
+        self.assertIn(f"--yes-apply-diff {digest[:16]}", str(code))
+        self.assertIn("sha256 prefix of THIS diff", str(code))
+        self.assertNotIn("edit", c.names())
 
     def test_F3_a_bare_or_short_pin_is_refused_and_nothing_is_created(self):
         out, digest = self.review()
