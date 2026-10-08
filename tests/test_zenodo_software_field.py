@@ -2,8 +2,6 @@
 
 No network: the HTTP layer is replaced by FakeClient; a socket guard fails any real connection.
 """
-import contextlib
-import io
 import json
 import socket
 import sys
@@ -12,91 +10,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fakes  # noqa: E402
+from fakes import (F, HOST, URL, FakeClient, HTTPFail, Resp, new, no_delays, run, upd,  # noqa: E402
+                   real_client, FakeSession)
 import zenodo_publish as zp  # noqa: E402
 
-F = zp.CODE_REPOSITORY_FIELD
-URL = "https://github.com/Cosmochrony/x/tree/abc/code"
-HOST = "zenodo.org"
+
+def setUpModule():
+    fakes.install_socket_guard()
 
 
-class Resp:
-    def __init__(self, status=200, text="ok"):
-        self.status_code, self.text, self.ok = status, text, status < 400
-
-
-class FakeClient:
-    """Mimics ZenodoClient; records every call. Behaviour is tuned per test."""
-
-    def __init__(self, drafts=None, put_keeps_custom=True, published_custom=URL,
-                 live_custom=None, fail_at=None, discard_status=201, latest_draft=None):
-        self.calls, self.created_state = [], None
-        self.drafts, self.put_keeps_custom = drafts or [], put_keeps_custom
-        self.published_custom, self.live_custom = published_custom, live_custom or {}
-        self.fail_at, self.discard_status, self.latest_draft = fail_at, discard_status, latest_draft
-        self.meta_put = None
-        self.state = "done"
-
-    def _c(self, name, *a):
-        self.calls.append((name,) + a)
-        if self.fail_at == name:
-            raise RuntimeError(f"boom at {name}")
-
-    def resolve_latest_version_recid(self, r):
-        self._c("resolve"); return 10
-    def list_drafts(self):
-        self._c("list_drafts"); return self.drafts
-    def get_deposition(self, i):
-        self._c("get_deposition", i)
-        if i == 10 and self.created_state is None:
-            return {"state": self.state, "links": {"latest_draft": self.latest_draft} if self.latest_draft else {},
-                    "metadata": {"title": "t", "custom": dict(self.live_custom)}}
-        meta = dict(self.meta_put or {"title": "t", "custom": dict(self.live_custom)})
-        if self.meta_put is not None and not self.put_keeps_custom:
-            meta.pop("custom", None)
-        return {"state": "unsubmitted", "metadata": meta}
-    def edit_deposition(self, i):
-        self._c("edit", i); self.created_state = {"dep_id": i, "kind": "edit session"}; return {}
-    def new_version(self, i):
-        self._c("newversion", i); self.created_state = {"dep_id": 99, "kind": "new-version draft"}
-        return {"id": 99, "files": [{"id": "f", "filename": "old.pdf"}], "links": {}}
-    def create_deposition(self):
-        self._c("create"); self.created_state = {"dep_id": 98, "kind": "new deposition draft"}
-        return {"id": 98, "files": [], "links": {}}
-    def delete_file(self, *a): self._c("delete_file")
-    def upload_file(self, *a): self._c("upload")
-    def set_metadata(self, i, m):
-        self._c("put", i); self.meta_put = m
-    def publish(self, i):
-        self._c("publish", i)
-        return {"id": i, "doi": "10.5281/zenodo.1", "conceptdoi": "10.5281/zenodo.0", "conceptrecid": "5",
-                "metadata": {}}
-    def discard(self, i):
-        self._c("discard", i); return Resp(self.discard_status)
-    def get_record(self, i):
-        self._c("get_record", i)
-        return {"metadata": {"custom": {F: self.published_custom} if self.published_custom else {}}}
-
-    def names(self):
-        return [c[0] for c in self.calls]
-
-
-def run(fn, *a, **k):
-    out, err = io.StringIO(), io.StringIO()
-    code = None
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        try:
-            fn(*a, **k)
-        except SystemExit as e:
-            code = e.code
-        except zp.PostPublishFailure as e:
-            code = ("POSTPUBLISH", str(e))
-    return code, out.getvalue(), err.getvalue()
-
-
-def new(client, code_url=URL, zid=5, **k):
-    meta = zp.build_metadata("T", "A", ["k"], "https://w", "1.0", code_url=code_url)
-    return zp.deposit_new(client, Path("/x/p.pdf"), meta, code_url, zid, "production", HOST, **k)
+def tearDownModule():
+    fakes.remove_socket_guard()
 
 
 class BuildMetadata(unittest.TestCase):
@@ -140,7 +66,7 @@ class NewVersionFlow(unittest.TestCase):
 
     def test_failure_after_newversion_discards_created_draft_once(self):
         for step in ("upload", "put", "publish"):
-            c = FakeClient(fail_at=step)
+            c = FakeClient(fail_at=step, fail_exc=HTTPFail(400) if step == "publish" else None)
             code, _, err = run(new, c)
             self.assertNotEqual(code, None, step)
             discards = [x for x in c.calls if x[0] == "discard"]
@@ -188,28 +114,22 @@ class NewVersionFlow(unittest.TestCase):
         self.assertNotIn("discard", c.names())
 
     def test_publish_failure_on_already_published_is_not_discarded(self):
-        c = FakeClient(fail_at="publish")
-        orig = c.get_deposition
-        def gd(i):
-            if i == 99 and "publish" in c.names():
-                return {"state": "done", "metadata": {}}
-            return orig(i)
-        c.get_deposition = gd
-        code, _, _ = run(new, c)
-        self.assertIn("PUBLISHED", code)
+        c = FakeClient(fail_at="publish", state_after_publish="done")
+        with no_delays():
+            code, _, _ = run(new, c)
+        self.assertIn("PUBLISHED", str(code) + _)
         self.assertNotIn("discard", c.names())
 
     def test_first_publication_cleans_only_its_own_deposition(self):
         c = FakeClient(fail_at="upload")
         run(new, c, zid=None)
         self.assertEqual([x for x in c.calls if x[0] == "discard"], [("discard", 98)])
-        self.assertNotIn("list_drafts", c.names())
+        self.assertNotIn("resolve", c.names())
 
 
 class UpdateFlow(unittest.TestCase):
-    def upd(self, c, code_url=URL, built_extra=None):
-        meta = zp.build_metadata("T", "A", [], "https://w", "1.0", code_url=code_url)
-        return zp.deposit_update(c, meta, code_url, 5, "production", HOST)
+    def upd(self, c, code_url=URL, **k):
+        return upd(c, code_url, **k)
 
     def test_update_keeps_other_custom_fields(self):
         c = FakeClient(live_custom={"code:programmingLanguage": ["py"], F: "https://old"})
@@ -247,28 +167,68 @@ class UpdateFlow(unittest.TestCase):
 class RealClientState(unittest.TestCase):
     """The real client records what THIS run created, before any follow-up call can fail."""
 
-    def make(self):
-        c = zp.ZenodoClient.__new__(zp.ZenodoClient)
-        c.base, c.created_state = "https://z/api", None
-        c.session = mock.Mock()
-        return c
-
     def test_new_version_records_draft_id_even_if_followup_get_fails(self):
-        c = self.make()
-        post = Resp(); post.json = lambda: {"links": {"latest_draft": "https://z/api/deposit/depositions/321"}}
-        c.session.post.return_value = post
-        c.session.get.side_effect = RuntimeError("down")
+        c, sess = real_client()
+        sess.route("POST", "/actions/newversion", Resp(201, {"links": {
+            "latest_draft": "https://zenodo.org/api/deposit/depositions/321"}}))
+        sess.route("GET", "/depositions/321", RuntimeError("down"))
         with self.assertRaises(RuntimeError):
             c.new_version(10)
-        self.assertEqual(c.created_state, {"dep_id": 321, "kind": "new-version draft"})
+        self.assertEqual(c.created_state, {"dep_id": 321, "kind": "new-version draft", "certain": True})
 
     def test_failed_newversion_records_nothing(self):
-        c = self.make()
-        c.session.post.return_value = Resp(409, "conflict")
-        c.session.post.return_value.raise_for_status = mock.Mock(side_effect=RuntimeError("409"))
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(RuntimeError):
-            c.new_version(10)
+        c, sess = real_client()
+        sess.route("POST", "/actions/newversion", Resp(409, text="conflict"))
+        with self.assertRaises(zp.ZenodoAPIError):
+            run_quiet(c.new_version, 10)
         self.assertIsNone(c.created_state)
+
+
+def run_quiet(fn, *a):
+    import contextlib, io
+    with contextlib.redirect_stderr(io.StringIO()):
+        return fn(*a)
+
+
+class SurvivingMutantKillers(unittest.TestCase):
+    """Mutants that survived the first review: local state never saved, saved too late, listing cut short."""
+
+    def test_on_published_called_once_with_result(self):
+        c, seen = FakeClient(), []
+        code, _, _ = run(new, c, on_published=seen.append)
+        self.assertIsNone(code)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["conceptrecid"], "5")
+
+    def test_local_state_saved_before_verification(self):
+        c, order = FakeClient(), []
+        c.events = order
+        run(new, c, on_published=lambda r: order.append("saved"))
+        self.assertEqual(order, ["saved", "verify"])
+
+    def test_local_state_saved_even_when_verification_fails(self):
+        c, order = FakeClient(published_custom="https://wrong"), []
+        c.events = order
+        with no_delays():
+            code, _, _ = run(new, c, on_published=lambda r: order.append("saved"))
+        self.assertEqual(code[0], "POSTPUBLISH")
+        self.assertEqual(order[0], "saved")
+
+    def test_list_drafts_reads_every_page(self):
+        c, sess = real_client()
+        pages = [[{"id": i} for i in (1, 2, 3)], [{"id": i} for i in (4, 5, 6)], [{"id": 7}], []]
+        sess.route("GET", "/deposit/depositions", *[Resp(200, p) for p in pages])
+        self.assertEqual([d["id"] for d in c.list_drafts()], [1, 2, 3, 4, 5, 6, 7])
+
+    def test_draft_on_a_later_page_is_seen_by_the_guard(self):
+        c, sess = real_client()
+        sess.route("GET", "/records/5", Resp(200, {"id": 10}))
+        sess.route("GET", "/depositions/10", Resp(200, {"id": 10, "state": "done", "conceptrecid": "5"}))
+        sess.route("GET", "/deposit/depositions", Resp(200, [{"id": 1, "conceptrecid": "9"}]),
+                   Resp(200, [{"id": 77, "conceptrecid": "5", "state": "unsubmitted"}]), Resp(200, []))
+        code, _, _ = run(zp.refuse_if_unpublished_state, c, 5, 10, HOST)
+        self.assertIn("already exists", code)
+        self.assertIn("77", code)
 
 
 if __name__ == "__main__":
