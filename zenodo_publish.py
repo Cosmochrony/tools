@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 """zenodo_publish.py — Automated Zenodo publication for Cosmochrony papers.
 
-Usage:
-    ZENODO_TOKEN=xxx python tools/zenodo_publish.py bell-paper/ [--sandbox] [--dry-run]
+Usage (production):
+    export ZENODO_TOKEN=...            # the script reads the PROCESS ENVIRONMENT only; it does NOT load
+                                       # tools/.env itself (export it first, e.g. `set -a; . tools/.env; set +a`)
+    python tools/zenodo_publish.py bell-paper/ [--update] [--no-cascade] [--dry-run]
+
+Sandbox (never touches a production id, DOI, pdfs/ or bibliography; see tools/README.md):
+    ZENODO_SANDBOX_TOKEN=... python tools/zenodo_publish.py PAPER/ --sandbox --sandbox-state /tmp/state.json
+    (--sandbox reads ONLY ZENODO_SANDBOX_TOKEN, with no fallback to ZENODO_TOKEN; the production token is
+     never sent to the sandbox host, nor the sandbox token to production.)
+
+Guards (all offline-tested): a run REFUSES when a draft/edit session of the concept already exists, and on
+any failure cleans up ONLY the server state this run certainly created (an uncertain outcome is reported
+and searched for, never assumed away; ambiguity discards nothing); every request has bounded timeouts, only
+GETs are retried; the Software field (code:codeRepository) is verified on the draft before publishing and on
+the public record afterwards; zenodo.json is saved the moment a publication is confirmed. After a
+post-publish FAIL, `--finish-after-fail` runs the skipped PDF archive and DOI cascade offline.
 
 Config file required at paper_dir/zenodo.json:
     {
@@ -30,10 +44,13 @@ import argparse
 import json
 import os
 import re
+import datetime
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 # The Cosmochrony repository root (this script lives in <root>/tools/). Used as the
 # stable anchor for the central pdfs/ archive and the DOI cascade, so both work
@@ -472,107 +489,277 @@ def find_pdf(paper_dir: Path) -> Path:
 
 # ── Zenodo API client ──────────────────────────────────────────────────────────
 
+PRODUCTION_HOST = "zenodo.org"
+SANDBOX_HOST = "sandbox.zenodo.org"
+PRODUCTION_TOKEN_VAR = "ZENODO_TOKEN"
+SANDBOX_TOKEN_VAR = "ZENODO_SANDBOX_TOKEN"
+
+# Network bounds (seconds). Overridable by environment variables, read when a client is built.
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_READ_TIMEOUT = 60.0
+DEFAULT_UPLOAD_READ_TIMEOUT = 900.0
+DEFAULT_GET_ATTEMPTS = 3          # GET only (idempotent); POST/PUT/DELETE are never retried
+DEFAULT_RETRY_BACKOFF = 1.0       # 1, 2, 4 ... seconds, capped at 30
+MAX_LIST_PAGES = 50               # pagination cap; hitting it without an empty page fails closed
+LIST_PAGE_SIZE = 100
+
+# Post-publication verification: bounded retries (attempts, delay before attempt k+1 = VERIFY_DELAYS[k]).
+DEFAULT_VERIFY_ATTEMPTS = 5
+VERIFY_DELAYS = (2.0, 4.0, 8.0, 16.0)   # total wait <= 30 s
+
+
+def _sleep(seconds: float) -> None:
+    """Single sleeping hook (tests replace it)."""
+    time.sleep(seconds)
+
+
+def _env_number(name: str, default: float, environ=None) -> float:
+    raw = (environ if environ is not None else os.environ).get(name)
+    try:
+        return float(raw) if raw not in (None, "") else default
+    except ValueError:
+        sys.exit(f"Error: environment variable {name} must be a number, got {raw!r}")
+
+
+class ZenodoAPIError(Exception):
+    """An HTTP error answer (4xx/5xx). ``response`` carries the raw answer."""
+
+    def __init__(self, response):
+        self.response = response
+        super().__init__(f"HTTP {response.status_code}")
+
+
+class MalformedResponse(Exception):
+    """A 2xx answer that is not the expected JSON (or lacks a required field)."""
+
+    def __init__(self, message, response=None):
+        self.response = response
+        super().__init__(message)
+
+
+class CompletenessError(Exception):
+    """A listing could not be proven complete (fail closed)."""
+
+
+class TokenHostMismatch(Exception):
+    """A token would be sent to the wrong Zenodo host (or to a foreign host)."""
+
+
+def is_definitive_refusal(exc: BaseException) -> bool:
+    """True when the server demonstrably refused the request (4xx other than 408): no effect."""
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    return isinstance(code, int) and 400 <= code < 500 and code != 408
+
+
+def resolve_token(sandbox: bool, environ=None) -> str:
+    """The token for the requested host. --sandbox reads ONLY ZENODO_SANDBOX_TOKEN, never ZENODO_TOKEN."""
+    environ = os.environ if environ is None else environ
+    name = SANDBOX_TOKEN_VAR if sandbox else PRODUCTION_TOKEN_VAR
+    token = (environ.get(name) or "").strip()
+    if not token:
+        extra = (f" --sandbox never falls back to {PRODUCTION_TOKEN_VAR}: the production token is "
+                 "never sent to the sandbox." if sandbox else "")
+        sys.exit(f"Error: {name} environment variable is not set or is empty.{extra} "
+                 "(This script reads the process environment only; it does not load tools/.env.) "
+                 "Nothing was sent.")
+    return token
+
+
 class ZenodoClient:
-    def __init__(self, token: str, sandbox: bool = False):
+    def __init__(self, token: str, sandbox: bool = False, session=None, environ=None):
         global requests
         if requests is None:
             import requests as _req
             requests = _req
+        environ = os.environ if environ is None else environ
+        self.sandbox = sandbox
         self.base = SANDBOX_URL if sandbox else ZENODO_URL
-        self.session = requests.Session()
+        self.host = SANDBOX_HOST if sandbox else PRODUCTION_HOST
+        # Host/token pairing: the token handed to this client must not be the other environment's.
+        other_var = PRODUCTION_TOKEN_VAR if sandbox else SANDBOX_TOKEN_VAR
+        other = (environ.get(other_var) or "").strip()
+        if not token or (other and token == other):
+            raise TokenHostMismatch(
+                f"refusing to build a {'sandbox' if sandbox else 'production'} client: the token is "
+                f"empty or equals {other_var}, i.e. it belongs to the other Zenodo host")
+        self.session = session if session is not None else requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
-        self.created_state: dict | None = None  # server-side state created by THIS run
+        connect = _env_number("ZENODO_CONNECT_TIMEOUT", DEFAULT_CONNECT_TIMEOUT, environ)
+        self.timeout = (connect, _env_number("ZENODO_READ_TIMEOUT", DEFAULT_READ_TIMEOUT, environ))
+        self.upload_timeout = (connect, _env_number("ZENODO_UPLOAD_TIMEOUT",
+                                                    DEFAULT_UPLOAD_READ_TIMEOUT, environ))
+        self.get_attempts = max(1, int(_env_number("ZENODO_GET_ATTEMPTS", DEFAULT_GET_ATTEMPTS, environ)))
+        self.retry_backoff = _env_number("ZENODO_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF, environ)
+        self._sleep = _sleep
+        # Server-side state created, or POSSIBLY created, by THIS run:
+        # {"dep_id": int|None, "kind": str, "certain": bool}. Set BEFORE the effect, refined after.
+        self.created_state: dict | None = None
+        # Filled by the existence guard / first-publication snapshot (see refuse_if_unpublished_state).
+        self.pre_run_draft_ids: set | None = None
+        self.pre_run_latest_state: str | None = None
+        self.concept_id = None
 
-    def _ok(self, resp: requests.Response) -> dict:
+    # ── transport ──
+    def _check_url(self, url: str) -> None:
+        """Never send the Authorization header anywhere but this client's own Zenodo host."""
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname != self.host:
+            raise TokenHostMismatch(
+                f"refusing to send a request to {parsed.scheme}://{parsed.hostname}: "
+                f"this client talks to https://{self.host} only")
+
+    def _request(self, method: str, url: str, **kw):
+        self._check_url(url)
+        kw.setdefault("timeout", self.timeout)
+        fn = getattr(self.session, method.lower())
+        attempts = self.get_attempts if method == "GET" else 1   # no automatic retry of writes
+        for i in range(attempts):
+            last = i + 1 == attempts
+            try:
+                resp = fn(url, **kw)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                if last:
+                    raise
+                self._sleep(min(30.0, self.retry_backoff * (2 ** i)))
+                continue
+            if method == "GET" and not last and resp.status_code in (429, 502, 503, 504):
+                self._sleep(min(30.0, self.retry_backoff * (2 ** i)))
+                continue
+            return resp
+
+    def _check(self, resp):
         if not resp.ok:
             print(f"  HTTP {resp.status_code}: {resp.text[:500]}", file=sys.stderr)
-            resp.raise_for_status()
-        return resp.json()
+            raise ZenodoAPIError(resp)
 
+    def _json(self, resp):
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise MalformedResponse(
+                f"HTTP {resp.status_code} answer is not JSON ({exc})", resp) from exc
+
+    def _ok(self, resp) -> dict:
+        self._check(resp)
+        return self._json(resp)
+
+    def _post_creating(self, url: str, kind: str, known_id=None, extract=None):
+        """POST that may create server-side state. Intent is recorded BEFORE the request is sent."""
+        previous = self.created_state
+        self.created_state = {"dep_id": known_id, "kind": kind, "certain": False}
+        resp = self._request("POST", url)      # timeout / dropped connection: state stays 'possible'
+        if not resp.ok:
+            if is_definitive_refusal(ZenodoAPIError(resp)):
+                self.created_state = previous   # the server demonstrably did nothing
+            self._check(resp)
+        body = self._json(resp)
+        if extract is not None:
+            try:
+                new_id = extract(body)
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                raise MalformedResponse(f"answer lacks the expected field ({exc!r})", resp) from exc
+            self.created_state = {"dep_id": new_id, "kind": kind, "certain": True}
+        else:
+            self.created_state["certain"] = True
+        return body
+
+    # ── API ──
     def create_deposition(self) -> dict:
-        dep = self._ok(self.session.post(f"{self.base}/deposit/depositions", json={}))
-        self.created_state = {"dep_id": dep["id"], "kind": "new deposition draft"}
-        return dep
+        return self._post_creating(f"{self.base}/deposit/depositions", "new deposition draft",
+                                   extract=lambda b: int(b["id"]))
 
     def get_deposition(self, dep_id: int) -> dict:
-        return self._ok(self.session.get(f"{self.base}/deposit/depositions/{dep_id}"))
+        return self._ok(self._request("GET", f"{self.base}/deposit/depositions/{dep_id}"))
 
     def edit_deposition(self, dep_id: int) -> dict:
-        self._ok(self.session.post(
-            f"{self.base}/deposit/depositions/{dep_id}/actions/edit"
-        ))
-        # The record is now in edit state because of THIS run: remember it before any further call.
-        self.created_state = {"dep_id": dep_id, "kind": "edit session"}
+        self._post_creating(f"{self.base}/deposit/depositions/{dep_id}/actions/edit",
+                            "edit session", known_id=dep_id)
         return self.get_deposition(dep_id)
 
     def new_version(self, dep_id: int) -> dict:
-        resp = self._ok(self.session.post(
-            f"{self.base}/deposit/depositions/{dep_id}/actions/newversion"
-        ))
-        draft_url = resp["links"]["latest_draft"]
-        # The draft exists server-side because of THIS run: record its id before the follow-up GET.
-        self.created_state = {"dep_id": int(draft_url.rstrip("/").rsplit("/", 1)[-1]),
-                              "kind": "new-version draft"}
-        return self._ok(self.session.get(draft_url))
+        body = self._post_creating(
+            f"{self.base}/deposit/depositions/{dep_id}/actions/newversion", "new-version draft",
+            extract=lambda b: int(b["links"]["latest_draft"].rstrip("/").rsplit("/", 1)[-1]))
+        return self._ok(self._request("GET", body["links"]["latest_draft"]))
 
     def list_drafts(self) -> list[dict]:
-        """All unpublished depositions of the account (read-only)."""
-        out: list[dict] = []
-        for page in range(1, 21):
-            batch = self._ok(self.session.get(
-                f"{self.base}/deposit/depositions",
-                params={"status": "draft", "size": 100, "page": page, "all_versions": "true"},
-            ))
-            out.extend(batch)
-            if len(batch) < 100:
-                break
-        return out
+        """ALL unpublished depositions of the account (read-only), or CompletenessError.
 
-    def discard(self, dep_id: int) -> requests.Response:
+        Reads pages until an EMPTY page (a short page proves nothing: the server may cap `size`).
+        Fails closed when: the cap is hit without an empty page; a page brings nothing new (the
+        server ignores `page`); a `next` link exists on an empty page; the server states a total
+        that differs from what was read."""
+        out: list[dict] = []
+        seen: set = set()
+        total = None
+        for page in range(1, MAX_LIST_PAGES + 1):
+            resp = self._request("GET", f"{self.base}/deposit/depositions", params={
+                "status": "draft", "size": LIST_PAGE_SIZE, "page": page, "all_versions": "true"})
+            batch = self._ok(resp)
+            if not isinstance(batch, list):
+                raise MalformedResponse("deposition listing is not a JSON list", resp)
+            headers = resp.headers if isinstance(resp.headers, dict) else {}
+            for key in ("X-Total", "X-Total-Count"):
+                if headers.get(key) not in (None, ""):
+                    try:
+                        total = int(headers[key])
+                    except ValueError:
+                        pass
+            links = resp.links if isinstance(resp.links, dict) else {}
+            if not batch:
+                if links.get("next"):
+                    raise CompletenessError("the server returned an empty page but advertises a next page")
+                if total is not None and total != len(out):
+                    raise CompletenessError(
+                        f"the server reports {total} depositions but {len(out)} were read")
+                return out
+            ids = {d.get("id") for d in batch}
+            if ids <= seen:
+                raise CompletenessError(f"page {page} brought no new deposition (the server ignores `page`)")
+            seen |= ids
+            out.extend(batch)
+        raise CompletenessError(f"more than {MAX_LIST_PAGES} pages of drafts: cannot prove completeness")
+
+    def discard(self, dep_id: int):
         """Documented actions/discard: deletes a draft, or ends an edit session without publishing."""
-        return self.session.post(f"{self.base}/deposit/depositions/{dep_id}/actions/discard")
+        return self._request("POST", f"{self.base}/deposit/depositions/{dep_id}/actions/discard")
 
     def get_record(self, rec_id: int) -> dict:
         """Public record (the same API host, read-only)."""
-        return self._ok(self.session.get(f"{self.base}/records/{rec_id}"))
+        return self._ok(self._request("GET", f"{self.base}/records/{rec_id}"))
 
     def resolve_latest_version_recid(self, recid: int) -> int:
         """Resolve a Zenodo recid (concept or version) to the latest published version's recid.
         GET /api/records/{recid} redirects to the latest version when given a concept recid,
         and returns the record itself otherwise."""
-        resp = self._ok(self.session.get(f"{self.base}/records/{recid}"))
-        return int(resp["id"])
+        resp = self._ok(self._request("GET", f"{self.base}/records/{recid}"))
+        try:
+            return int(resp["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MalformedResponse(f"record {recid} answer has no usable id", None) from exc
 
-    def delete_file(self, dep_id: int, file_id: str) -> bool:
-        resp = self.session.delete(
-            f"{self.base}/deposit/depositions/{dep_id}/files/{file_id}"
-        )
-        if not resp.ok:
-            print(f"  Warning: delete returned {resp.status_code}: {resp.text[:200]}",
-                  file=sys.stderr)
-            return False
-        return True
+    def delete_file(self, dep_id: int, file_id: str) -> None:
+        """Remove a file from the draft. A failure is BLOCKING (raises)."""
+        resp = self._request("DELETE", f"{self.base}/deposit/depositions/{dep_id}/files/{file_id}")
+        self._check(resp)
 
     def upload_file(self, deposition: dict, file_path: Path) -> dict:
-        """Upload via S3 bucket API (new depositions and new versions)."""
+        """Upload via S3 bucket API (new depositions and new versions). A failure raises."""
         bucket_url = deposition["links"]["bucket"]
         with open(file_path, "rb") as fh:
-            return self._ok(self.session.put(
-                f"{bucket_url}/{file_path.name}",
-                data=fh,
+            return self._ok(self._request(
+                "PUT", f"{bucket_url}/{file_path.name}", data=fh,
                 headers={"Content-Type": "application/octet-stream"},
-            ))
+                timeout=self.upload_timeout))
 
     def set_metadata(self, dep_id: int, metadata: dict) -> dict:
-        return self._ok(self.session.put(
-            f"{self.base}/deposit/depositions/{dep_id}",
-            json={"metadata": metadata},
-        ))
+        return self._ok(self._request(
+            "PUT", f"{self.base}/deposit/depositions/{dep_id}", json={"metadata": metadata}))
 
     def publish(self, dep_id: int) -> dict:
-        return self._ok(self.session.post(
-            f"{self.base}/deposit/depositions/{dep_id}/actions/publish"
-        ))
+        return self._ok(self._request(
+            "POST", f"{self.base}/deposit/depositions/{dep_id}/actions/publish"))
 
 
 # ── BibTeX DOI cascade ─────────────────────────────────────────────────────────
@@ -715,6 +902,8 @@ def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
     return meta
 
 
+
+
 # ── Guarded deposit flows ──────────────────────────────────────────────────────
 
 class VerificationError(Exception):
@@ -722,23 +911,45 @@ class VerificationError(Exception):
 
 
 class PostPublishFailure(Exception):
-    """The record is published but its verification failed (never un-published automatically)."""
+    """The record is published but a check failed (never un-published automatically)."""
 
 
 def custom_repository(meta: dict | None) -> str | None:
     return ((meta or {}).get("custom") or {}).get(CODE_REPOSITORY_FIELD)
 
 
-def refuse_if_unpublished_state(client, concept_id: int, latest_id: int, host: str):
-    """Refuse (nothing created) when a draft / edit session of this concept already exists."""
+def _norm_url(url):
+    return url.rstrip("/") if isinstance(url, str) else url
+
+
+def verify_attempts() -> int:
+    """Post-publication attempts: ZENODO_VERIFY_ATTEMPTS (default 5), clamped to 1..6 (total wait <= 46 s)."""
+    return max(1, min(6, int(_env_number("ZENODO_VERIFY_ATTEMPTS", DEFAULT_VERIFY_ATTEMPTS))))
+
+
+def _verify_delay(k: int) -> float:
+    return VERIFY_DELAYS[min(k, len(VERIFY_DELAYS) - 1)] if VERIFY_DELAYS else 0.0
+
+
+def refuse_if_unpublished_state(client, zenodo_id, latest_id: int, host: str):
+    """Refuse (nothing created) when a draft / edit session of this concept already exists.
+
+    The concept id is taken from the latest record itself (zenodo_id may be a version id), and the
+    record must be in state 'done' (a missing state refuses). On success the pre-run snapshot of ALL
+    draft ids is stored on the client: it is what lets a later cleanup tell this run's drafts from others."""
     problems = []
     try:
-        for d in client.list_drafts():
-            if str(d.get("conceptrecid")) == str(concept_id) or d.get("id") in (latest_id,):
-                problems.append(f"unpublished deposition {d.get('id')} (state {d.get('state')})")
         latest = client.get_deposition(latest_id)
-        if latest.get("state") not in (None, "done"):
-            problems.append(f"record {latest_id} is already in state {latest.get('state')!r}")
+        concept = latest.get("conceptrecid")
+        if concept in (None, ""):
+            raise RuntimeError(f"record {latest_id} does not state its conceptrecid")
+        drafts = client.list_drafts()
+        ids = {d.get("id") for d in drafts}
+        for d in drafts:
+            if str(d.get("conceptrecid")) == str(concept) or d.get("id") == latest_id:
+                problems.append(f"unpublished deposition {d.get('id')} (state {d.get('state')})")
+        if latest.get("state") != "done":
+            problems.append(f"record {latest_id} is in state {latest.get('state')!r}, not 'done'")
         link = (latest.get("links") or {}).get("latest_draft")
         if link:
             problems.append(f"record {latest_id} advertises a latest_draft: {link}")
@@ -752,31 +963,152 @@ def refuse_if_unpublished_state(client, concept_id: int, latest_id: int, host: s
             + f"\nNothing was created and nothing was discarded. Inspect https://{host}/deposit "
             "and resolve it by hand (publish or discard it yourself), then re-run."
         )
+    client.pre_run_draft_ids = ids
+    client.concept_id = concept
+    client.pre_run_latest_state = "done"
 
 
-def abort_and_cleanup(client, step: str, exc: BaseException, host: str):
-    """Report a failure, clean up ONLY the state created by this run, then exit non-zero."""
-    print(f"\n!! FAILED at step: {step}", file=sys.stderr)
-    resp = getattr(exc, "response", None)
-    if resp is not None:
-        print(f"!! HTTP status: {resp.status_code}; body: {resp.text[:300]}", file=sys.stderr)
-    print(f"!! Error: {exc}", file=sys.stderr)
+def snapshot_before_first_publication(client, host: str):
+    """First publication has no concept to guard, but the pre-run draft ids are still needed to tell
+    this run's draft from anyone else's if its creation request ends in doubt."""
+    try:
+        client.pre_run_draft_ids = {d.get("id") for d in client.list_drafts()}
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(f"Error: cannot snapshot the existing drafts ({exc}); without it an uncertain creation "
+                 "could not be attributed safely. Nothing was created. Refusing to proceed.")
+    client.concept_id = None
+
+
+UNPUBLISHED_STATES = ("unsubmitted", "inprogress")
+
+
+def locate_own_state(client, state: dict):
+    """Resolve a state-creating request of unknown outcome.
+
+    Returns (verdict, dep_id, candidates, why) with verdict 'own' (CERTAINLY this run's, discardable),
+    'none' (nothing found) or 'unknown' (not certain: delete nothing). Draft kinds: a draft is ours
+    only if its id is absent from the pre-run snapshot AND it belongs to the concept AND it is in an
+    unpublished state AND it is the only such draft. An edit session: the record was proven 'done'
+    before this run and is not 'done' now."""
+    kind = state["kind"]
+    snapshot, concept = client.pre_run_draft_ids, client.concept_id
+    if kind == "edit session":
+        rid = state["dep_id"]
+        if client.pre_run_latest_state != "done":
+            return "unknown", None, [rid], "the state of the record before this run was not established"
+        try:
+            dep = client.get_deposition(rid)
+        except Exception as exc:  # noqa: BLE001
+            return "unknown", None, [rid], f"cannot read record {rid} ({exc})"
+        if dep.get("state") == "done":
+            return "none", None, [], f"record {rid} is in state 'done': no edit session exists"
+        return "own", rid, [], ""
+    if snapshot is None:
+        return "unknown", None, [], "no pre-run snapshot of the drafts was taken"
+    try:
+        drafts = client.list_drafts()
+    except Exception as exc:  # noqa: BLE001
+        return "unknown", None, [], f"cannot list the drafts ({exc})"
+    cands = [d for d in drafts
+             if d.get("id") not in snapshot
+             and d.get("state") in UNPUBLISHED_STATES
+             and (concept is None or str(d.get("conceptrecid")) == str(concept))]
+    ids = [d.get("id") for d in cands]
+    if len(cands) == 1:
+        return "own", ids[0], [], ""
+    if not cands:
+        return "none", None, [], "no draft absent from the pre-run snapshot was found"
+    return "unknown", None, ids, f"{len(cands)} drafts are absent from the pre-run snapshot"
+
+
+def _poll_published(client, dep_id):
+    """Bounded re-reads of a deposition after a publish call of unknown outcome. -> (dep|None, done)."""
+    attempts, last = verify_attempts(), None
+    for k in range(attempts):
+        try:
+            last = client.get_deposition(dep_id)
+            if last.get("state") == "done":
+                return last, True
+        except Exception:  # noqa: BLE001
+            pass
+        if k < attempts - 1:
+            _sleep(_verify_delay(k))
+    return last, False
+
+
+def _cleanup(client, step: str, exc: BaseException, host: str, on_published):
+    """Decide and perform the cleanup. Returns (message, recovered_deposition, local_save_error)."""
     state = client.created_state
     if not state:
-        sys.exit("No server-side state had been created by this run; nothing to clean up.")
-    dep_id, kind = state["dep_id"], state["kind"]
-    print(f"!! This run created: {kind} {dep_id}", file=sys.stderr)
+        return ("No server-side state was created, or possibly created, by this run (no state-creating "
+                "request was sent, or the server demonstrably refused it); nothing to clean up.",
+                None, None)
+    kind, dep_id, certain = state["kind"], state.get("dep_id"), bool(state.get("certain"))
+    snapshot, concept = client.pre_run_draft_ids, client.concept_id
+    if not certain:
+        print(f"!! UNCERTAINTY: the request creating a {kind} was sent but its outcome is unknown "
+              "(timeout, dropped connection, unreadable or incomplete answer). The server MAY have "
+              "created it. Searching for the state this run may have created...", file=sys.stderr)
+        verdict, found, cands, why = locate_own_state(client, state)
+        if verdict == "none":
+            return (f"!! No {kind} attributable to this run was found ({why}). Nothing was discarded. "
+                    f"The server may still show it later: check https://{host}/deposit before any retry.",
+                    None, None)
+        if verdict == "unknown":
+            lines = [f"!! UNCERTAIN: a {kind} may exist and cannot be attributed with certainty ({why}).",
+                     "!! NOTHING WAS DISCARDED."]
+            if cands:
+                lines.append("!! Candidate ids: " + ", ".join(f"https://{host}/deposit/{c}" for c in cands))
+            lines.append(f"!! MANUAL CHECK REQUIRED: open https://{host}/deposit, identify what this run "
+                         "created (unpublished, created just now) and discard it yourself if it is yours.")
+            return "\n".join(lines), None, None
+        dep_id = found
+        print(f"!! Attributed to this run with certainty: {kind} {dep_id}", file=sys.stderr)
     manual = f"https://{host}/deposit/{dep_id}"
+    print(f"!! This run created: {kind} {dep_id}", file=sys.stderr)
+    if kind != "edit session" and snapshot is not None and dep_id in snapshot:
+        return (f"!! REFUSING to discard {kind} {dep_id}: it existed before this run (pre-run snapshot). "
+                f"Inspect {manual} by hand.", None, None)
+    dep, read_err = None, None
+    try:
+        dep = client.get_deposition(dep_id)
+    except Exception as exc2:  # noqa: BLE001
+        read_err = exc2
     if step == "publish":
-        # A failed publish call may still have published: never discard without proof it did not.
-        try:
-            st = client.get_deposition(dep_id).get("state")
-        except Exception as exc2:  # noqa: BLE001
-            sys.exit(f"!! CLEANUP SKIPPED: cannot read state of {dep_id} after failed publish ({exc2}). "
-                     f"Inspect {manual} by hand; it may be published or still a draft.")
-        if st == "done":
-            sys.exit(f"!! The publish call failed but {dep_id} is PUBLISHED (state done). "
-                     f"No cleanup done. Check https://{host}/record/{dep_id}.")
+        if dep is None:
+            return (f"!! CLEANUP SKIPPED: cannot read state of {dep_id} after the failed publish call "
+                    f"({read_err}). Inspect {manual} by hand; it may be published or still a draft. "
+                    "Nothing was discarded.", None, None)
+        if dep.get("state") != "done" and not is_definitive_refusal(exc):
+            # The call may still have gone through (timeout, dropped connection, interruption, 5xx).
+            dep, done = _poll_published(client, dep_id)
+            if not done:
+                return (f"!! The publish call ended in doubt and {dep_id} is not (yet) published. "
+                        f"NOTHING WAS DISCARDED: the publication may still complete. Inspect {manual} "
+                        f"and https://{host}/record/{dep_id}; discard by hand only if it is a draft.",
+                        None, None)
+        if dep.get("state") == "done":
+            save_error = None
+            msg = (f"!! The publish call failed but {dep_id} is PUBLISHED (state done). No cleanup. "
+                   f"Check https://{host}/record/{dep_id}.")
+            if on_published is not None:
+                try:
+                    on_published(dep)
+                except Exception as exc3:  # noqa: BLE001
+                    save_error = exc3
+                    msg += (f"\n!! LOCAL STATE NOT SAVED ({exc3}). Set zenodo_id (concept recid) and doi in "
+                            "zenodo.json BY HAND and DO NOT re-run the deposit: it would publish twice.")
+            return msg, dep, save_error
+    else:
+        if dep is not None and dep.get("state") == "done":
+            return (f"!! {kind} {dep_id} is in state 'done': nothing to discard (it is not an unpublished "
+                    f"state). Inspect {manual}.", None, None)
+        if dep is not None and concept is not None and dep.get("conceptrecid") not in (None, "") \
+                and str(dep.get("conceptrecid")) != str(concept):
+            return (f"!! REFUSING to discard {dep_id}: it belongs to concept {dep.get('conceptrecid')}, "
+                    f"not {concept}. Inspect {manual} by hand.", None, None)
+        if dep is None and not certain:
+            return (f"!! CLEANUP SKIPPED: cannot read {dep_id} ({read_err}). Inspect {manual}.", None, None)
     try:
         r = client.discard(dep_id)
         ok = r.ok
@@ -784,10 +1116,41 @@ def abort_and_cleanup(client, step: str, exc: BaseException, host: str):
     except Exception as exc2:  # noqa: BLE001
         ok, detail = False, str(exc2)
     if ok:
-        sys.exit(f"Cleanup performed: POST actions/discard on {kind} {dep_id} ({detail}). "
-                 "Nothing published. Exiting non-zero.")
-    sys.exit(f"!! CLEANUP FAILED for {kind} {dep_id} ({detail}).\n"
-             f"!! MANUAL CLEANUP REQUIRED: discard it at {manual}. Nothing was published.")
+        return (f"Cleanup performed: POST actions/discard on {kind} {dep_id} ({detail}). "
+                "Nothing published. Exiting non-zero.", None, None)
+    return (f"!! CLEANUP FAILED for {kind} {dep_id} ({detail}).\n"
+            f"!! MANUAL CLEANUP REQUIRED: discard it at {manual}. Nothing was published.", None, None)
+
+
+def abort_and_cleanup(client, step: str, exc: BaseException, host: str, on_published=None):
+    """Report a failure, clean up ONLY state this run certainly created, then exit non-zero.
+
+    KeyboardInterrupt / SystemExit are handled like any failure and RE-RAISED afterwards. Returns
+    (deposition, local_save_error) only when the failed publish call turned out to have published."""
+    print(f"\n!! FAILED at step: {step}", file=sys.stderr)
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        print(f"!! HTTP status: {resp.status_code}; body: {resp.text[:300]}", file=sys.stderr)
+    print(f"!! Error: {type(exc).__name__}: {exc}", file=sys.stderr)
+    interrupted = not isinstance(exc, Exception)
+    try:
+        msg, recovered, save_error = _cleanup(client, step, exc, host, on_published)
+    except BaseException as exc2:  # noqa: BLE001 - a second interrupt or a bug must not hide the state
+        state = client.created_state or {}
+        msg = (f"!! CLEANUP ABORTED ({type(exc2).__name__}: {exc2}). State possibly created by this run: "
+               f"{state.get('kind')} {state.get('dep_id')}. NOTHING MORE WAS DONE: inspect "
+               f"https://{host}/deposit by hand.")
+        if not isinstance(exc2, Exception):
+            print(msg, file=sys.stderr)
+            raise
+        recovered, save_error = None, None
+    if recovered is not None and not interrupted:
+        print(msg, file=sys.stderr)
+        return recovered, save_error
+    if interrupted:
+        print(msg, file=sys.stderr)
+        raise exc
+    sys.exit(msg)
 
 
 def verify_draft_code_repository(client, dep_id: int, expected: str | None):
@@ -802,31 +1165,51 @@ def verify_draft_code_repository(client, dep_id: int, expected: str | None):
     print(f"  Software field verified on draft: PASS ({expected})")
 
 
+def verify_draft_files(client, dep_id: int, pdf_name: str):
+    """After upload / old-file removal: the draft must hold exactly the PDF this run uploaded."""
+    names = sorted(str(f.get("filename")) for f in (client.get_deposition(dep_id).get("files") or []))
+    if names != [pdf_name]:
+        raise VerificationError(f"draft {dep_id} holds files {names}, expected exactly [{pdf_name!r}]: "
+                                "refusing to publish")
+    print(f"  Draft files verified: PASS ({pdf_name})")
+
+
 def verify_published_code_repository(client, rec_id: int, expected: str | None, host: str):
+    """Post-publication read-back with BOUNDED retries (a fresh record may be served stale)."""
     if not expected:
         return
-    try:
-        got = custom_repository(client.get_record(rec_id).get("metadata"))
-    except Exception as exc:  # noqa: BLE001
-        got = f"<unreadable: {exc}>"
-    if got != expected:
-        print(f"  Software field on published record: FAIL (got {got!r}, expected {expected!r})",
-              file=sys.stderr)
-        raise PostPublishFailure(
-            f"\n!! RECORD {rec_id} IS PUBLISHED but its Software field is wrong or unverifiable.\n"
-            f"!! Not un-publishing. Inspect https://{host}/record/{rec_id}; fix with a reviewed "
-            "metadata-only edit (--update) or by hand in the Zenodo UI.")
-    print(f"  Software field on published record: PASS ({expected})")
+    attempts, got = verify_attempts(), None
+    for k in range(attempts):
+        try:
+            got = custom_repository(client.get_record(rec_id).get("metadata"))
+        except Exception as exc:  # noqa: BLE001
+            got = f"<unreadable: {exc}>"
+        if _norm_url(got) == _norm_url(expected):
+            print(f"  Software field on published record: PASS ({expected})")
+            return
+        if k < attempts - 1:
+            _sleep(_verify_delay(k))
+    print(f"  Software field on published record: FAIL after {attempts} attempt(s) "
+          f"(got {got!r}, expected {expected!r})", file=sys.stderr)
+    raise PostPublishFailure(
+        f"\n!! RECORD {rec_id} IS PUBLISHED but its Software field is wrong or unverifiable.\n"
+        f"!! Not un-publishing. Inspect https://{host}/record/{rec_id}; fix with a reviewed "
+        "metadata-only edit (--update) or by hand in the Zenodo UI.")
 
 
 def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, env_label: str,
-                   host: str) -> tuple[int, str | None]:
+                   host: str, on_published=None) -> tuple[int, str | None]:
     """--update: metadata-only edit in place. Returns (dep_id, doi)."""
-    dep_id = client.resolve_latest_version_recid(int(zenodo_id))
+    step = "resolve latest version"
+    try:
+        dep_id = client.resolve_latest_version_recid(int(zenodo_id))
+    except BaseException as exc:  # noqa: BLE001
+        abort_and_cleanup(client, step, exc, host)
     if dep_id != int(zenodo_id):
         print(f"\nConcept record {zenodo_id} → latest version {dep_id} [{env_label}]")
-    refuse_if_unpublished_state(client, int(zenodo_id), dep_id, host)
+    refuse_if_unpublished_state(client, zenodo_id, dep_id, host)
     step = "edit"
+    result, save_error, expected = None, None, None
     try:
         print(f"Editing metadata of record {dep_id} in place [{env_label}]…")
         client.edit_deposition(dep_id)
@@ -853,28 +1236,39 @@ def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, 
         step = "publish"
         print("Publishing…")
         result = client.publish(dep_id)
-    except Exception as exc:  # noqa: BLE001
-        abort_and_cleanup(client, step, exc, host)
+    except BaseException as exc:  # noqa: BLE001
+        result, save_error = abort_and_cleanup(client, step, exc, host, on_published)
+    else:
+        if on_published:
+            on_published(result)
     verify_published_code_repository(client, dep_id, expected, host)
+    if save_error is not None:
+        raise PostPublishFailure(f"\n!! local state not saved: {save_error}")
     return dep_id, result.get("doi")
 
 
 def deposit_new(client, pdf_path: Path, metadata: dict, code_url: str, zenodo_id,
                 env_label: str, host: str, on_published=None) -> dict:
-    """New version (zenodo_id set) or first publication. Returns the publish response."""
-    step = "start"
+    """New version (zenodo_id set) or first publication. Returns the publish response.
+
+    on_published(result) runs the moment a publication is confirmed (publish returned, or a failed
+    publish call was followed by a read showing state 'done'), BEFORE any verification or archiving."""
+    step, latest_recid, dep_id = "resolve latest version", None, None
     try:
         if zenodo_id:
-            step = "resolve latest version"
             latest_recid = client.resolve_latest_version_recid(int(zenodo_id))
             if latest_recid != int(zenodo_id):
                 print(f"\nConcept record {zenodo_id} → latest version {latest_recid} [{env_label}]")
-        else:
-            latest_recid = None
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
         abort_and_cleanup(client, step, exc, host)
     if zenodo_id:
-        refuse_if_unpublished_state(client, int(zenodo_id), latest_recid, host)
+        refuse_if_unpublished_state(client, zenodo_id, latest_recid, host)
+    else:
+        snapshot_before_first_publication(client, host)
+    if not code_url:
+        print("  Note: no code_url for this paper: the Software field is neither set nor verified "
+              "(a new-version draft may or may not inherit the previous version's repository).")
+    result, save_error, recovered = None, None, False
     try:
         if zenodo_id:
             step = "newversion"
@@ -883,7 +1277,7 @@ def deposit_new(client, pdf_path: Path, metadata: dict, code_url: str, zenodo_id
             dep_id = dep["id"]
             step = "delete old files"
             for f in dep.get("files", []):
-                client.delete_file(dep_id, f["id"])
+                client.delete_file(dep_id, f["id"])      # a failure is blocking
                 print(f"  Removed old file: {f['filename']}")
         else:
             step = "create deposition"
@@ -893,7 +1287,9 @@ def deposit_new(client, pdf_path: Path, metadata: dict, code_url: str, zenodo_id
         print(f"  Deposition ID: {dep_id}")
         step = "upload"
         print(f"Uploading {pdf_path.name} …")
-        client.upload_file(dep, pdf_path)
+        client.upload_file(dep, pdf_path)               # a failure is blocking
+        step = "verify draft files"
+        verify_draft_files(client, dep_id, pdf_path.name)
         step = "metadata PUT"
         print("Setting metadata…")
         client.set_metadata(dep_id, metadata)
@@ -902,30 +1298,96 @@ def deposit_new(client, pdf_path: Path, metadata: dict, code_url: str, zenodo_id
         step = "publish"
         print("Publishing…")
         result = client.publish(dep_id)
-    except Exception as exc:  # noqa: BLE001
-        abort_and_cleanup(client, step, exc, host)
-    if on_published:
-        on_published(result)
+    except BaseException as exc:  # noqa: BLE001
+        result, save_error = abort_and_cleanup(client, step, exc, host, on_published)
+        recovered = True
+    if not recovered and on_published:
+        try:
+            on_published(result)
+        except Exception as exc:  # noqa: BLE001
+            save_error = exc
+            print(f"!! PUBLISHED but LOCAL STATE NOT SAVED ({exc}). Set zenodo_id and doi in zenodo.json "
+                  "BY HAND and DO NOT re-run the deposit: it would publish twice.", file=sys.stderr)
     verify_published_code_repository(client, result.get("id", dep_id), code_url, host)
+    if save_error is not None:
+        raise PostPublishFailure(f"\n!! local state not saved: {save_error}")
     return result
+
+
+# ── Local state / sandbox ──────────────────────────────────────────────────────
+
+def record_sandbox_state(path: Path, host: str, paper: str, version, result: dict) -> None:
+    """A sandbox run records its result HERE and nowhere else (never zenodo.json, pdfs/, bibliographies)."""
+    data = {
+        "sandbox": True, "host": host, "paper": paper, "version": version,
+        "record_id": result.get("id"), "doi": result.get("doi"),
+        "conceptrecid": result.get("conceptrecid") or (result.get("metadata") or {}).get("conceptrecid"),
+        "conceptdoi": result.get("conceptdoi") or (result.get("metadata") or {}).get("conceptdoi"),
+        "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    }
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"  [sandbox] result recorded in {path} (production zenodo.json, pdfs/ and bibliographies untouched)")
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def validate_sandbox_state_path(path: Path, repo_root: Path, paper_dir: Path) -> Path:
+    """The sandbox state file must live outside the workspace (a repo might commit it)."""
+    p = path.expanduser().resolve()
+    for root in (repo_root.resolve(), paper_dir.resolve()):
+        if p == root or root in p.parents:
+            sys.exit(f"Error: --sandbox-state {p} lies inside {root}: a repository could commit it. "
+                     "Use a path under the OS temp/scratch directory.")
+    if p.is_dir():
+        sys.exit(f"Error: --sandbox-state {p} is a directory")
+    return p
+
+
+def run_cascade(repo_root: Path, config: dict, concept_doi: str, no_cascade: bool) -> None:
+    if no_cascade:
+        return
+    bib_key = config.get("bib_key")
+    if bib_key:
+        print(f"\nDOI cascade ({bib_key} → {concept_doi})…")
+        doi_cascade(repo_root, bib_key, concept_doi)
+    else:
+        print("\nNo bib_key in zenodo.json — skipping DOI cascade.")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Publish a Cosmochrony paper to Zenodo",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("paper_dir", type=Path, help="Paper directory (e.g. bell-paper/)")
-    parser.add_argument("--sandbox", action="store_true", help="Use sandbox.zenodo.org for testing")
+    parser.add_argument("--sandbox", action="store_true",
+                        help="Use sandbox.zenodo.org (reads ONLY ZENODO_SANDBOX_TOKEN; needs --sandbox-state; "
+                             "touches no production file)")
+    parser.add_argument("--sandbox-state", type=Path, metavar="PATH",
+                        help="With --sandbox: JSON file (outside the workspace) recording the sandbox result")
+    parser.add_argument("--sandbox-zenodo-id", type=int, metavar="ID",
+                        help="With --sandbox: sandbox concept/record id for a new version or --update "
+                             "(the production zenodo_id is never used on the sandbox)")
     parser.add_argument("--dry-run", action="store_true", help="Parse LaTeX only, do not upload")
     parser.add_argument("--update", action="store_true", help="Update metadata in place (same DOI, no new version — PDF unchanged; use without flag for new version with PDF)")
     parser.add_argument("--no-cascade", action="store_true", help="Skip DOI cascade after publish")
+    parser.add_argument("--finish-after-fail", action="store_true",
+                        help="Offline: after a post-publish FAIL (record published, zenodo.json saved), run the "
+                             "skipped PDF archive and DOI cascade from zenodo.json; no network, no deposit")
     parser.add_argument("--skip-checks", action="store_true",
                         help="Bypass the pre-deposit check battery (not recommended)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.finish_after_fail and (args.sandbox or args.update or args.dry_run):
+        parser.error("--finish-after-fail is a production-only, offline step: no --sandbox/--update/--dry-run")
+    networked = not (args.dry_run or args.finish_after_fail)
+    if args.sandbox and networked and not args.sandbox_state:
+        parser.error("--sandbox requires --sandbox-state PATH (a file outside the workspace)")
+
+    # ── Auth first: refuse to start without the right token, before anything else ─────────────
+    token = resolve_token(args.sandbox) if networked else None
 
     paper_dir = args.paper_dir.resolve()
     if not paper_dir.is_dir():
@@ -955,6 +1417,10 @@ def main():
     # central pdfs/ archive and the DOI cascade work for nested paper directories
     # (e.g. condensed-matter/quantum-fisher-witness/) as well as top-level ones.
     repo_root = REPO_ROOT
+
+    sandbox_state = None
+    if args.sandbox and networked:
+        sandbox_state = validate_sandbox_state_path(args.sandbox_state, repo_root, paper_dir)
 
     # ── Parse LaTeX ────────────────────────────────────────────────────────────
     tex_path = find_main_tex(paper_dir, config)
@@ -1001,6 +1467,18 @@ def main():
         print("\n[Dry run] Stopping here — no upload performed.")
         return
 
+    # ── --finish-after-fail: the local steps a post-publish FAIL skipped (offline) ─────────────
+    if args.finish_after_fail:
+        zid, concept_doi = config.get("zenodo_id"), config.get("doi")
+        if not zid or not concept_doi:
+            sys.exit("Error: zenodo.json has no zenodo_id/doi: the publication was not saved locally, "
+                     "so there is nothing to finish. Set them by hand from the record first.")
+        pdf_path = find_pdf(paper_dir)
+        print(f"  PDF:      {pdf_path.relative_to(repo_root)}  (must be the PDF that was deposited)")
+        archive_pdf(repo_root, pdf_path, tex_path.stem, version, zid)
+        run_cascade(repo_root, config, concept_doi, args.no_cascade)
+        return
+
     # ── Pre-deposit gate ───────────────────────────────────────────────────────
     # A published Zenodo record cannot be deleted, so refuse to upload an artefact
     # the battery rejects. An unavailable checker warns but never blocks a
@@ -1029,49 +1507,35 @@ def main():
     pdf_path = find_pdf(paper_dir)
     print(f"  PDF:      {pdf_path.relative_to(repo_root)}")
 
-    # ── Auth ───────────────────────────────────────────────────────────────────
-    token = os.environ.get("ZENODO_TOKEN")
-    if not token:
-        sys.exit("Error: ZENODO_TOKEN environment variable is not set")
-
-    client = ZenodoClient(token, sandbox=args.sandbox)
+    try:
+        client = ZenodoClient(token, sandbox=args.sandbox)
+    except TokenHostMismatch as exc:
+        sys.exit(f"Error: {exc}. Nothing was sent.")
     env_label = "sandbox" if args.sandbox else "production"
-    zenodo_id = config.get("zenodo_id")
+    # The production zenodo_id is meaningless on the sandbox: a sandbox run uses --sandbox-zenodo-id only.
+    zenodo_id = args.sandbox_zenodo_id if args.sandbox else config.get("zenodo_id")
 
-    host = "sandbox.zenodo.org" if args.sandbox else "zenodo.org"
+    host = SANDBOX_HOST if args.sandbox else PRODUCTION_HOST
     metadata = build_metadata(title, abstract, keywords, config.get("web_url", ""), version,
                               publication_type=config.get("publication_type"),
                               notes=config.get("notes"),
                               code_url=code_url)
 
-    # ── --update: metadata-only edit in place via legacy deposit API (same DOI) ─
-    # Note: file replacement in place is not possible via the Zenodo REST API;
-    # the file bucket remains locked for published records. Use new version for files.
-    if args.update and zenodo_id:
-        try:
-            dep_id, doi = deposit_update(client, metadata, code_url, int(zenodo_id), env_label, host)
-        except PostPublishFailure as exc:
-            sys.exit(str(exc))
-        doi = doi or config.get("doi", "")
-        print(f"\nUpdated! (metadata only — files unchanged)")
-        print(f"  DOI:    {doi}")
-        print(f"  Record: https://{host}/record/{dep_id}")
-        return
-
-    # ── New version or first publication via legacy deposit API ────────────────
     published: dict = {}
 
     def save_local_state(result: dict):
-        # Runs right after publish and BEFORE verification, so a later verification failure
-        # cannot make a re-run create a duplicate deposition.
-        doi = result["doi"]
+        # Runs right after publish is confirmed and BEFORE any verification or archiving, so a later
+        # failure cannot make a re-run create a duplicate deposition.
+        if args.sandbox:
+            raise AssertionError("production state must never be written by a sandbox run")
+        doi = result.get("doi")
         concept_doi = result.get("conceptdoi") or result.get("metadata", {}).get("conceptdoi")
         concept_recid = result.get("conceptrecid") or result.get("metadata", {}).get("conceptrecid")
         print(f"\nPublished!")
         print(f"  Version DOI:   {doi} (ephemeral, not stored)")
         print(f"  Concept DOI:   {concept_doi}")
         print(f"  Concept recid: {concept_recid}")
-        print(f"  Record: https://{host}/record/{result['id']}")
+        print(f"  Record: https://{host}/record/{result.get('id')}")
         if not concept_doi or not concept_recid:
             raise RuntimeError(
                 "Zenodo response did not include conceptdoi/conceptrecid; refusing to overwrite "
@@ -1087,24 +1551,45 @@ def main():
         print(f"  Saved zenodo_id + concept DOI → {config_path.relative_to(repo_root)}")
         published["concept_doi"] = concept_doi
 
+    def save_sandbox_state(result: dict):
+        print("\nPublished on the SANDBOX!")
+        record_sandbox_state(sandbox_state, host, paper_dir.name, version, result)
+
+    saver = save_sandbox_state if args.sandbox else save_local_state
+
+    # ── --update: metadata-only edit in place via legacy deposit API (same DOI) ─
+    # Note: file replacement in place is not possible via the Zenodo REST API;
+    # the file bucket remains locked for published records. Use new version for files.
+    if args.update:
+        if not zenodo_id:
+            sys.exit("Error: --update needs an existing record: zenodo_id in zenodo.json"
+                     + (" (on the sandbox: --sandbox-zenodo-id)" if args.sandbox else "") + ".")
+        try:
+            dep_id, doi = deposit_update(client, metadata, code_url, int(zenodo_id), env_label, host,
+                                         on_published=save_sandbox_state if args.sandbox else None)
+        except PostPublishFailure as exc:
+            sys.exit(str(exc))
+        doi = doi or config.get("doi", "")
+        print(f"\nUpdated! (metadata only — files unchanged)")
+        print(f"  DOI:    {doi}")
+        print(f"  Record: https://{host}/record/{dep_id}")
+        return
+
+    # ── New version or first publication via legacy deposit API ────────────────
     try:
         result = deposit_new(client, pdf_path, metadata, code_url, zenodo_id, env_label, host,
-                             on_published=save_local_state)
+                             on_published=saver)
     except PostPublishFailure as exc:
-        sys.exit(str(exc) + "\n!! zenodo.json was saved; PDF archive and DOI cascade were SKIPPED: "
-                 "run them by hand once the record is fixed.")
+        sys.exit(str(exc) + "\n!! PDF archive and DOI cascade were SKIPPED (a sandbox run skips them "
+                 "always). Once the record is fixed, run them with --finish-after-fail.")
+    if args.sandbox:
+        print("\n[sandbox] PDF archive and DOI cascade skipped by contract: no production file was written.")
+        return
     concept_doi = published["concept_doi"]
 
     # Archive the published PDF into the central pdfs/ store (systematic, every deposit).
     archive_pdf(repo_root, pdf_path, tex_path.stem, version, result["id"])
-
-    if not args.no_cascade:
-        bib_key = config.get("bib_key")
-        if bib_key:
-            print(f"\nDOI cascade ({bib_key} → {concept_doi})…")
-            doi_cascade(repo_root, bib_key, concept_doi)
-        else:
-            print("\nNo bib_key in zenodo.json — skipping DOI cascade.")
+    run_cascade(repo_root, config, concept_doi, args.no_cascade)
 
 
 if __name__ == "__main__":
