@@ -4,7 +4,7 @@
 Each mutant is a one-line semantic break of a guard. The suite must FAIL on every one of them;
 a mutant that survives names a guard the tests do not really protect.
 
-    python3 tests/mutation_check.py
+    python3 tests/mutation_check.py [--shard K/N] [--only-new] [--ids ID1,ID2]
 
 Exit status 0 only when every mutant is killed EXCEPT the documented equivalent mutant M16b (removing the
 unreachable defensive assertion in save_local_state while the saver choice, tested by M16, is intact): the
@@ -99,8 +99,8 @@ MUTANTS = [
     ("C1", "journal not written before a write request", "            self.journal.write_intent(method, urlparse(url).path)", "            pass"),
     ("C2", "unreconciled journal does not block", "        if blocking:\n            die(blocking_message(blocking))", "        if False:\n            die(blocking_message(blocking))"),
     ("C3", "publish not journaled as unreconciled before sending", "            j.update(outcome=\"UNRECONCILED\", phase=\"publish request about to be sent\",", "            j.update(outcome=\"RUNNING\", phase=\"publish request about to be sent\","),
-    ("C4", "reconcile accepts a journal that is not unreconciled", "    if data.get(\"outcome\") not in BLOCKING_OUTCOMES:\n        raise ReconcileRefused(f\"the journal {path.name} is not unreconciled", "    if False:\n        raise ReconcileRefused(f\"the journal {path.name} is not unreconciled"),
-    ("C4b", "reconcile published without a record id", "        if not record_id:\n            raise ReconcileRefused(", "        if False:\n            raise ReconcileRefused("),
+    ("C4", "reconcile accepts a journal that is not unreconciled", '    if data["outcome"] not in BLOCKING_OUTCOMES:\n        raise ReconcileRefused(f"the journal {path.name} is not unreconciled', '    if False:\n        raise ReconcileRefused(f"the journal {path.name} is not unreconciled'),
+    ("C4b", "reconcile published without a record id", '        if not rid:\n            raise ReconcileRefused(', '        if False:\n            raise ReconcileRefused('),
     ("C5", "a draft left behind does not block", "BLOCKING_OUTCOMES = (\"RUNNING\", \"UNRECONCILED\", \"DRAFT-LEFT-BEHIND\", UNSAVED_OUTCOME)", "BLOCKING_OUTCOMES = (\"RUNNING\", \"UNRECONCILED\", UNSAVED_OUTCOME)"),
     ("C6", "Ctrl-C right after publish not caught", "        except BaseException as exc:  # noqa: BLE001 - Ctrl-C right after publish returns (R12) included", "        except Exception as exc:  # noqa: BLE001 - Ctrl-C right after publish returns (R12) included"),
     ("D1", "sandbox state file may be overwritten", "    if p.exists():\n        sys.exit(f\"Error: --sandbox-state {p} already exists", "    if False:\n        sys.exit(f\"Error: --sandbox-state {p} already exists"),
@@ -133,25 +133,25 @@ MUTANTS = [
     ("K4", "journal not created through the exclusive primitive", "        _create_exclusive_text(path, _journal_text(data))      # exclusive: never over an existing journal", "        _atomic_write_text(path, _journal_text(data))"),
     ("Y29", "the concept block ignores the host", "                and (host is None or data.get(\"host\") == host):", "                and True:"),
     # reconcile
-    ("R1", "reconcile writes the paper directory the operator names, not the journal's", "    if paper_dir_arg is not None and _realpath(paper_dir_arg) != _realpath(data.get(\"paper_dir_real\") or jdir):", "    if False:"),
+    ("R1", "reconcile writes the paper directory the operator names, not the journal's", '    if paper_dir_arg is not None and _realpath(paper_dir_arg) != _realpath(recorded_real or jdir):', '    if False:'),
     ("R2", "zenodo.json of another concept overwritten", "            if cfg.get(\"zenodo_id\") not in (None, \"\") and str(cfg[\"zenodo_id\"]) != str(cid):", "            if False:"),
-    ("R3", "zenodo.json of another bib_key overwritten", "            if data.get(\"bib_key\") and cfg.get(\"bib_key\") != data[\"bib_key\"]:", "            if False:"),
-    ("R4", "not-published needs no evidence", "        elif checked_account and reason:", "        elif True:"),
-    ("R4b", "the account check needs no reason", "        elif checked_account and reason:", "        elif checked_account:"),
-    ("R5", "record URL of any host accepted", "            if not str(record_url).startswith(f\"https://{host}/\"):", "            if False:"),
+    ("R3", "zenodo.json of another bib_key overwritten", '            if cfg.get("bib_key") != data["bib_key"]:', '            if False:'),
+    ("R4", "not-published needs no evidence", '        elif checked_account and reason_text:', '        elif True:'),
+    ("R4b", "the account check needs no reason", '        elif checked_account and reason_text:', '        elif checked_account:'),
+    ("R5", "record URL of any host accepted", '            evidence["record_url"] = validate_record_url(record_url, host, known_id)', '            evidence["record_url"] = record_url'),
     ("R6", "a succeeded publication reconciled as not-published", "        if data.get(\"outcome\") == UNSAVED_OUTCOME:\n            raise ReconcileRefused(\n                \"the journal says", "        if False:\n            raise ReconcileRefused(\n                \"the journal says"),
     ("R7", "published reconciled without the identifiers to save", "            if not cid or not cdoi:", "            if False:"),
     ("R8", "the config written by a reconcile is not read back", "            if str(check.get(\"zenodo_id\")) != str(cid) or check.get(\"doi\") != cdoi:", "            if False:"),
     ("R9", "quarantine deletes instead of renaming", "    os.rename(path, target)", "    os.unlink(path)"),
     ("R10", "quarantine overwrites an earlier quarantined file", "    while target.exists() or target.is_symlink():", "    while False:"),
-    ("R11", "quarantine accepts a readable journal", "    if readable:\n        raise ReconcileRefused(f\"{path} is a readable journal", "    if False:\n        raise ReconcileRefused(f\"{path} is a readable journal"),
+    ("R11", "quarantine accepts a readable journal", '    if isinstance(content, dict) and isinstance(content.get("outcome"), str) and content["outcome"] in KNOWN_OUTCOMES:', '    if False:'),
     # secrets
-    ("S1", "journal values not redacted before writing", "    return json.dumps(redact_obj(data), indent=2, ensure_ascii=False) + \"\\n\"", "    return json.dumps(data, indent=2, ensure_ascii=False) + \"\\n\""),
-    ("S2", "Bearer strings no longer masked", "    out = _BEARER.sub(\"Bearer [REDACTED]\", out)", "    out = out"),
-    ("S3", "access_token query strings no longer masked", "    out = _TOKEN_QUERY.sub(lambda m: m.group(1) + \"=[REDACTED]\", out)", "    out = out"),
+    ("S1", "journal values not redacted before writing", '    out = redact_obj(data)\n    out["identity_sha256"]', '    out = dict(data)\n    out["identity_sha256"]'),
+    ("S2", "Bearer strings no longer masked", '    return _BEARER.sub("Bearer [REDACTED]", out)', '    return out'),
+    ("S3", "access_token query strings no longer masked", '    out = _FIELD_EQ.sub(_mask_field, out)', '    out = out'),
     ("S4", "the tokens loaded in the process are not registered", "    register_environment_secrets()        # the exact tokens loaded in this process are masked everywhere", "    pass"),
     ("S5", "locate_own_state returns an unredacted exception text", "return \"unknown\", None, [rid], f\"cannot read record {rid} ({redact(exc)})\"", "return \"unknown\", None, [rid], f\"cannot read record {rid} ({exc})\""),
-    ("S6", "Authorization header values no longer masked", "    return _AUTH_HEADER.sub(lambda m: \"Authorization\" + m.group(1) + \"[REDACTED]\", out)", "    return out"),
+    ("S6", "Authorization header values no longer masked", '    out = _FIELD_COLON.sub(_mask_field, out)', '    out = out'),
     # archive
     ("A1c", "an existing archive is judged by size only", "        if existing[\"sha256\"] == src[\"sha256\"]:", "        if existing[\"size\"] == src[\"size\"]:"),
     ("A5", "a symlink at the archive destination is followed", "    if dest.is_symlink():\n        raise ArchiveRefused(f\"{dest} is a symbolic link: refusing", "    if False:\n        raise ArchiveRefused(f\"{dest} is a symbolic link: refusing"),
@@ -177,7 +177,7 @@ MUTANTS = [
     ("B8", "GET attempts unbounded", "(\"ZENODO_GET_ATTEMPTS\", DEFAULT_GET_ATTEMPTS, None, False, float(MAX_GET_ATTEMPTS)),", "(\"ZENODO_GET_ATTEMPTS\", DEFAULT_GET_ATTEMPTS, None, False, None),"),
     ("B9", "upper bounds not enforced", "        if maximum is not None and value > maximum:", "        if False:"),
     # --update
-    ("W1", "--set-web-url replaces the whole related_identifiers list", "            payload[key] = merge_related_web_url(live.get(key), entries[0])", "            payload[key] = copy.deepcopy(entries)"),
+    ("W1", "--set-web-url replaces the whole related_identifiers list", '            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier)', '            payload[key] = copy.deepcopy(entries)'),
     ("W2", "an ambiguous web entry is guessed", "    if len(same_role) > 1:", "    if False:"),
     ("W3", "an entry with the same identifier is not replaced in place", "    if exact:\n        items[exact[0]]", "    if False:\n        items[exact[0]]"),
     ("V1", "the reviewed-digest pin may be bare or short", "    if not CONFIRM_SHAPE.fullmatch(pin):", "    if False:"),
@@ -201,6 +201,74 @@ MUTANTS = [
     ("J10", "an explicit sandbox journal is accepted for finish", "        if data.get(\"sandbox\"):\n            die(f\"Error: the journal {explicit.name} is a SANDBOX journal", "        if False:\n            die(f\"Error: the journal {explicit.name} is a SANDBOX journal"),
     ("Z5", "publish() does not mark the journal with the answer", "        body = self._ok(resp)\n        if j is not None:\n            j.mark_published(dep_id, body)\n        return body", "        body = self._ok(resp)\n        return body"),
 ]
+
+
+# Fourth corrective pass (review round 20; ids T1.., RS*): one mutant per new behaviour (F-1..F-5, N03) and the five survivors
+# of the review's own run (RS1, RS11, RS15, RS17, RS28). Run only these with `--only-new` (see below).
+NEW_MUTANTS = [
+    # F-1 reconcile bound to the real path and the verified identity
+    ("T1", "reconcile does not verify the journal identity digest", '    if problems:\n        raise ReconcileRefused(f"the journal {path.name} cannot be trusted', '    if False:\n        raise ReconcileRefused(f"the journal {path.name} cannot be trusted'),
+    ("T2", "the identity digest ignores paper_dir_real", 'IDENTITY_FIELDS = ("schema", "paper", "paper_dir", "paper_dir_real", "host",', 'IDENTITY_FIELDS = ("schema", "paper", "paper_dir", "host",'),
+    ("T3", "paper_dir vs paper_dir_real (symlink retarget) not compared", '            if _realpath(jdir) != recorded_real or _realpath(recorded_real) != recorded_real:', '            if False:'),
+    ("T4", "journal without identity fields may write a zenodo.json", '            if missing:\n                raise ReconcileRefused(', '            if False:\n                raise ReconcileRefused('),
+    ("T5", "a vanished paper directory is not noticed", '            if not os.path.isdir(recorded_real):', '            if False:'),
+    ("T6", "the config is written to paper_dir, not to the recorded real path", '            cfg_path = Path(recorded_real) / "zenodo.json"', '            cfg_path = Path(jdir) / "zenodo.json"'),
+    ("T7", "the zenodo.json content hash is not checked", '            if config_core_fingerprint(cfg) != data["config_core_sha256"]:', '            if False:'),
+    ("T8", "the identity digest is not stored", '    out["identity_sha256"] = identity_digest(out)\n', '    pass\n'),
+    ("T9", "an absent digest is accepted", '    if not stored:\n        return ["the journal carries no identity digest', '    if False:\n        return ["the journal carries no identity digest'),
+    # F-2 fail closed on an unknown outcome
+    ("T11", "an unknown outcome does not block (old fail-open rule)", '        if known and outcome in NON_BLOCKING_OUTCOMES:\n            continue', '        if outcome not in BLOCKING_OUTCOMES:\n            continue'),
+    ("T12", "NOT-PUBLISHED-RECONCILED is not a known non-blocking outcome", 'NON_BLOCKING_OUTCOMES = PUBLISHED_OUTCOMES + ("NOT-PUBLISHED", "NOT-PUBLISHED-RECONCILED")', 'NON_BLOCKING_OUTCOMES = PUBLISHED_OUTCOMES + ("NOT-PUBLISHED",)'),
+    ("T13", "an unknown-outcome journal is not attributed by its file name", '            if _named_after(path, paper_dir):\n                why.append("file named after this paper")', '            if False:\n                why.append("file named after this paper")'),
+    ("T14", "a readable journal with an unknown outcome cannot be quarantined", '    if isinstance(content, dict) and isinstance(content.get("outcome"), str) and content["outcome"] in KNOWN_OUTCOMES:', '    if isinstance(content, dict):'),
+    ("T15", "the block message omits the quarantine cure of an unknown outcome", '        if data.get("outcome") != "UNREADABLE" and not (isinstance(data.get("outcome"), str)', '        if False and data.get("outcome") != "UNREADABLE" and not (isinstance(data.get("outcome"), str)'),
+    ("T16", "reconcile of an unknown outcome is not refused as such", '    if not known:\n        raise ReconcileRefused(f"the journal {path.name} has an absent or unknown outcome', '    if False:\n        raise ReconcileRefused(f"the journal {path.name} has an absent or unknown outcome'),
+    # F-3 / F-4 validation before any write
+    ("T17", "ids may carry a sign", 'rf"[1-9][0-9]{{0,{MAX_ID_DIGITS - 1}}}"', 'rf"[+-]?[0-9]{{1,{MAX_ID_DIGITS}}}"'),
+    ("T18", "ids may be arbitrarily long", "MAX_ID_DIGITS = 12", "MAX_ID_DIGITS = 40"),
+    ("T19", "the DOI shape is not checked", '    if not isinstance(doi, str) or not DOI_SHAPE.fullmatch(doi):', '    if not isinstance(doi, str):'),
+    ("T20", "a Zenodo DOI need not carry the concept id", '    if m and concept_id:', '    if False:'),
+    ("T21", "a reason of one character is evidence", "MIN_REASON_CHARS = 10", "MIN_REASON_CHARS = 1"),
+    ("T22", "the reason is not stripped before its length is judged", '    text = reason.strip() if isinstance(reason, str) else ""', '    text = reason if isinstance(reason, str) else ""'),
+    ("T23", "the record URL host is matched loosely", 'parts.hostname == host and parts.username is None', 'host in (parts.hostname or "") and parts.username is None'),
+    ("T24", "a plain http record URL is accepted", 'parts.scheme == "https" and', 'parts.scheme in ("http", "https") and'),
+    ("T25", "the record URL need not contain the record id", '    if record_id and not re.search(', '    if False and not re.search('),
+    ("T26", "the record id is matched as a substring", 'rf"(?<!\\d){re.escape(str(record_id))}(?!\\d)"', 'rf"{re.escape(str(record_id))}"'),
+    ("T27", "credentials in the record URL are accepted", 'and parts.username is None\n              and parts.password is None', 'and True\n              and parts.password is None'),
+    ("T28", "the quarantine reason is not validated", '    reason = validate_reason(reason)\n', '    reason = reason or ""\n'),
+    ("T29", "the record id is not validated", '    rid = validate_id(record_id, "--record-id") if record_id not in (None, "") else None', '    rid = int(record_id) if record_id not in (None, "") else None'),
+    ("T30", "the concept id is not validated", '    cid_arg = validate_id(concept_id, "--concept-id") if concept_id not in (None, "") else None', '    cid_arg = concept_id if concept_id not in (None, "") else None'),
+    # F-5 redaction by value and by name
+    ("T31", "credential-named dict keys are not masked", '"[REDACTED]" if is_sensitive_name(k) else redact_obj(v))', 'redact_obj(v))'),
+    ("T32", "environment tokens shorter than 8 are not registered", '        if isinstance(raw, str):\n            register_secret(raw)', '        if isinstance(raw, str) and len(raw.strip()) >= 8:\n            register_secret(raw)'),
+    ("T33", "only the production token variable is registered", '    for name in (PRODUCTION_TOKEN_VAR, SANDBOX_TOKEN_VAR):\n        raw = environ.get(name)', '    for name in (PRODUCTION_TOKEN_VAR,):\n        raw = environ.get(name)'),
+    ("T34", "Cookie is not a sensitive name", 'r"set[-_]cookie", r"cookie",', 'r"set[-_]cookie",'),
+    ("T35", "X-Api-Key is not a sensitive name", 'r"x[-_]api[-_]key", r"api[-_]?key",', 'r"api[-_]?key",'),
+    ("T36", "sensitive names are case-sensitive in dict keys", '_SENSITIVE_KEY = re.compile(rf"(?i)(?:{_NAME_ALT})")', '_SENSITIVE_KEY = re.compile(rf"(?:{_NAME_ALT})")'),
+    ("T37", "the empty string is registered as a secret", '    if isinstance(value, str) and value:\n        _SECRETS.add(value)', '    if isinstance(value, str):\n        _SECRETS.add(value)'),
+    ("T38", "the stripped form of a token is not registered", '            register_secret(raw.strip())', '            pass'),
+    ("T39", "refresh_token is not a sensitive name", 'r"access[-_]?token", r"refresh[-_]?token",', 'r"access[-_]?token",'),
+    ("T40", "client_secret is not a sensitive name", 'r"client[-_]?secret", r"password", r"token")', 'r"password", r"token")'),
+    ("T41", "password is not a sensitive name", 'r"client[-_]?secret", r"password", r"token")', 'r"client[-_]?secret", r"token")'),
+    ("T42", "Proxy-Authorization is not a sensitive name", '_SENSITIVE_NAMES = (r"proxy[-_]authorization", r"authorization",', '_SENSITIVE_NAMES = (r"authorization",'),
+    # N03 related identifiers
+    ("T43", "an entry without resource_type is replaced implicitly", '        if target.get("resource_type") is None:', '        if False:'),
+    ("T44", "the cosmochrony.org entry is not preferred among candidates", '    if on_web_host:\n        same_role = on_web_host', '    if False:\n        same_role = on_web_host'),
+    ("T45", "--replace-related-identifier is ignored", '    if replace_identifier:\n        named =', '    if False:\n        named ='),
+    ("T46", "any host ending in cosmochrony.org is the web host", 'return host == WEB_HOST or host.endswith("." + WEB_HOST)', 'return host.endswith(WEB_HOST)'),
+    ("T47", "--replace-related-identifier may match several entries", '        if len(named) != 1:', '        if len(named) < 1:'),
+    ("T48", "the web entry is not appended when nothing matches", '    else:\n        items.append(copy.deepcopy(entry))\n    return items\n\n\ndef build_update_payload', '    else:\n        pass\n    return items\n\n\ndef build_update_payload'),
+    # survivors of the review's own run (round 20), now killed by named tests
+    ("T49", "get_git_branch hands the whole environment to git", '            check=True,\n            env=git_env(),\n        )', '            check=True,\n        )'),
+    ("T50", "git_env keeps every variable (tokens included)", '    return {k: v for k, v in environ.items() if k in _GIT_ENV_KEEP or k.startswith("GIT_")}', '    return dict(environ)'),
+    ("RS1", "the block no longer matches on the zenodo.json content hash", '("title", "same title"),\n                               ("config_sha256", "same zenodo.json content")', '("title", "same title")'),
+    ("RS11", "no file fsync in the atomic journal write", '        fh.write(text)\n        _fsync_file(fh)\n    os.replace(tmp, path)', '        fh.write(text)\n    os.replace(tmp, path)'),
+    ("RS15", "the pin is compared on its first 4 characters only", "if not digest.startswith(pin):", "if digest[:4] != pin[:4]:"),
+    ("RS17", "the exact web-url match ignores the relation", 'and items[i].get("relation") == entry.get("relation")]\n    if exact:', 'and True]\n    if exact:'),
+    ("RS28", "dictionary keys are not redacted in redact_obj", 'return {(redact(k) if isinstance(k, str) else k):', 'return {k:'),
+]
+NEW_IDS = {m[0] for m in NEW_MUTANTS}
+MUTANTS = MUTANTS + NEW_MUTANTS
 
 
 def load_mutated(src: str):
@@ -243,7 +311,13 @@ def main() -> int:
         print("baseline is not green: cannot judge mutants")
         return 2
     survivors = []
-    mutants = shard_of(MUTANTS, sys.argv[1:])
+    mutants = MUTANTS
+    if "--only-new" in sys.argv:                      # the fourth-pass mutants and the five round-20 survivors
+        mutants = [m for m in mutants if m[0] in NEW_IDS]
+    if "--ids" in sys.argv:                           # --ids P1,P2,RS28
+        wanted = set(sys.argv[sys.argv.index("--ids") + 1].split(","))
+        mutants = [m for m in mutants if m[0] in wanted]
+    mutants = shard_of(mutants, sys.argv[1:])
     for mid, desc, old, new in mutants:
         if src.count(old) != 1:
             print(f"{mid:5} SKIPPED (pattern occurs {src.count(old)} times): {desc}", flush=True)

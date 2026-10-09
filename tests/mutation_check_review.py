@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The reviewer's 43 mutants of review round 19 (Y1-Y38, Z1-Z5), ported onto the current code.
 
-    python3 tests/mutation_check_review.py
+    python3 tests/mutation_check_review.py [--ids Y14,Y34]
 
 Each pattern of the review was re-anchored on the code as it is after the third corrective pass (the code the
 review attacked has changed shape: an archive written through a temp file and an exclusive link, journals bound
@@ -37,7 +37,7 @@ M = [
     ("Y11", "finish-after-fail md5 check skipped", 'if rec.get("filename") == pdf_path.name and checksum and checksum != local["md5"]:', 'if False:'),
     ("Y12", "state-dir inside the workspace accepted", '        if p == root or root in p.parents:\n            die(f"Error: --state-dir', '        if False:\n            die(f"Error: --state-dir'),
     ("Y13", "no blocking by concept", '        if concepts and str(data.get("concept_id")) in concepts \\', '        if False and concepts and str(data.get("concept_id")) in concepts \\'),
-    ("Y14", "unreadable journal never blocks", 'if path.name.startswith(re.sub(r"[^A-Za-z0-9_.-]", "_", paper_dir.name) + "-"):', 'if False:'),
+    ("Y14", "unreadable journal never blocks", 'return path.name.startswith(re.sub(r"[^A-Za-z0-9_.-]", "_", paper_dir.name) + "-")', 'return False'),
     ("Y15", "unknown publish outcome marked NOT-PUBLISHED", 'mark("UNRECONCILED", f"publish of {dep_id} ended in doubt', 'mark("NOT-PUBLISHED", f"publish of {dep_id} ended in doubt'),
     ("Y16", "DO NOT RE-RUN wording removed", '"!! DO NOT RE-RUN this deposit', '"!! it is fine to run this deposit'),
     ("Y17", "upload does not compare with the journal digest", 'if expected_sha256 is not None and digest != expected_sha256:', 'if False:'),
@@ -57,7 +57,7 @@ M = [
     ("Y31", "edit-session cleanup discards without reading state", '        if dep is not None and dep.get("state") == "done":\n            mark("UNRECONCILED", f"{kind} {dep_id} is unexpectedly in state done"', '        if False:\n            mark("UNRECONCILED", f"{kind} {dep_id} is unexpectedly in state done"'),
     ("Y32", "archive copy not re-verified after write", '    if file_digests(dest)["sha256"] != src["sha256"]:\n        raise ArchiveRefused(f"the archived copy {dest} does not match the source after linking")', '    if False:\n        raise ArchiveRefused(f"the archived copy {dest} does not match the source after linking")'),
     ("Y33", "same-concept draft ignored by guard", 'if str(d.get("conceptrecid")) == str(concept) or d.get("id") == latest_id:', 'if d.get("id") == latest_id:'),
-    ("Y34", "reconcile accepts non-blocking journals", '    if data.get("outcome") not in BLOCKING_OUTCOMES:\n        raise ReconcileRefused(f"the journal {path.name} is not unreconciled', '    if False:\n        raise ReconcileRefused(f"the journal {path.name} is not unreconciled'),
+    ("Y34", "reconcile accepts non-blocking journals", '    if data["outcome"] not in BLOCKING_OUTCOMES:\n        raise ReconcileRefused(f"the journal {path.name} is not unreconciled', '    if False:\n        raise ReconcileRefused(f"the journal {path.name} is not unreconciled'),
     ("Y35", "numeric env negative backoff accepted", '("ZENODO_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF, 0.0, False, 60.0)', '("ZENODO_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF, -1e9, False, 60.0)'),
     ("Y36", "Authorization sent to a hostname suffix match", 'parsed.hostname != self.host:', 'not parsed.hostname.endswith(self.host):'),
     ("Y37", "post-publish on_published catches Exception only", '        except BaseException as exc:  # noqa: BLE001 - Ctrl-C right after publish returns (R12) included', '        except Exception as exc:  # noqa: BLE001 - Ctrl-C right after publish returns (R12) included'),
@@ -78,7 +78,11 @@ def main() -> int:
         print("baseline is not green: cannot judge mutants")
         return 2
     survivors = []
-    for mid, desc, old, new in M:
+    chosen = M
+    if "--ids" in sys.argv:                           # --ids Y14,Y34
+        wanted = set(sys.argv[sys.argv.index("--ids") + 1].split(","))
+        chosen = [m for m in M if m[0] in wanted]
+    for mid, desc, old, new in chosen:
         if src.count(old) != 1:
             print(f"{mid:5} SKIPPED (pattern occurs {src.count(old)} times): {desc}", flush=True)
             survivors.append(mid)
@@ -89,7 +93,7 @@ def main() -> int:
         if not killed:
             survivors.append(mid)
     unexpected = [m for m in survivors if m not in EQUIVALENT_SURVIVORS]
-    print(f"review mutants: {len(M)}, killed: {len(M) - len(survivors)}, survivors: {survivors or 'none'}")
+    print(f"review mutants: {len(chosen)}, killed: {len(chosen) - len(survivors)}, survivors: {survivors or 'none'}")
     if unexpected:
         print(f"UNEXPECTED survivor(s): {unexpected}")
         return 1
