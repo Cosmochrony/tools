@@ -8,7 +8,7 @@ before any production deposit. Every step below is an instruction for the operat
 | File | Role |
 |---|---|
 | `checksums_before_after.sh` | **Read-only** snapshot / compare of the production state (paper `zenodo.json`, `pdfs/`, bibliographies, `git status` of the paper and of `tools`). Never deletes, refuses to overwrite a snapshot, refuses a LABEL that is not a plain file name (no `/`, no `..`, no leading `.` or `-`). |
-| `sandbox_launch.py` | Runs `zenodo_publish.py` (or one `inject_failures.py` case) against the sandbox with the token **read from the terminal** (getpass) and kept in that Python process only: never in an argument vector, never exported to a child, environment reduced to `PATH`, `HOME` and the token. Refuses without `--sandbox` or if `ZENODO_TOKEN` exists. |
+| `sandbox_launch.py` | Runs `zenodo_publish.py` (or one `inject_failures.py` case) against the sandbox with the token **read from the terminal** (getpass) and kept in that Python process only: never in an argument vector (it is in the environment of that process; the four `git` calls of `zenodo_publish.py` run with a reduced environment that does not carry it, while the pre-deposit battery's commands inherit it), environment reduced to `PATH`, `HOME` and the token. Refuses without `--sandbox` or if `ZENODO_TOKEN` exists. |
 | `inject_failures.py` | Scratch harness: wraps `ZenodoClient._request` (and, for two cases, `build_metadata` / `get_record`) **in memory** to inject one failure case F-a..F-i, then calls `zenodo_publish.main`. Refuses unless `--sandbox` is given, `ZENODO_TOKEN` is absent from the environment and every request URL is `https://sandbox.zenodo.org/...`. The tool file is never modified. |
 
 The tests of both (`tests/test_pilot_harness.py`) run offline against the `Sim` double.
@@ -40,7 +40,7 @@ SNAP() { sh tools/pilot/checksums_before_after.sh snapshot "$1" "<PAPER_DIR>" "<
 ```
 
 `RUN` is `sandbox_launch.py`: it takes the sandbox token from the terminal (not echoed, not in the history, **not in
-any argument vector**, not exported to a child process), `--sandbox` makes the tool read only
+any argument vector**; it lives in the environment of the launcher's own process, so it is in no command line, the four `git` calls of `zenodo_publish.py` run with a scrubbed environment, and the pre-deposit battery's child commands inherit it), `--sandbox` makes the tool read only
 `ZENODO_SANDBOX_TOKEN`, and both the launcher and the harness refuse if `ZENODO_TOKEN` is present. Every `RUN` call
 therefore starts with `--` before the tool's own arguments (see the commands below). Run every command in the foreground. After each step run
 `SNAP after-Pn` and `sh tools/pilot/checksums_before_after.sh compare "$SCR/snap/before.snapshot" "$SCR/snap/after-Pn.snapshot"`:
@@ -56,7 +56,7 @@ refuses to start until `--reconcile` (see P6).
 ```sh
 python3 tools/zenodo_publish.py "$PAPER" --dry-run                      # prints the exact metadata incl. custom; the version-label verdict
 python3 tools/zenodo_publish.py "$PAPER" --sandbox --sandbox-state "$SCR/p0.json" --state-dir "$SCR/journals"   # refuses: ZENODO_SANDBOX_TOKEN not set (the token check comes first)
-python3 tools/pilot/sandbox_launch.py -- "$PAPER" --sandbox --sandbox-state "<WORKSPACE>/x.json"                 # (enter any dummy text at the prompt) refuses: the state file lies inside the workspace
+python3 tools/pilot/sandbox_launch.py -- "$PAPER" --sandbox --sandbox-state "<WORKSPACE>/x.json"                 # (at the prompt enter a dummy token WITHOUT spaces, e.g. DUMMYTOKEN1234; a value with a space is refused first, by the token-shape check) refuses: the state file lies inside the workspace
 python3 tools/zenodo_publish.py "$PAPER" --dry-run --update --set-title --live-snapshot <LIVE_JSON>             # the diff, offline
 ```
 
@@ -149,7 +149,9 @@ Reconcile an unresolved journal locally (the tool sends nothing):
 python3 tools/zenodo_publish.py --reconcile "$SCR/journals/<JOURNAL>.run.json" --outcome not-published \
     --record-url "https://sandbox.zenodo.org/deposit/<ID>"      # or: --i-checked-the-account --reason "what you saw"
 python3 tools/zenodo_publish.py --reconcile "$SCR/journals/<JOURNAL>.run.json" --outcome published --record-id <ID>
-# an unreadable journal: python3 tools/zenodo_publish.py --reconcile <FILE> --quarantine --reason "..."  (renames, never deletes)
+# an unreadable journal, or one with an absent/unknown outcome: python3 tools/zenodo_publish.py --reconcile <FILE> --quarantine --reason "..."  (renames, never deletes)
+# inputs are validated before anything is written: ids are positive integers, the URL is https on the journal's host and contains the record id,
+# --reason has at least 10 characters; a production deposit is reconciled as published with --concept-id C --concept-doi D (a 10.5281/zenodo.N DOI must carry C)
 ```
 
 Also observe the listing: `GET /deposit/depositions?status=draft&size=100&all_versions=true` with two or more drafts

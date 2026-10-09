@@ -6,7 +6,10 @@ on a command line.
 
 The sandbox token is read from the terminal (getpass: /dev/tty, no echo, not in the shell history) and is put
 into THIS process's environment only; the tool then runs in-process. Consequences:
-  * the token is never in an argument vector (nothing for `ps` to show, in this process or in any child);
+  * the token is never in an argument vector (nothing for `ps` to show, in this process or in any child). It IS in
+    the environment of this process: a child process inherits that environment unless it is scrubbed. The tool
+    runs its four `git` helper calls with a scrubbed environment (no ZENODO_* variable); the commands of the
+    pre-deposit battery (predeposit_check.py) and any other child would inherit it;
   * the process environment is reduced to PATH and HOME plus ZENODO_SANDBOX_TOKEN, and the launcher refuses if
     the production variable ZENODO_TOKEN is present at all;
   * the arguments after `--` must contain --sandbox (the tool then reads ONLY ZENODO_SANDBOX_TOKEN).
@@ -46,7 +49,8 @@ def main(argv=None, getpass_fn=getpass.getpass, zp=None) -> int:
     kept = {k: os.environ[k] for k in KEEP if k in os.environ}
     os.environ.clear()
     os.environ.update(kept)
-    os.environ["ZENODO_SANDBOX_TOKEN"] = token          # this process only; never argv, never a child
+    os.environ["ZENODO_SANDBOX_TOKEN"] = token          # this process's environment; never argv (a child inherits
+    #                                                     the environment unless it scrubs it, as the tool's git calls do)
     if zp is None:
         sys.path.insert(0, str(TOOLS))
         import zenodo_publish as zp  # noqa: PLC0415
