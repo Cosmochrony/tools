@@ -458,14 +458,14 @@ class RunJournal(unittest.TestCase):
         self.assertIn("--record-id", str(code))
         self.assertEqual(json.loads(jpath.read_text())["outcome"], "UNRECONCILED")
         code, out, _ = run_main([str(paper), "--reconcile", str(jpath), "--outcome", "published",
-                                 "--record-id", "301", "--concept-id", "5", "--concept-doi", "10.5281/zenodo.0"],
+                                 "--record-id", "301", "--concept-id", "5", "--concept-doi", "10.5281/zenodo.5"],
                                 {}, root)
         self.assertIsNone(code, code)
         data = json.loads(jpath.read_text())
         self.assertEqual((data["outcome"], data["record_id"], data["operator_asserted"]),
                          ("PUBLISHED-RECONCILED", 301, True))
         cfg = json.loads((paper / "zenodo.json").read_text())
-        self.assertEqual((cfg["zenodo_id"], cfg["doi"]), (5, "10.5281/zenodo.0"))
+        self.assertEqual((cfg["zenodo_id"], cfg["doi"]), (5, "10.5281/zenodo.5"))
 
     def test_reconcile_of_a_sandbox_journal_never_writes_zenodo_json(self):
         root, paper = workspace()

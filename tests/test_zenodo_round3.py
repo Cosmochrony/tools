@@ -120,10 +120,10 @@ class PublishedUnsavedBlocks(unittest.TestCase):
         self.assertEqual(json.loads(jp.read_text())["outcome"], "PUBLISHED-UNSAVED")
         # the cure: writes ONLY the paper directory recorded in the journal (no positional argument needed)
         code, out, _ = run_main(["--reconcile", str(jp), "--outcome", "published", "--record-id", "98",
-                                 "--concept-id", "5", "--concept-doi", "10.5281/zenodo.0"], {}, root)
+                                 "--concept-id", "5", "--concept-doi", "10.5281/zenodo.5"], {}, root)
         self.assertIsNone(code, code)
         cfg = json.loads((paper / "zenodo.json").read_text())
-        self.assertEqual((cfg["zenodo_id"], cfg["doi"]), (5, "10.5281/zenodo.0"))
+        self.assertEqual((cfg["zenodo_id"], cfg["doi"]), (5, "10.5281/zenodo.5"))
         self.assertEqual(json.loads(jp.read_text())["outcome"], "PUBLISHED-RECONCILED")
         code, _, _ = run_main([str(paper), "--skip-checks"], PROD_ONLY, root, Factory(FakeClient()))
         self.assertNotIn("REFUSING", str(code))
@@ -332,7 +332,7 @@ class ReconcileSafety(unittest.TestCase):
         other_root, other = workspace(zenodo_id=7, doi="10.0/other")
         before = (other / "zenodo.json").read_text()
         code, _, _ = run_main([str(other), "--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
-                               "--concept-id", "999", "--concept-doi", "10.9/zzz"], {}, root)
+                               "--concept-id", "999", "--concept-doi", "10.9999/zzz"], {}, root)
         self.assertIn("belongs to the paper directory", str(code))
         self.assertEqual((other / "zenodo.json").read_text(), before)
         self.assertEqual(json.loads(jp.read_text())["outcome"], "UNRECONCILED")
@@ -342,7 +342,7 @@ class ReconcileSafety(unittest.TestCase):
         link = root / "alias"
         os.symlink(paper, link)
         code, _, _ = run_main([str(link), "--reconcile", str(jp), "--outcome", "published", "--record-id", "301",
-                               "--concept-id", "5", "--concept-doi", "10.5281/zenodo.0"], {}, root)
+                               "--concept-id", "5", "--concept-doi", "10.5281/zenodo.5"], {}, root)
         self.assertIsNone(code, code)
 
     def test_a_zenodo_json_of_another_concept_or_bib_key_is_never_overwritten(self):
@@ -350,13 +350,13 @@ class ReconcileSafety(unittest.TestCase):
         cfg = json.loads((paper / "zenodo.json").read_text())
         before = (paper / "zenodo.json").read_text()
         code, _, _ = run_main(["--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
-                               "--concept-id", "999", "--concept-doi", "10.9/zzz"], {}, root)
+                               "--concept-id", "999", "--concept-doi", "10.9999/zzz"], {}, root)
         self.assertIn("another concept", str(code))
         cfg["bib_key"] = "SomethingElse"
         (paper / "zenodo.json").write_text(json.dumps(cfg))
         before = (paper / "zenodo.json").read_text()
         code, _, _ = run_main(["--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
-                               "--concept-id", "5", "--concept-doi", "10.9/zzz"], {}, root)
+                               "--concept-id", "5", "--concept-doi", "10.9999/zzz"], {}, root)
         self.assertIn("not the same paper", str(code))
         self.assertEqual((paper / "zenodo.json").read_text(), before)
 
@@ -419,14 +419,14 @@ class ReconcileSafety(unittest.TestCase):
 
     def test_quarantine_never_overwrites_and_refuses_a_readable_journal(self):
         root, paper, jp = self.unreconciled()
-        code, _, _ = run_main(["--reconcile", str(jp), "--quarantine", "--reason", "x"], {}, root)
+        code, _, _ = run_main(["--reconcile", str(jp), "--quarantine", "--reason", "checked the account"], {}, root)
         self.assertIn("readable journal", str(code))
         self.assertTrue(jp.exists())
         bad = state_dir_for(root) / "paper-1.run.json"
         bad.write_text("[1]")
         taken = Path(str(bad) + ".quarantined")
         taken.write_text("earlier")
-        run_main(["--reconcile", str(bad), "--quarantine", "--reason", "x"], {}, root)
+        run_main(["--reconcile", str(bad), "--quarantine", "--reason", "checked the account"], {}, root)
         self.assertEqual(taken.read_text(), "earlier")
         self.assertEqual(Path(str(bad) + ".quarantined.1").read_text(), "[1]")
 
@@ -440,7 +440,7 @@ class ReconcileSafety(unittest.TestCase):
             return real(path, text)
         with mock.patch.object(zp, "_atomic_write_text", lying):
             code, _, _ = run_main(["--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
-                                   "--concept-id", "5", "--concept-doi", "10.9/zzz"], {}, root)
+                                   "--concept-id", "5", "--concept-doi", "10.9999/zzz"], {}, root)
         self.assertIn("does not hold the identifiers", str(code))
         self.assertEqual(json.loads(jp.read_text())["outcome"], "UNRECONCILED")
 
