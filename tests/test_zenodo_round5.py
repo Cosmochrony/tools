@@ -400,6 +400,13 @@ class EveryOutputSiteIsRedacted(unittest.TestCase):
             code, out, err = run_main([str(paper_named), "--dry-run"], {"ZENODO_TOKEN": PROD_TOKEN}, root, Factory())
         self.assertNotIn(PROD_TOKEN, out + err + str(code))
 
+    def test_die_masks_the_registered_secrets_and_the_named_fields(self):
+        with mock.patch.object(zp, "_SECRETS", set()):
+            zp.register_secret("TOPSECRET12345")
+            with self.assertRaises(SystemExit) as cm:
+                zp.die("Error: boom TOPSECRET12345 and token=zzz")
+        self.assertEqual(cm.exception.code, "Error: boom [REDACTED] and token=[REDACTED]")
+
     def test_every_sys_exit_site_goes_through_die(self):
         self.assertEqual(SRC.count("sys.exit("), 1)
         self.assertIn("def die(", SRC)
@@ -958,7 +965,7 @@ class RelatedIdentifiersAreKept(unittest.TestCase):
 
 # ── N-7: no secret in the environment of any child ───────────────────────────────────────────────────
 
-SECRET_ENV = {"ZENODO_TOKEN": "zt-1", "ZENODO_SANDBOX_TOKEN": "zs-1", "ZENODO_ANYTHING": "z", "GH_TOKEN": "g", "GITHUB_PAT": "g",
+SECRET_ENV = {"GH_HOST": "h", "ZENODO_TOKEN": "zt-1", "ZENODO_SANDBOX_TOKEN": "zs-1", "ZENODO_ANYTHING": "z", "GH_TOKEN": "g", "GITHUB_PAT": "g",
               "NETLIFY_PAT": "n", "NETLIFY_AUTH_TOKEN": "n", "MY_API_KEY": "k", "SOME_SECRET": "s", "DB_PASSWORD": "p",
               "AWS_ACCESS_KEY_ID": "a", "ORCID_KEY": "o", "FOO_TOKEN": "t", "gh_token": "g"}
 KEPT_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/home/x", "LANG": "C", "TMPDIR": "/tmp", "TEXMFHOME": "/tex", "PYTHONPATH": "/py",

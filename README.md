@@ -133,7 +133,7 @@ python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome published|not-pu
 Run in the foreground, from the version branch (the branch name is the version label), after the
 pre-deposit checks and the independent review. `python3 -m unittest discover -s tests` runs the offline
 suite (over 500 tests, no network: a socket guard fails any real connection). `python3 tests/mutation_check.py`
-re-applies the in-memory mutants (268 mutants in all, of which 74 new in the fifth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
+re-applies the in-memory mutants (267 mutants in all, of which 73 new in the fifth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
 processes, or `--only-new` / `--ids ID1,ID2` for a subset; `--count` prints these numbers from the script); **its expected result is: every mutant killed except
 exactly one survivor, `M16b`, a documented equivalent mutant** (it removes an unreachable defensive assertion; its
 reachable counterpart M16 is killed). The script exits 0 only in that case and 1 for any other survivor, skipped

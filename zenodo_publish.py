@@ -1419,8 +1419,6 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
     if not isinstance(host, str):
         raise ReconcileRefused(f"the journal {path.name} records a host that is not a string: it cannot be reconciled. "
                                "Nothing was written.")
-    if concept_doi not in (None, ""):
-        validate_concept_doi(concept_doi, cid_arg, host)          # the registrant must be this host's
     evidence = {}
     if outcome == "published":
         if not rid:
