@@ -40,7 +40,7 @@ SNAP() { sh tools/pilot/checksums_before_after.sh snapshot "$1" "<PAPER_DIR>" "<
 ```
 
 `RUN` is `sandbox_launch.py`: it takes the sandbox token from the terminal (not echoed, not in the history, **not in
-any argument vector**; it lives in the environment of the launcher's own process, so it is in no command line, the four `git` calls of `zenodo_publish.py` run with a scrubbed environment, and the pre-deposit battery's child commands inherit it), `--sandbox` makes the tool read only
+any argument vector**; it lives in the environment of the launcher's own process, so it is in no command line, the `git` calls of `zenodo_publish.py` and the commands of the pre-deposit battery run with an environment without any secret-looking variable), `--sandbox` makes the tool read only
 `ZENODO_SANDBOX_TOKEN`, and both the launcher and the harness refuse if `ZENODO_TOKEN` is present. Every `RUN` call
 therefore starts with `--` before the tool's own arguments (see the commands below). Run every command in the foreground. After each step run
 `SNAP after-Pn` and `sh tools/pilot/checksums_before_after.sh compare "$SCR/snap/before.snapshot" "$SCR/snap/after-Pn.snapshot"`:
@@ -149,9 +149,14 @@ Reconcile an unresolved journal locally (the tool sends nothing):
 python3 tools/zenodo_publish.py --reconcile "$SCR/journals/<JOURNAL>.run.json" --outcome not-published \
     --record-url "https://sandbox.zenodo.org/deposit/<ID>"      # or: --i-checked-the-account --reason "what you saw"
 python3 tools/zenodo_publish.py --reconcile "$SCR/journals/<JOURNAL>.run.json" --outcome published --record-id <ID>
-# an unreadable journal, or one with an absent/unknown outcome: python3 tools/zenodo_publish.py --reconcile <FILE> --quarantine --reason "..."  (renames, never deletes)
-# inputs are validated before anything is written: ids are positive integers, the URL is https on the journal's host and contains the record id,
-# --reason has at least 10 characters; a production deposit is reconciled as published with --concept-id C --concept-doi D (a 10.5281/zenodo.N DOI must carry C)
+# a journal no reconcile can cure (unreadable; absent/unknown outcome; identity digest absent or wrong; directory moved):
+#   python3 tools/zenodo_publish.py --backup-journal <FILE>        (a copy beside it; nothing is unblocked)
+#   python3 tools/zenodo_publish.py --lift-block <FILE> --reason "..." --i-checked-the-account      (or --record-url URL)
+#   -> writes <FILE>.decision.json (journal sha256, who, when, reason, evidence); the journal is never renamed, edited or deleted;
+#      the decision counts only while the journal keeps exactly those bytes
+# inputs are validated before anything is written: ids are positive integers in ASCII digits, the URL is https on the journal's host and contains
+# the record id, --reason has at least 10 characters; a production deposit is reconciled as published with --concept-id C --concept-doi D
+# (D must be exactly 10.5281/zenodo.C; the sandbox registrant is 10.5072; a different doi already in zenodo.json is refused)
 ```
 
 Also observe the listing: `GET /deposit/depositions?status=draft&size=100&all_versions=true` with two or more drafts

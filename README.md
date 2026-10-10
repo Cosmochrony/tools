@@ -76,14 +76,47 @@ outcome `PUBLISHED-UNSAVED` exists. `--reconcile ... --outcome not-published` no
 and must run with the paper at the deposited version. Environment settings above their upper bounds are refused.
 
 **Breaking changes of the fourth corrective pass (review round 20).** A journal whose `outcome` is absent or not one
-of the known names now BLOCKS (fail closed); its cure is `--reconcile JOURNAL --quarantine --reason ...`. A
-`--reconcile` refuses a journal whose identity digest is missing or does not match (journals written by earlier
-versions of this tool, and hand-written ones, can no longer be reconciled: quarantine them), and a production
-`published` reconcile writes only `<paper_dir_real>/zenodo.json`. `--record-id` and `--concept-id` must be positive
-integers written as digits, `--concept-doi` must look like `10.NNNN/suffix` (a `10.5281/zenodo.N` DOI must carry the
-concept id), `--record-url` must be an https URL on the journal's host containing the record id, `--reason` must have at
-least 10 characters once stripped. `--set-web-url` never replaces a live related identifier that states no
-`resource_type` (see `--replace-related-identifier`). Secrets are masked by field name as well as by value.
+of the known names now BLOCKS (fail closed); its cure is `--lift-block` (fifth pass; the fourth pass had a rename).
+A `--reconcile` refuses a journal whose identity digest is missing or does not match (journals written by earlier
+versions of this tool, and hand-written ones, can no longer be reconciled: they are lifted by a decision, see below),
+and a production `published` reconcile writes only `<paper_dir_real>/zenodo.json`. `--record-id` and `--concept-id`
+must be positive integers written as digits, `--record-url` must be an https URL on the journal's host containing
+the record id, `--reason` must have at least 10 characters once stripped. `--set-web-url` never replaces a live
+related identifier that states no `resource_type` (see `--replace-related-identifier`). Secrets are masked by field
+name as well as by value.
+
+**Breaking changes of the fifth corrective pass (review round 21).**
+* `--quarantine` is REMOVED (it is refused with a pointer): it renamed the journal, which was a dead end for a journal
+  of known outcome and a modification of the evidence. It is replaced by two separate steps. `--backup-journal JOURNAL`
+  only COPIES the journal beside itself to `<name>.quarantine-copy-<UTC stamp>-<sha256 prefix>.json` (exclusive create,
+  fsynced, never overwrites; nothing is unblocked). `--lift-block JOURNAL --reason TEXT (--record-url URL |
+  --i-checked-the-account)` records your decision in a SEPARATE file `<journal>.decision.json` (exclusive create)
+  holding the journal's sha256, who, when, the reason, the evidence and the decision `UNBLOCK`; it makes the backup
+  copy first if none with the same sha256 exists. The journal is never renamed, edited or deleted. The block check
+  honours a decision only if its sha256 equals the journal's CURRENT bytes (edit the journal afterwards and it blocks
+  again), only for this journal's name and block kind, and only for the kinds no reconcile can cure: unreadable;
+  absent or unknown outcome; identity digest absent or mismatching (an older version, hand-written, edited); paper
+  directory moved or retargeted. A journal with a known outcome, a consistent identity and an intact directory is
+  reconciled (`--outcome ...`), not lifted.
+* `--concept-doi` must be exactly `10.5281/zenodo.<concept id>` in ASCII (registrant `10.5072` on the sandbox): digits
+  `0-9` only, no leading zero, no space, `zenodo` in lower case, the number EQUAL to the concept id (not a prefix of
+  it), no other registrant. A `zenodo.json` that already holds a different `doi` or `zenodo_id` is refused with both
+  values (an identical value is accepted and not rewritten); a DOI is never silently replaced.
+* `--set-web-url` replaces a related identifier only when it is `isSupplementedBy`, scheme `url`, resource type
+  `other` AND on `cosmochrony.org`, or equal to the new value, or equal to a `previous_web_url` of the paper's
+  `zenodo.json` (a string or a list, written by hand). A same-role entry on another host is KEPT (the run says so) and
+  the web entry is appended; `cites` DOIs and every other entry are always kept.
+  `--replace-related-identifier IDENTIFIER` is the only way to replace anything else: exactly one live entry must
+  match the identifier exactly, a `cites` / `isCitedBy` / `references` entry or a DOI-scheme entry is refused, and the
+  replaced entry is printed with the diff.
+* Redaction (below) applies scheme words first, decodes percent-encoded names, knows `X-Auth-Token`, `X-Access-Token`,
+  `Private-Token` and `ZENODO_TOKEN=` / `ZENODO_SANDBOX_TOKEN=`, never registers a blank secret, masks a registered
+  secret shorter than 8 characters only as a whole token, registers the environment tokens before the arguments are
+  parsed, and every output of the tool goes through it.
+* The commands of the pre-deposit battery run WITHOUT any variable whose name looks like a secret (`ZENODO_*`, `GH_*`,
+  `GITHUB_*`, `NETLIFY_*`, `ORCID*`, `*TOKEN*`, `*SECRET*`, `*PASSW*`, `*API_KEY*`, `*CREDENTIAL*`, `AWS_*`).
+* A `zenodo.json` or journal write that fails reports the temporary file it left (next to the target, because an
+  atomic rename works within one filesystem) and keeps it: this tool deletes nothing.
 
 ```bash
 # Production. The script reads the PROCESS ENVIRONMENT only: it does NOT load tools/.env itself.
@@ -99,9 +132,9 @@ python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome published|not-pu
 
 Run in the foreground, from the version branch (the branch name is the version label), after the
 pre-deposit checks and the independent review. `python3 -m unittest discover -s tests` runs the offline
-suite (over 400 tests, no network: a socket guard fails any real connection). `python3 tests/mutation_check.py`
-re-applies the in-memory mutants (193 in all; a full run takes more than an hour: use `--shard K/N` to spread it over
-processes, or `--only-new` / `--ids ID1,ID2` for a subset); **its expected result is: every mutant killed except
+suite (over 500 tests, no network: a socket guard fails any real connection). `python3 tests/mutation_check.py`
+re-applies the in-memory mutants (268 mutants in all, of which 74 new in the fifth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
+processes, or `--only-new` / `--ids ID1,ID2` for a subset; `--count` prints these numbers from the script); **its expected result is: every mutant killed except
 exactly one survivor, `M16b`, a documented equivalent mutant** (it removes an unreachable defensive assertion; its
 reachable counterpart M16 is killed). The script exits 0 only in that case and 1 for any other survivor, skipped
 pattern or red baseline. `python3 tests/mutation_check_review.py` re-applies the 43 mutants of independent review
@@ -130,13 +163,23 @@ A token is **masked by value and by field name**, not guaranteed absent: every e
 reaches the console, and every value written to a run journal, goes through one function (`redact`) that masks (a) the
 exact value of every registered secret: both `ZENODO_TOKEN` and `ZENODO_SANDBOX_TOKEN` as soon as either is present,
 whatever their length (an empty value is never registered), (b) any `Bearer ...` string, and (c) the value of any
-field whose NAME is `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `Cookie`, `Set-Cookie`,
-`access_token`, `token`, `refresh_token`, `client_secret` or `password` (case-insensitive; `-` and `_` alike), in header
-dicts, URL query strings, `key=value` text and JSON-looking text, whatever the value. The journal is redacted before the
+field whose NAME is `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Auth-Token`, `X-Access-Token`,
+`Private-Token`, `Cookie`, `Set-Cookie`, `access_token`, `token`, `refresh_token`, `client_secret` or `password`
+(case-insensitive; `-` and `_` alike; a name written with percent escapes such as `access%5Ftoken` is decoded first;
+`ZENODO_TOKEN=` and `ZENODO_SANDBOX_TOKEN=` assignments), in header dicts, URL query strings, `key=value` text and
+JSON-looking text; the scheme word (`Bearer`, `Basic`) of an `Authorization` value is consumed with its credential
+in every form (`Authorization=Bearer X`, `Authorization: Basic X`, quoted, JSON), the scheme patterns being applied
+first. Every `print` of the tool, every message of `sys.exit` and every argument-parsing error passes through the same
+function (the environment tokens are registered before the arguments are parsed); the only raw output calls of the
+module are the three that redact, and a test pins that by AST. The journal is redacted before the
 file is written (all its strings, its keys, and the value of every credential-named key). **Limits:** a secret that is
-neither registered nor attached to one of those names (for instance a token printed bare, or under another field
-name, or a token typed in a `--reason`) is not recognised; masking a registered secret of one or two characters also
-masks every other occurrence of that character. The client refuses to be built with a token equal to the other host's
+neither registered nor attached to one of those names (for instance a token printed bare, a differently named field such
+as `api_secret`, `session` or `bearer:X`, or a token typed in a `--reason`) is not recognised; a registered secret
+**shorter than 8 characters** is masked only as a whole token (not preceded or followed by a letter, digit or
+underscore) and never inside a dictionary key, because a blind substring replacement of a one- or two-character secret
+would mangle every other text and the keys of a journal: such a secret glued to other characters is not masked. The
+output of `predeposit_check.py` run as its own command is not redacted (it prints paths and log lines of the paper, and
+never reads a token). The client refuses to be built with a token equal to the other host's
 variable, and refuses to send a request (bucket upload links included) to any host but its own, so the
 production token cannot reach the sandbox, nor the sandbox token production.
 
@@ -158,7 +201,7 @@ concept id, the intent flags, the host, the sha256/md5/size of the PDF actually 
 | `PUBLISHED` | published; `zenodo.json` written **and read back** (sandbox: state file committed; `--update`: nothing to save) | no |
 | `NOT-PUBLISHED` | nothing is published and nothing is left behind (refusal before any write, or a clean discard) | no |
 | `*-RECONCILED` | set by `--reconcile` | no |
-| anything else (absent, mistyped, a future name) | unknown to this version of the tool | **yes (fail closed)**; cure: `--reconcile JOURNAL --quarantine --reason ...` |
+| anything else (absent, mistyped, a future name) | unknown to this version of the tool | **yes (fail closed)**; cure: `--lift-block JOURNAL --reason ...` (a decision file; the journal is not touched) |
 
 The non-blocking outcomes are exactly `PUBLISHED`, `PUBLISHED-RECONCILED`, `NOT-PUBLISHED` and
 `NOT-PUBLISHED-RECONCILED`; every other value blocks.
@@ -189,7 +232,7 @@ directory given on the command line, if any; the journal must carry `bib_key` an
 have that `bib_key`, the same content apart from `zenodo_id`/`doi`, and a `zenodo_id` empty or equal to the concept you
 assert (if `zenodo.json` was legitimately changed since the run, restore it, reconcile, then redo the change);
 (3) every input is validated before anything is written: `--record-id` and `--concept-id` positive integers (digits
-only, at most 12), `--concept-doi` `10.NNNN/suffix` (and, for `10.5281/zenodo.N`, N equal to the concept id),
+only, at most 12), `--concept-doi` exactly `10.5281/zenodo.<concept id>` (ASCII, the number equal to the concept id; an existing different `doi` in `zenodo.json` is refused),
 `--record-url` an https URL on the journal's own host that contains the record id, `--reason` at least 10 characters
 after stripping; a refusal is a message, never a traceback, and `zenodo.json` is written (temporary file then replace,
 then read back) only after all of it:
@@ -200,12 +243,18 @@ python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome published --reco
 # not published: evidence is mandatory and stored in the journal; the consequences are printed
 python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome not-published --record-url https://zenodo.org/deposit/N
 python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome not-published --i-checked-the-account --reason "what you saw"
-# a corrupt / unreadable journal (prints its path and size first; renames to *.quarantined, never deletes)
-python3 tools/zenodo_publish.py --reconcile <JOURNAL> --quarantine --reason "what you checked on the account"
+# a journal no reconcile can cure (unreadable; absent/unknown outcome; identity digest absent or wrong; directory moved):
+python3 tools/zenodo_publish.py --backup-journal <JOURNAL>        # copy only: nothing is unblocked, the original is not touched
+python3 tools/zenodo_publish.py --lift-block <JOURNAL> --reason "what you checked" --i-checked-the-account
+python3 tools/zenodo_publish.py --lift-block <JOURNAL> --reason "what you checked" --record-url https://zenodo.org/deposit/N
 ```
 
-`--quarantine` also accepts a readable journal whose outcome is absent or unknown (it has no other cure); a readable
-journal with a known outcome is reconciled, not quarantined. `not-published` is refused for a `PUBLISHED-UNSAVED`
+`--lift-block` never renames, edits or deletes the journal: it makes sure a copy with the same sha256 exists, then writes
+`<JOURNAL>.decision.json` by exclusive create (a second lift is refused: move the old decision aside by hand if the
+journal was edited after it and blocks again). A decision counts only while the journal has exactly the bytes it
+recorded. For a `PUBLISHED-UNSAVED` journal whose directory moved, `--reconcile` still refuses; `--lift-block` may
+unblock it and then states that the publication HAPPENED: nothing is saved, set `zenodo_id` and `doi` in `zenodo.json`
+by hand and do NOT re-run the deposit. `--reconcile --outcome not-published` is refused for a `PUBLISHED-UNSAVED`
 journal (the publication did succeed). A sandbox journal never
 writes any `zenodo.json`. If the journal cannot be written before a write request, the request is not sent. The
 journal file is created exclusively (written under a unique temp name, then hard-linked: never over an existing
@@ -284,10 +333,13 @@ confirmation. (A `--dry-run` prints the verdict as `REFUSED, a real run would st
 `--set-version`, `--set-title`, `--set-abstract` (description), `--set-keywords`, `--set-notes`, `--set-web-url`
 (**only the web-page entry** of the related identifiers is replaced or inserted; `cites` and every other entry are
 kept. The live entry with the same identifier and relation is replaced in place; otherwise the candidates are the
-entries with the same relation and scheme whose `resource_type` is `other` or absent, narrowed to the `cosmochrony.org`
-ones if any; several candidates are refused as ambiguous; a single candidate **without `resource_type` is never
-replaced implicitly**: the run is refused naming it, and you pass `--replace-related-identifier <IDENTIFIER>` if it is
-the web entry; no candidate: the entry is appended), `--set-publication-type`,
+entries with the same relation (`isSupplementedBy`), scheme (`url`) and `resource_type` (`other`) that are on
+`cosmochrony.org`, equal to the new value or equal to a `previous_web_url` recorded in `zenodo.json`; several are
+refused as ambiguous; a single candidate **without `resource_type` is never replaced implicitly**: the run is refused
+naming it, and you pass `--replace-related-identifier <IDENTIFIER>` if it is the web entry; an entry of another host is
+KEPT, the run says so and the web entry is appended. `--replace-related-identifier` needs exactly ONE live entry with
+that exact identifier (none or several: refused) and never replaces a `cites` / `isCitedBy` / `references` or DOI entry;
+the replaced entry is printed and appears in the diff), `--set-publication-type`,
 `--set-code-url` (the repository field, other `custom` keys kept),
 or `--apply-local-metadata=version,title,...`. With none of them the run is refused. **Before anything is created**
 the tool prints the whole-metadata unified diff `live -> to-be-sent` and its sha256, and stops unless
@@ -339,7 +391,8 @@ python3 tools/pilot/sandbox_launch.py -- <paper_dir>/ \
   to show), and the launcher refuses if `ZENODO_TOKEN` is present. It is in the environment of that process; the
   four `git` calls of `zenodo_publish.py` run with a reduced environment (`PATH`, `HOME`, locale, `TMPDIR`, `GIT_*`)
   that does not carry it; the commands of the pre-deposit battery (`predeposit_check.py`, run in-process unless
-  `--skip-checks`) are plain child processes and DO inherit the environment, including the token;
+  `--skip-checks`) are child processes too and run with an environment WITHOUT any secret-looking variable
+  (`ZENODO_*`, `GH_*`, `NETLIFY_*`, `*TOKEN*`, `*SECRET*`, ...), so none of the children of this tool sees the token;
 * `--sandbox-state PATH` is mandatory, must lie outside the workspace and **must not exist** (an existing file is
   refused, never overwritten); a unique temp file next to it is created **before any request** as a writability
   probe and is the file later moved into place, so no residue is left; the result is always printed in full, and if

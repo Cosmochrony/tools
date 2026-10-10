@@ -14,8 +14,9 @@ Usage (production):
     python tools/zenodo_publish.py bell-paper/ --finish-after-fail [--journal PATH]  # offline
     python tools/zenodo_publish.py --reconcile JOURNAL --outcome published --record-id N --concept-id C --concept-doi D
     python tools/zenodo_publish.py --reconcile JOURNAL --outcome not-published (--record-url URL | --i-checked-the-account --reason TXT)
-    python tools/zenodo_publish.py --reconcile JOURNAL --quarantine --reason TXT     # unreadable journal, or one with an
-                                                                                      # absent/unknown outcome: rename, never delete
+    python tools/zenodo_publish.py --backup-journal JOURNAL                          # copy only; nothing is unblocked
+    python tools/zenodo_publish.py --lift-block JOURNAL --reason TXT (--record-url URL | --i-checked-the-account)
+                                                          # a journal no reconcile can cure: a decision file, the journal is untouched
 
 Sandbox (never touches a production id, DOI, pdfs/ or bibliography; see tools/README.md):
     python tools/pilot/sandbox_launch.py -- PAPER/ --sandbox --sandbox-state /tmp/new-state.json --state-dir DIR
@@ -35,10 +36,15 @@ Guards (all offline-tested; the server semantics they rely on are listed as UNPR
     paper: every journal carries a digest of its identity fields (an edited, hand-written or old journal is
     refused), and it writes ONLY <paper_dir_real>/zenodo.json, the realpath recorded in the journal, which must
     still exist, still be what paper_dir resolves to, and match the journal's bib_key and zenodo.json content.
-    Its inputs are validated before anything is written (ids: positive integers; DOI: 10.NNNN/suffix, a
-    10.5281/zenodo.N DOI must carry the concept id; URL: https on the journal's host with the record id; reason:
-    at least 10 characters). An absent/unknown-outcome journal is cured by --quarantine. Every value written to a
-    journal is masked first (see the last bullet).
+    Its inputs are validated before anything is written (ids: positive integers in ASCII digits; DOI: exactly
+    10.5281/zenodo.<concept id>, 10.5072 on the sandbox, the number EQUAL to the concept id, never replacing a
+    different DOI already saved; URL: https on the journal's host with the record id; reason: at least 10
+    characters). A journal no reconcile can cure (unreadable; absent/unknown outcome; identity digest absent or
+    mismatching; paper directory moved) is lifted by --lift-block JOURNAL --reason TXT (--record-url URL |
+    --i-checked-the-account): a SEPARATE file JOURNAL.decision.json (journal sha256, who, when, reason, evidence,
+    UNBLOCK), made after --backup-journal's copy (JOURNAL beside itself, never overwritten); the journal is never
+    renamed, edited or deleted, and the decision counts only while the journal has exactly those bytes. Every value
+    written to a journal is masked first (see the last bullet).
   * A run REFUSES when a draft/edit session of the concept already exists, and on any failure cleans up ONLY the
     server state this run certainly created (an uncertain outcome is reported and searched for, never assumed
     away; ambiguity discards nothing). The cleanup call comes from an explicit kind table (CLEANUP_CALLS):
@@ -46,9 +52,11 @@ Guards (all offline-tested; the server semantics they rely on are listed as UNPR
   * --update PRESERVES the live metadata: the PUT is the live record with only the fields named by
     --set-version/--set-title/--set-abstract/--set-keywords/--set-notes/--set-web-url/--set-publication-type/
     --set-code-url (or --apply-local-metadata=a,b) replaced (--set-web-url replaces only the web-page entry of
-    related_identifiers: same identifier+relation, or the single same-relation/scheme entry of resource_type "other"
-    (the cosmochrony.org one if several); an entry with NO resource_type is never replaced implicitly - the run
-    is refused naming it, and --replace-related-identifier IDENTIFIER is the operator's explicit choice); the
+    related_identifiers: same identifier+relation, or the single isSupplementedBy/url/"other" entry on
+    cosmochrony.org, equal to the new value or to a previous_web_url of zenodo.json; an entry of another host is
+    kept and the web entry appended; an entry with NO resource_type is never replaced implicitly - the run is
+    refused naming it; --replace-related-identifier IDENTIFIER is the operator's explicit choice: exactly one
+    live entry, never a cites/isCitedBy/references or DOI entry, the replaced entry shown); the
     whole-metadata diff is printed first and --yes-apply-diff must carry at least 12 hex
     characters of the sha256 of exactly that printed diff (a bare flag is refused).
   * The version label is guarded independently of the pre-deposit gate and of --skip-checks: never
@@ -66,13 +74,17 @@ Guards (all offline-tested; the server semantics they rely on are listed as UNPR
     deposit journal (its version is the archive label, its PDF digest the identity, a sandbox journal or a concept
     mismatch is refused).
   * Secrets are MASKED, by value and by field name (not proven absent): the exact value of ZENODO_TOKEN and
-    ZENODO_SANDBOX_TOKEN (both, as soon as either is set, whatever their length), any "Bearer ..." string, and the
-    value of any field named Authorization, Proxy-Authorization, X-Api-Key, Api-Key, Cookie, Set-Cookie,
-    access_token, token, refresh_token, client_secret or password (case-insensitive; header dicts, query strings,
-    key=value and JSON-looking text), before printing and before any journal write. A secret that is neither
-    registered nor attached to such a name is not recognised. A token with whitespace or control characters is
-    refused unseen; every numeric environment setting is validated before any request. The four git calls of
-    this module run with a scrubbed environment (no token); the pre-deposit battery's commands do not.
+    ZENODO_SANDBOX_TOKEN (both, as soon as either is set; a blank value never; a value shorter than 8 characters
+    only as a whole token), any "Bearer ..." / "Basic ..." credential (scheme patterns applied first), and the
+    value of any field named Authorization, Proxy-Authorization, X-Api-Key, Api-Key, X-Auth-Token, X-Access-Token,
+    Private-Token, Cookie, Set-Cookie, access_token, token, refresh_token, client_secret or password, or a
+    ZENODO_TOKEN= / ZENODO_SANDBOX_TOKEN= assignment (case-insensitive; percent-encoded names decoded; header dicts,
+    query strings, key=value and JSON-looking text), before printing (every print, every exit message, every
+    argument-parsing error) and before any journal write. A secret that is neither registered nor attached to such a
+    name (another field name, a token typed in a --reason), or a short secret glued to other characters, is not
+    recognised. A token with whitespace or control characters is refused unseen; every numeric environment setting
+    is validated before any request. The git calls of this module and the commands of the pre-deposit battery run
+    with an environment without any secret-looking variable.
 
 UNPROVEN (never observed on a server): the semantics of DELETE vs actions/discard, custom acceptance for
 workingpaper, latest_draft on clean published records, X-Total/Link headers, status=draft including edit
@@ -1404,6 +1416,9 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
             f"the journal belongs to the paper directory {jdir}, not {paper_dir_arg}: refusing. A reconcile "
             "writes only the paper directory recorded in the journal.")
     host = data.get("host") or PRODUCTION_HOST
+    if not isinstance(host, str):
+        raise ReconcileRefused(f"the journal {path.name} records a host that is not a string: it cannot be reconciled. "
+                               "Nothing was written.")
     if concept_doi not in (None, ""):
         validate_concept_doi(concept_doi, cid_arg, host)          # the registrant must be this host's
     evidence = {}
