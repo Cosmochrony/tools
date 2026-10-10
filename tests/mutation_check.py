@@ -27,8 +27,9 @@ EQUIVALENT_SURVIVORS = {"M16b"}
 # (id, description, old, new) -- `old` must occur exactly once.
 MUTANTS = [
     ("M1", "cleanup discards dep_id+1", "r = client.discard(dep_id, kind)", "r = client.discard(dep_id + 1, kind)"),
-    ("M2", "existing-draft refusal removed", "    if problems:\n        sys.exit(\n            \"Error: an unpublished",
-     "    if False:\n        sys.exit(\n            \"Error: an unpublished"),
+    ('M2', 'existing-draft refusal removed',
+     '    if problems:\n        die(\n            "Error: an unpublished',
+     '    if False:\n        die(\n            "Error: an unpublished'),
     ("M3", "post-publish verification skipped", "    attempts, got = verify_attempts(), None\n    for k",
      "    return\n    attempts, got = verify_attempts(), None\n    for k"),
     ("M4", "draft verification skipped", "    if got != expected:\n        raise VerificationError(\n            f\"draft",
@@ -103,10 +104,14 @@ MUTANTS = [
     ("C4b", "reconcile published without a record id", '        if not rid:\n            raise ReconcileRefused(', '        if False:\n            raise ReconcileRefused('),
     ("C5", "a draft left behind does not block", "BLOCKING_OUTCOMES = (\"RUNNING\", \"UNRECONCILED\", \"DRAFT-LEFT-BEHIND\", UNSAVED_OUTCOME)", "BLOCKING_OUTCOMES = (\"RUNNING\", \"UNRECONCILED\", UNSAVED_OUTCOME)"),
     ("C6", "Ctrl-C right after publish not caught", "        except BaseException as exc:  # noqa: BLE001 - Ctrl-C right after publish returns (R12) included", "        except Exception as exc:  # noqa: BLE001 - Ctrl-C right after publish returns (R12) included"),
-    ("D1", "sandbox state file may be overwritten", "    if p.exists():\n        sys.exit(f\"Error: --sandbox-state {p} already exists", "    if False:\n        sys.exit(f\"Error: --sandbox-state {p} already exists"),
+    ('D1', 'sandbox state file may be overwritten',
+     '    if p.exists():\n        die(f"Error: --sandbox-state {p} already exists',
+     '    if False:\n        die(f"Error: --sandbox-state {p} already exists'),
     ("D2", "no early writability probe", "            sandbox_slot.reserve()       # writability probe BEFORE any request", "            pass"),
     ("E1", "exception text printed unredacted", "print(f\"!! Error: {type(exc).__name__}: {redact(exc)}\", file=sys.stderr)", "print(f\"!! Error: {type(exc).__name__}: {exc}\", file=sys.stderr)"),
-    ("E2", "token shape not validated", "    if not TOKEN_SHAPE.fullmatch(token):\n        sys.exit(f\"Error: the value of", "    if False:\n        sys.exit(f\"Error: the value of"),
+    ('E2', 'token shape not validated',
+     '    if not TOKEN_SHAPE.fullmatch(token):\n        die(f"Error: the value of',
+     '    if False:\n        die(f"Error: the value of'),
     ("E3", "numeric environment not validated at startup", "        validate_numeric_env()        # every tunable, before any request", "        pass"),
     ("E4", "headers only read from a plain dict", "isinstance(resp.headers, collections.abc.Mapping)", "isinstance(resp.headers, dict)"),
     ("E5", "new-version draft cleaned up like an edit session", "    \"new-version draft\": \"unpublished-new-version-draft\",", "    \"new-version draft\": \"edit-session\","),
@@ -142,16 +147,30 @@ MUTANTS = [
     ("R6", "a succeeded publication reconciled as not-published", "        if data.get(\"outcome\") == UNSAVED_OUTCOME:\n            raise ReconcileRefused(\n                \"the journal says", "        if False:\n            raise ReconcileRefused(\n                \"the journal says"),
     ("R7", "published reconciled without the identifiers to save", "            if not cid or not cdoi:", "            if False:"),
     ("R8", "the config written by a reconcile is not read back", "            if str(check.get(\"zenodo_id\")) != str(cid) or check.get(\"doi\") != cdoi:", "            if False:"),
-    ("R9", "quarantine deletes instead of renaming", "    os.rename(path, target)", "    os.unlink(path)"),
-    ("R10", "quarantine overwrites an earlier quarantined file", "    while target.exists() or target.is_symlink():", "    while False:"),
-    ("R11", "quarantine accepts a readable journal", '    if isinstance(content, dict) and isinstance(content.get("outcome"), str) and content["outcome"] in KNOWN_OUTCOMES:', '    if False:'),
+    ('R9', 'the backup removes the original after copying it',
+     '    return target, sha, True\n',
+     '    os.unlink(path)\n    return target, sha, True\n'),
+    ('R10', 'the backup overwrites an existing file of the same name',
+     '        _create_exclusive_bytes(target, raw)\n    except FileExistsError as exc:',
+     '        target.write_bytes(raw)\n    except FileExistsError as exc:'),
+    ('R11', 'lift-block accepts a journal that has a known outcome and a consistent identity',
+     '    if kind not in LIFTABLE_KINDS:\n        outcome = (data or {}).get("outcome")',
+     '    if False:\n        outcome = (data or {}).get("outcome")'),
     # secrets
     ("S1", "journal values not redacted before writing", '    out = redact_obj(data)\n    out["identity_sha256"]', '    out = dict(data)\n    out["identity_sha256"]'),
-    ("S2", "Bearer strings no longer masked", '    return _BEARER.sub("Bearer [REDACTED]", out)', '    return out'),
-    ("S3", "access_token query strings no longer masked", '    out = _FIELD_EQ.sub(_mask_field, out)', '    out = out'),
-    ("S4", "the tokens loaded in the process are not registered", "    register_environment_secrets()        # the exact tokens loaded in this process are masked everywhere", "    pass"),
+    ('S2', 'bare Bearer / Basic credentials are no longer masked',
+     '_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)',
+     '_PATTERN_PASSES = (_pass_field_colon, _pass_field_eq)'),
+    ('S3', 'access_token query strings (name=value) no longer masked',
+     '_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)',
+     '_PATTERN_PASSES = (_pass_scheme, _pass_field_colon)'),
+    ('S4', 'the tokens loaded in the process are not registered',
+     '    register_environment_secrets()        # BEFORE the arguments are parsed: an argparse error echoes the values it refuses',
+     '    pass'),
     ("S5", "locate_own_state returns an unredacted exception text", "return \"unknown\", None, [rid], f\"cannot read record {rid} ({redact(exc)})\"", "return \"unknown\", None, [rid], f\"cannot read record {rid} ({exc})\""),
-    ("S6", "Authorization header values no longer masked", '    out = _FIELD_COLON.sub(_mask_field, out)', '    out = out'),
+    ('S6', 'Authorization header values (name: value) no longer masked',
+     '_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)',
+     '_PATTERN_PASSES = (_pass_scheme, _pass_field_eq)'),
     # archive
     ("A1c", "an existing archive is judged by size only", "        if existing[\"sha256\"] == src[\"sha256\"]:", "        if existing[\"size\"] == src[\"size\"]:"),
     ("A5", "a symlink at the archive destination is followed", "    if dest.is_symlink():\n        raise ArchiveRefused(f\"{dest} is a symbolic link: refusing", "    if False:\n        raise ArchiveRefused(f\"{dest} is a symbolic link: refusing"),
@@ -170,14 +189,18 @@ MUTANTS = [
     ("U2", "a checksum returned by Zenodo that differs is accepted", "    if value != want:\n        raise VerificationError(f\"Zenodo returned", "    if False:\n        raise VerificationError(f\"Zenodo returned"),
     ("U3", "the upload answer is never compared", "        note = verify_upload_answer(answer, digest)", "        note = None"),
     # durability / bounds
-    ("D1", "no directory fsync after a journal replace", "    os.replace(tmp, path)\n    _fsync_dir(path.parent)\n\n\ndef _create_exclusive_text", "    os.replace(tmp, path)\n\n\ndef _create_exclusive_text"),
+    ('D1', 'no directory fsync after a journal replace',
+     '        raise AtomicWriteError(path, tmp if os.path.lexists(tmp) else None, exc) from exc\n    _fsync_dir(path.parent)',
+     '        raise AtomicWriteError(path, tmp if os.path.lexists(tmp) else None, exc) from exc'),
     ("D2", "directory fsync errors always raised", "            if exc.errno not in (errno.EINVAL, errno.ENOTSUP):", "            if True:"),
     ("D3", "directory fsync errors never raised", "            if exc.errno not in (errno.EINVAL, errno.ENOTSUP):", "            if False:"),
     ("D4", "sandbox state committed with an overwriting replace", "            os.link(self.tmp, self.path)\n", "            os.replace(self.tmp, self.path)\n"),
     ("B8", "GET attempts unbounded", "(\"ZENODO_GET_ATTEMPTS\", DEFAULT_GET_ATTEMPTS, None, False, float(MAX_GET_ATTEMPTS)),", "(\"ZENODO_GET_ATTEMPTS\", DEFAULT_GET_ATTEMPTS, None, False, None),"),
     ("B9", "upper bounds not enforced", "        if maximum is not None and value > maximum:", "        if False:"),
     # --update
-    ("W1", "--set-web-url replaces the whole related_identifiers list", '            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier)', '            payload[key] = copy.deepcopy(entries)'),
+    ('W1', '--set-web-url replaces the whole related_identifiers list',
+     '            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier,\n                                                 previous_web_urls, notes)',
+     '            payload[key] = copy.deepcopy(entries)'),
     ("W2", "an ambiguous web entry is guessed", "    if len(same_role) > 1:", "    if False:"),
     ("W3", "an entry with the same identifier is not replaced in place", "    if exact:\n        items[exact[0]]", "    if False:\n        items[exact[0]]"),
     ("V1", "the reviewed-digest pin may be bare or short", "    if not CONFIRM_SHAPE.fullmatch(pin):", "    if False:"),
@@ -220,14 +243,24 @@ NEW_MUTANTS = [
     ("T11", "an unknown outcome does not block (old fail-open rule)", '        if known and outcome in NON_BLOCKING_OUTCOMES:\n            continue', '        if outcome not in BLOCKING_OUTCOMES:\n            continue'),
     ("T12", "NOT-PUBLISHED-RECONCILED is not a known non-blocking outcome", 'NON_BLOCKING_OUTCOMES = PUBLISHED_OUTCOMES + ("NOT-PUBLISHED", "NOT-PUBLISHED-RECONCILED")', 'NON_BLOCKING_OUTCOMES = PUBLISHED_OUTCOMES + ("NOT-PUBLISHED",)'),
     ("T13", "an unknown-outcome journal is not attributed by its file name", '            if _named_after(path, paper_dir):\n                why.append("file named after this paper")', '            if False:\n                why.append("file named after this paper")'),
-    ("T14", "a readable journal with an unknown outcome cannot be quarantined", '    if isinstance(content, dict) and isinstance(content.get("outcome"), str) and content["outcome"] in KNOWN_OUTCOMES:', '    if isinstance(content, dict):'),
-    ("T15", "the block message omits the quarantine cure of an unknown outcome", '        if data.get("outcome") != "UNREADABLE" and not (isinstance(data.get("outcome"), str)', '        if False and data.get("outcome") != "UNREADABLE" and not (isinstance(data.get("outcome"), str)'),
+    ('T14', 'a readable journal with an unknown outcome cannot be lifted',
+     '    if not (isinstance(outcome, str) and outcome in KNOWN_OUTCOMES):\n        return "unknown-outcome"',
+     '    if not (isinstance(outcome, str) and outcome in KNOWN_OUTCOMES):\n        return None'),
+    ('T15', 'the block message omits the lift-block cure',
+     '        if kind in LIFTABLE_KINDS:\n            reason_text = {',
+     '        if False and kind in LIFTABLE_KINDS:\n            reason_text = {'),
     ("T16", "reconcile of an unknown outcome is not refused as such", '    if not known:\n        raise ReconcileRefused(f"the journal {path.name} has an absent or unknown outcome', '    if False:\n        raise ReconcileRefused(f"the journal {path.name} has an absent or unknown outcome'),
     # F-3 / F-4 validation before any write
-    ("T17", "ids may carry a sign", 'rf"[1-9][0-9]{{0,{MAX_ID_DIGITS - 1}}}"', 'rf"[+-]?[0-9]{{1,{MAX_ID_DIGITS}}}"'),
+    ('T17', 'ids may carry a sign',
+     '    if not _is_ascii_digits(text) or text[0] == "0" or len(text) > MAX_ID_DIGITS:',
+     '    if not _is_ascii_digits(text.lstrip("+-")) or text[0] == "0" or len(text) > MAX_ID_DIGITS:'),
     ("T18", "ids may be arbitrarily long", "MAX_ID_DIGITS = 12", "MAX_ID_DIGITS = 40"),
-    ("T19", "the DOI shape is not checked", '    if not isinstance(doi, str) or not DOI_SHAPE.fullmatch(doi):', '    if not isinstance(doi, str):'),
-    ("T20", "a Zenodo DOI need not carry the concept id", '    if m and concept_id:', '    if False:'),
+    ('T19', 'the DOI shape is not checked',
+     '    if registrant not in allowed or not rest.startswith(DOI_SUFFIX_WORD):',
+     '    if False:'),
+    ('T20', 'a Zenodo DOI need not carry the concept id',
+     '    if concept_id not in (None, "") and number != str(concept_id):',
+     '    if False:'),
     ("T21", "a reason of one character is evidence", "MIN_REASON_CHARS = 10", "MIN_REASON_CHARS = 1"),
     ("T22", "the reason is not stripped before its length is judged", '    text = reason.strip() if isinstance(reason, str) else ""', '    text = reason if isinstance(reason, str) else ""'),
     ("T23", "the record URL host is matched loosely", 'parts.hostname == host and parts.username is None', 'host in (parts.hostname or "") and parts.username is None'),
@@ -235,7 +268,9 @@ NEW_MUTANTS = [
     ("T25", "the record URL need not contain the record id", '    if record_id and not re.search(', '    if False and not re.search('),
     ("T26", "the record id is matched as a substring", 'rf"(?<!\\d){re.escape(str(record_id))}(?!\\d)"', 'rf"{re.escape(str(record_id))}"'),
     ("T27", "credentials in the record URL are accepted", 'and parts.username is None\n              and parts.password is None', 'and True\n              and parts.password is None'),
-    ("T28", "the quarantine reason is not validated", '    reason = validate_reason(reason)\n', '    reason = reason or ""\n'),
+    ('T28', 'the lift-block reason is not validated',
+     '    reason_text = validate_reason(reason)\n    raw = _read_journal_bytes(path)',
+     '    reason_text = reason or ""\n    raw = _read_journal_bytes(path)'),
     ("T29", "the record id is not validated", '    rid = validate_id(record_id, "--record-id") if record_id not in (None, "") else None', '    rid = int(record_id) if record_id not in (None, "") else None'),
     ("T30", "the concept id is not validated", '    cid_arg = validate_id(concept_id, "--concept-id") if concept_id not in (None, "") else None', '    cid_arg = concept_id if concept_id not in (None, "") else None'),
     # F-5 redaction by value and by name
@@ -244,8 +279,12 @@ NEW_MUTANTS = [
     ("T33", "only the production token variable is registered", '    for name in (PRODUCTION_TOKEN_VAR, SANDBOX_TOKEN_VAR):\n        raw = environ.get(name)', '    for name in (PRODUCTION_TOKEN_VAR,):\n        raw = environ.get(name)'),
     ("T34", "Cookie is not a sensitive name", 'r"set[-_]cookie", r"cookie",', 'r"set[-_]cookie",'),
     ("T35", "X-Api-Key is not a sensitive name", 'r"x[-_]api[-_]key", r"api[-_]?key",', 'r"api[-_]?key",'),
-    ("T36", "sensitive names are case-sensitive in dict keys", '_SENSITIVE_KEY = re.compile(rf"(?i)(?:{_NAME_ALT})")', '_SENSITIVE_KEY = re.compile(rf"(?:{_NAME_ALT})")'),
-    ("T37", "the empty string is registered as a secret", '    if isinstance(value, str) and value:\n        _SECRETS.add(value)', '    if isinstance(value, str):\n        _SECRETS.add(value)'),
+    ('T36', 'sensitive names are case-sensitive in dict keys',
+     '_SENSITIVE_KEY = re.compile(rf"(?i)(?:{_NAME_ALT_EQ})")',
+     '_SENSITIVE_KEY = re.compile(rf"(?:{_NAME_ALT_EQ})")'),
+    ('T37', 'the empty string is registered as a secret',
+     '    if isinstance(value, str) and value.strip():\n        _SECRETS.add(value)',
+     '    if isinstance(value, str):\n        _SECRETS.add(value)'),
     ("T38", "the stripped form of a token is not registered", '            register_secret(raw.strip())', '            pass'),
     ("T39", "refresh_token is not a sensitive name", 'r"access[-_]?token", r"refresh[-_]?token",', 'r"access[-_]?token",'),
     ("T40", "client_secret is not a sensitive name", 'r"client[-_]?secret", r"password", r"token")', 'r"password", r"token")'),
@@ -253,28 +292,137 @@ NEW_MUTANTS = [
     ("T42", "Proxy-Authorization is not a sensitive name", '_SENSITIVE_NAMES = (r"proxy[-_]authorization", r"authorization",', '_SENSITIVE_NAMES = (r"authorization",'),
     # N03 related identifiers
     ("T43", "an entry without resource_type is replaced implicitly", '        if target.get("resource_type") is None:', '        if False:'),
-    ("T44", "the cosmochrony.org entry is not preferred among candidates", '    if on_web_host:\n        same_role = on_web_host', '    if False:\n        same_role = on_web_host'),
+    ('T44', 'the cosmochrony.org host is not recognised as the web host among candidates',
+     'web_like = [i for i in same_role if _is_web_host(items[i].get("identifier")) or items[i].get("identifier") in known]',
+     'web_like = [i for i in same_role if items[i].get("identifier") in known]'),
     ("T45", "--replace-related-identifier is ignored", '    if replace_identifier:\n        named =', '    if False:\n        named ='),
     ("T46", "any host ending in cosmochrony.org is the web host", 'return host == WEB_HOST or host.endswith("." + WEB_HOST)', 'return host.endswith(WEB_HOST)'),
     ("T47", "--replace-related-identifier may match several entries", '        if len(named) != 1:', '        if len(named) < 1:'),
-    ("T48", "the web entry is not appended when nothing matches", '    else:\n        items.append(copy.deepcopy(entry))\n    return items\n\n\ndef build_update_payload', '    else:\n        pass\n    return items\n\n\ndef build_update_payload'),
+    ('T48', 'the web entry is not appended when nothing matches',
+     '    items.append(copy.deepcopy(entry))\n    return items\n\n\ndef build_update_payload',
+     '    pass\n    return items\n\n\ndef build_update_payload'),
     # survivors of the review's own run (round 20), now killed by named tests
     ("T49", "get_git_branch hands the whole environment to git", '            check=True,\n            env=git_env(),\n        )', '            check=True,\n        )'),
     ("T50", "git_env keeps every variable (tokens included)", '    return {k: v for k, v in environ.items() if k in _GIT_ENV_KEEP or k.startswith("GIT_")}', '    return dict(environ)'),
     ("RS1", "the block no longer matches on the zenodo.json content hash", '("title", "same title"),\n                               ("config_sha256", "same zenodo.json content")', '("title", "same title")'),
-    ("RS11", "no file fsync in the atomic journal write", '        fh.write(text)\n        _fsync_file(fh)\n    os.replace(tmp, path)', '        fh.write(text)\n    os.replace(tmp, path)'),
+    ('RS11', 'no file fsync in the atomic journal write',
+     '            fh.write(text)\n            _fsync_file(fh)\n        os.replace(tmp, path)',
+     '            fh.write(text)\n        os.replace(tmp, path)'),
     ("RS15", "the pin is compared on its first 4 characters only", "if not digest.startswith(pin):", "if digest[:4] != pin[:4]:"),
     ("RS17", "the exact web-url match ignores the relation", 'and items[i].get("relation") == entry.get("relation")]\n    if exact:', 'and True]\n    if exact:'),
-    ("RS28", "dictionary keys are not redacted in redact_obj", 'return {(redact(k) if isinstance(k, str) else k):', 'return {k:'),
+    ('RS28', 'dictionary keys are not redacted in redact_obj',
+     'return {(redact(k, short_secrets=False) if isinstance(k, str) else k):',
+     'return {k:'),
 ]
-NEW_IDS = {m[0] for m in NEW_MUTANTS}
-MUTANTS = MUTANTS + NEW_MUTANTS
+
+# ── fifth corrective pass (review round 21): N-1 .. N-11 ───────────────────────────────────────────────────────────────
+# A tuple may carry a fifth element, the file it mutates (default zenodo_publish.py).
+PC = "predeposit_check.py"
+NEW5_MUTANTS = [
+    # N-1 / Q6 / Q38: the DOI and the ids
+    ("U1", "ids accept the digits of other scripts (Q6)", "    return isinstance(text, str) and text != \"\" and all(c in ASCII_DIGITS for c in text)",
+     "    return isinstance(text, str) and text != \"\" and text.isdigit()"),
+    ("U2", "ids may have a leading zero", '    if not _is_ascii_digits(text) or text[0] == "0" or len(text) > MAX_ID_DIGITS:',
+     '    if not _is_ascii_digits(text) or len(text) > MAX_ID_DIGITS:'),
+    ("U3", "the DOI number is compared with the concept id by prefix", "and number != str(concept_id):", "and not number.startswith(str(concept_id)):"),
+    ("U4", "any registrant is accepted for a Zenodo concept DOI", "    if registrant not in allowed or not rest.startswith(DOI_SUFFIX_WORD):",
+     '    if not registrant.startswith("10.") or not rest.startswith(DOI_SUFFIX_WORD):'),
+    ("U5", "the word zenodo may be in any case", "not rest.startswith(DOI_SUFFIX_WORD):", "not rest.lower().startswith(DOI_SUFFIX_WORD):"),
+    ("U6", "a different DOI already saved is silently replaced", '            if cfg.get("doi") not in (None, "") and cfg["doi"] != cdoi:', "            if False:"),
+    ("U7", "the concept id read from the journal is not validated (Q38)", 'cid = cid_arg or (validate_id(data.get("concept_id"), "the concept id recorded in the journal")',
+     'cid = cid_arg or (str(data.get("concept_id"))'),
+    ("U8", "both registrants are accepted on every host", "    allowed = [ZENODO_REGISTRANTS[host]] if host in ZENODO_REGISTRANTS else sorted(ZENODO_REGISTRANTS.values())",
+     "    allowed = sorted(ZENODO_REGISTRANTS.values())"),
+    ("U9", "the concept DOI recorded in the journal is not validated",
+     'validate_concept_doi(cdoi, cid, host, "--concept-doi" if concept_doi else "the concept DOI recorded in the journal")', "pass"),
+    ("U10", "a different zenodo_id already saved is accepted", '            if cfg.get("zenodo_id") not in (None, "") and str(cfg["zenodo_id"]) != str(cid):', "            if False:"),
+    ("U11", "a journal host that is not a string is not refused", "    if not isinstance(host, str):\n        raise ReconcileRefused(f\"the journal {path.name} records a host",
+     "    if False:\n        raise ReconcileRefused(f\"the journal {path.name} records a host"),
+    ("U12", "the DOI is not checked against the registrant of the journal's host", "        validate_concept_doi(concept_doi, cid_arg, host)          # the registrant must be this host's", "        pass"),
+    # N-2 / N-5 / N-6: redaction
+    ("U13", "name=value masks the scheme word only (the credential after it leaks)", '_SCHEME_WORDS = r"(?:(?:bearer|basic|digest|negotiate|token)[ \\t]+)?"', '_SCHEME_WORDS = r""'),
+    ("U14", "Basic credentials are not recognised as a scheme", "(?P<scheme>bearer|basic)", "(?P<scheme>bearer)"),
+    ("U15", "percent-encoded names are not decoded", '    return decoded if re.fullmatch(r"[\\w-]+", decoded) else m.group("enc")', '    return m.group("enc")'),
+    ("U16", "X-Auth-Token is not a sensitive name", 'r"x[-_]auth[-_]token", ', ""),
+    ("U17", "ZENODO_TOKEN= assignments are not masked", '_ASSIGNMENT_NAMES = (r"zenodo[-_](?:sandbox[-_])?token",)', "_ASSIGNMENT_NAMES = ()"),
+    ("U18", "ZENODO_TOKEN: in prose is masked too", '_NAME_ALT = "|".join(_SENSITIVE_NAMES)', '_NAME_ALT = "|".join(_ASSIGNMENT_NAMES + _SENSITIVE_NAMES)'),
+    ("U19", "a short secret is replaced as a substring", "        if len(secret) >= MIN_BLIND_SECRET:", "        if True:"),
+    ("U20", "a short secret has no word-boundary rule", '_SHORT_EDGE = (r"(?<![A-Za-z0-9_])", r"(?![A-Za-z0-9_])")', '_SHORT_EDGE = ("", "")'),
+    ("U21", "a dictionary key is masked by a short secret", "redact(k, short_secrets=False)", "redact(k)"),
+    ("U22", "argument-parsing errors are not redacted", "self._print_message(redact(message), sys.stderr)", "self._print_message(message, sys.stderr)"),
+    ("U23", "the environment tokens are registered after the arguments are parsed",
+     "    register_environment_secrets()        # BEFORE the arguments are parsed: an argparse error echoes the values it refuses\n    parser = build_parser()\n    args = parser.parse_args(argv)\n",
+     "    parser = build_parser()\n    args = parser.parse_args(argv)\n    register_environment_secrets()\n"),
+    ("U24", "print does not redact", "    _builtins.print(redact(sep.join(str(a) for a in args)), end=", "    _builtins.print((sep.join(str(a) for a in args)), end="),
+    ("U25", "die does not redact", "    sys.exit(redact(message))", "    sys.exit(message)"),
+    ("U26", "the blind-substitution threshold is one character", "MIN_BLIND_SECRET = 8 ", "MIN_BLIND_SECRET = 1 "),
+    ("U27", "the scheme pass is the only pattern pass", "_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)", "_PATTERN_PASSES = (_pass_scheme,)"),
+    ("U28", "a whitespace-only environment token is registered", "            register_secret(raw.strip())\n", "            register_secret(raw.strip()); _SECRETS.add(raw)\n"),
+    # N-3: --backup-journal / --lift-block (decision-file mechanism)
+    ("V1", "the digest of the journal is not compared with the decision's", 'and decision["journal_sha256"] == current)', "and True)"),
+    ("V2", "a decision is honoured for any journal kind", "    if kind not in LIFTABLE_KINDS:\n        return False\n    dec = decision_path(path)", "    dec = decision_path(path)"),
+    ("V3", "the original journal is modified by the lift", '    decision["decision_path"] = str(dec)', '    path.write_bytes(raw + b"\\n")\n    decision["decision_path"] = str(dec)'),
+    ("V4", "the backup is written by a plain write over an existing file", "        _create_exclusive_bytes(target, raw)\n    except FileExistsError as exc:", "        target.write_bytes(raw)\n    except FileExistsError as exc:"),
+    ("V5", "the decision file is written by a plain write, not an exclusive create", '        _create_exclusive_text(dec, json.dumps(decision, indent=2, ensure_ascii=False) + "\\n")',
+     '        dec.write_text(json.dumps(decision, indent=2, ensure_ascii=False) + "\\n")'),
+    ("V6", "the backup name is unique by timestamp only", '{BACKUP_MARK}{_utc_stamp()}-{sha[:BACKUP_SHA_CHARS]}.json"', '{BACKUP_MARK}{_utc_stamp()}.json"'),
+    ("V7", "the decision's journal name is not compared", 'and decision.get("journal") == path.name', "and True"),
+    ("V8", "the decision's block kind is not compared", 'and decision.get("block_kind") == kind', "and True"),
+    ("V9", "any decision value is taken for UNBLOCK", 'decision.get("decision") == "UNBLOCK"', 'decision.get("decision") is not None'),
+    ("V10", "a symbolic link is accepted as a decision file", "        if dec.is_symlink() or not dec.is_file():", "        if not dec.is_file():"),
+    ("V11", "an existing copy is trusted by its name, not by its sha256", "                    and hashlib.sha256(candidate.read_bytes()).hexdigest() == sha):", "                    ):"),
+    ("V12", "the lift needs no evidence", "    elif checked_account:\n        evidence[\"checked_account\"] = True", "    elif True:\n        evidence[\"checked_account\"] = True"),
+    ("V13", "an existing decision file is not looked for before the lift", "    if dec.exists() or dec.is_symlink():", "    if False:"),
+    ("V14", "the lift makes no backup", "        copy_path, _, _ = backup_journal(path)", "        copy_path = path"),
+    ("V15", "a moved directory is not a liftable kind", '        return "directory"', "        return None"),
+    ("V16", "an identity problem is not a liftable kind", '    if journal_identity_problems(data):\n        return "identity"', "    if journal_identity_problems(data):\n        return None"),
+    ("V17", "the decision records another digest than the journal's", '"journal_sha256": sha, "block_kind": kind', '"journal_sha256": hashlib.sha256(b"").hexdigest(), "block_kind": kind'),
+    ("V18", "--quarantine is accepted silently", '    if args.quarantine:\n        parser.error("--quarantine was removed', '    if False:\n        parser.error("--quarantine was removed'),
+    ("V19", "an unreadable journal is not a liftable kind", 'LIFTABLE_KINDS = ("unreadable", "unknown-outcome", "identity", "directory")', 'LIFTABLE_KINDS = ("unknown-outcome", "identity", "directory")'),
+    ("V20", "the copy is not fsynced before it is linked", '    with open(tmp, "xb") as fh:\n        fh.write(data)\n        _fsync_file(fh)', '    with open(tmp, "xb") as fh:\n        fh.write(data)'),
+    ("V21", "the decision stores no evidence", '"reason": reason_text, "evidence": evidence,', '"reason": reason_text, "evidence": {},'),
+    ("V22", "the block check does not look at decisions", "        if journal_lift_decision_ok(path, data):\n            continue", "        if False:\n            continue"),
+    ("V23", "a published-unsaved lift prints no consequence", '    if info.get("outcome_at_decision") == UNSAVED_OUTCOME:', "    if False:"),
+    # N-4 / N-5: related identifiers
+    ("W2", "a same-role entry of any host is replaced implicitly (old behaviour)", 'web_like = [i for i in same_role if _is_web_host(items[i].get("identifier")) or items[i].get("identifier") in known]', "web_like = list(same_role)"),
+    ("W3", "previous web urls are ignored", ' or items[i].get("identifier") in known]', "]"),
+    ("W4", "a citation can be replaced by name", "        if _protected_entry(items[named[0]]):", "        if False:"),
+    ("W5", "protected relations are matched case-sensitively", 'str(entry.get("relation") or "").lower() in PROTECTED_RELATIONS', 'str(entry.get("relation") or "") in PROTECTED_RELATIONS'),
+    ("W6", "a DOI-scheme entry can be replaced by name", 'or str(entry.get("scheme") or "").lower() == "doi")', "or False)"),
+    ("W7", "the kept foreign entry is not reported", "    for i in same_role:\n        notes.append(", "    for i in []:\n        notes.append("),
+    ("W8", "previous_web_url is not forwarded to the merge", "payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier,\n                                                 previous_web_urls, notes)",
+     "payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier,\n                                                 (), notes)"),
+    ("W9", "previous_web_url is not read from zenodo.json in a real update", "previous_web_urls=previous_web_urls_of(config))", "previous_web_urls=())"),
+    ("W10", "the replaced entry is not reported", '        notes.append(f"replacing the related identifier', '        (lambda *_: None)(f"replacing the related identifier'),
+    ("W11", "a lone typeless foreign entry is appended instead of refused", "    if typeless:\n        if len(same_role) > 1:", "    if False:\n        if len(same_role) > 1:"),
+    ("W12", "previous_web_url accepts any type", '    values = [raw] if isinstance(raw, str) else list(raw) if isinstance(raw, list) else []', '    values = [raw] if isinstance(raw, str) else list(raw) if isinstance(raw, (list, int)) else []'),
+    # N-7: scrubbed environment of every child
+    ("X1", "the battery's sh() hands the whole environment to its child", "text=True, env=child_env())\n    return r.returncode, r.stdout.strip()", "text=True)\n    return r.returncode, r.stdout.strip()", PC),
+    ("X2", "the battery's sh_raw() hands the whole environment to its child", 'text=True, env=child_env())\n    return r.returncode, r.stdout.rstrip("\\n")', 'text=True)\n    return r.returncode, r.stdout.rstrip("\\n")', PC),
+    ("X3", "pdfinfo gets the whole environment", "            check=False,\n            env=child_env(),", "            check=False,", PC),
+    ("X4", "child_env keeps every variable", "    return {k: v for k, v in environ.items() if not _SECRET_NAME.search(k)}", "    return dict(environ)", PC),
+    ("X5", "GH_ variables are not scrubbed", "|^GH_", "", PC),
+    ("X6", "variables named *TOKEN* are not scrubbed", "|TOKEN", "", PC),
+    ("X7", "NETLIFY_ variables are not scrubbed", "|^NETLIFY_", "", PC),
+    ("X8", "ZENODO_ variables are not scrubbed", "(^ZENODO_|", "(", PC),
+    # N-8 / N-9: failed writes
+    ("Z6", "a failed write does not name its temporary file", "raise AtomicWriteError(path, tmp if os.path.lexists(tmp) else None, exc) from exc\n    _fsync_dir(path.parent)",
+     "raise AtomicWriteError(path, None, exc) from exc\n    _fsync_dir(path.parent)"),
+    ("Z7", "a failed write deletes its temporary file", "    except OSError as exc:\n        raise AtomicWriteError(", "    except OSError as exc:\n        os.path.lexists(tmp) and os.unlink(tmp)\n        raise AtomicWriteError("),
+    ("Z8", "a failed config write in a reconcile is a traceback", '                except OSError as exc:\n                    raise ReconcileRefused(f"{exc}. Nothing else was written; the journal still blocks.") from exc',
+     "                except OSError as exc:\n                    raise"),
+    ("Z9", "a failed journal write after the config is a traceback", '        raise ReconcileRefused(f"{exc}.{saved} The journal was NOT updated and still blocks.") from exc', "        raise"),
+]
+NEW5_IDS = {m[0] for m in NEW5_MUTANTS}
+
+NEW_IDS = NEW5_IDS                                # --only-new: the fifth-pass mutants
+MUTANTS = MUTANTS + NEW_MUTANTS + NEW5_MUTANTS
 
 
-def load_mutated(src: str):
-    mod = types.ModuleType("zenodo_publish")
-    mod.__file__ = str(SRC_PATH)
-    exec(compile(src, str(SRC_PATH), "exec"), mod.__dict__)
+def load_mutated(src: str, name: str = "zenodo_publish", path: Path = SRC_PATH):
+    mod = types.ModuleType(name)
+    mod.__file__ = str(path)
+    exec(compile(src, str(path), "exec"), mod.__dict__)
     return mod
 
 
@@ -304,6 +452,9 @@ def shard_of(items, argv):
 
 
 def main() -> int:
+    if "--count" in sys.argv:                          # the numbers the README states, computed from this script
+        print(f"mutants: {len(MUTANTS)}, new: {len(NEW_IDS)}")
+        return 0
     src = SRC_PATH.read_text(encoding="utf-8")
     n, f, e = run_suite(load_mutated(src))
     print(f"baseline: {n} tests, {f} failures, {e} errors", flush=True)
@@ -318,12 +469,33 @@ def main() -> int:
         wanted = set(sys.argv[sys.argv.index("--ids") + 1].split(","))
         mutants = [m for m in mutants if m[0] in wanted]
     mutants = shard_of(mutants, sys.argv[1:])
-    for mid, desc, old, new in mutants:
-        if src.count(old) != 1:
-            print(f"{mid:5} SKIPPED (pattern occurs {src.count(old)} times): {desc}", flush=True)
-            survivors.append(mid)
-            continue
-        n, f, e = run_suite(load_mutated(src.replace(old, new)))
+    real_pc = None
+    for mid, desc, old, new, *target in mutants:
+        if target and target[0] != SRC_PATH.name:        # a mutant of another module (predeposit_check.py)
+            tpath = TOOLS / target[0]
+            tsrc = tpath.read_text(encoding="utf-8")
+            if tsrc.count(old) != 1:
+                print(f"{mid:5} SKIPPED (pattern occurs {tsrc.count(old)} times): {desc}", flush=True)
+                survivors.append(mid)
+                continue
+            stem = tpath.stem
+            sys.path.insert(0, str(TOOLS))
+            real_pc = sys.modules.get(stem)
+            sys.modules[stem] = load_mutated(tsrc.replace(old, new), stem, tpath)
+            try:
+                n, f, e = run_suite(load_mutated(src))
+            finally:
+                if real_pc is not None:
+                    sys.modules[stem] = real_pc
+                else:
+                    sys.modules.pop(stem, None)
+                sys.path.pop(0)
+        else:
+            if src.count(old) != 1:
+                print(f"{mid:5} SKIPPED (pattern occurs {src.count(old)} times): {desc}", flush=True)
+                survivors.append(mid)
+                continue
+            n, f, e = run_suite(load_mutated(src.replace(old, new)))
         killed = (f + e) > 0
         print(f"{mid:5} {'killed  ' if killed else 'SURVIVED'} ({f} failures, {e} errors of {n}): {desc}", flush=True)
         if not killed:
