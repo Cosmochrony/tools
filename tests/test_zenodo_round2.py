@@ -452,7 +452,7 @@ class RunJournal(unittest.TestCase):
 
     def test_reconcile_published_needs_the_record_id_and_can_save_the_ids(self):
         sim = Sim(publish="timeout_pending")
-        root, paper, client, _ = main_with_sim(sim, cfg={"zenodo_id": 5, "doi": "10.0/c"})
+        root, paper, client, _ = main_with_sim(sim, cfg={"zenodo_id": 5, "doi": None})
         (jpath,) = state_dir_for(root).glob("*.run.json")
         code, _, _ = run_main([str(paper), "--reconcile", str(jpath), "--outcome", "published"], {}, root)
         self.assertIn("--record-id", str(code))
@@ -473,7 +473,7 @@ class RunJournal(unittest.TestCase):
         j.update(outcome="UNRECONCILED")
         before = (paper / "zenodo.json").read_text()
         code, out, _ = run_main([str(paper), "--reconcile", str(j.path), "--outcome", "published",
-                                 "--record-id", "9", "--concept-id", "8", "--concept-doi", "10.5072/x"], {}, root)
+                                 "--record-id", "9", "--concept-id", "8", "--concept-doi", "10.5072/zenodo.8"], {}, root)
         self.assertIsNone(code, code)
         self.assertEqual((paper / "zenodo.json").read_text(), before)
 

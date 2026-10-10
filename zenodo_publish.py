@@ -591,9 +591,9 @@ def _env_number(name: str, default: float, environ=None) -> float:
     try:
         value = float(raw)
     except ValueError:
-        sys.exit(f"Error: environment variable {name} must be a number, got {raw!r}")
+        die(f"Error: environment variable {name} must be a number, got {raw!r}")
     if not math.isfinite(value):
-        sys.exit(f"Error: environment variable {name} must be a finite number, got {raw!r}")
+        die(f"Error: environment variable {name} must be a finite number, got {raw!r}")
     return value
 
 
@@ -615,10 +615,10 @@ def validate_numeric_env(environ=None) -> None:
     for name, default, minimum, exclusive, maximum in NUMERIC_ENV:
         value = _env_number(name, default, environ)
         if minimum is not None and (value <= minimum if exclusive else value < minimum):
-            sys.exit(f"Error: environment variable {name} must be "
+            die(f"Error: environment variable {name} must be "
                      f"{'>' if exclusive else '>='} {minimum:g}, got {value:g}")
         if maximum is not None and value > maximum:
-            sys.exit(f"Error: environment variable {name} must be <= {maximum:g}, got {value:g}")
+            die(f"Error: environment variable {name} must be <= {maximum:g}, got {value:g}")
 
 
 # ── Secrets never reach a message (R10) ────────────────────────────────────────
@@ -631,25 +631,49 @@ class InvalidToken(Exception):
     """The token cannot be used as a header value. The message never contains the token."""
 
 
+MIN_BLIND_SECRET = 8        # a registered secret at least this long is replaced wherever it occurs (substring)
+
+
 def register_secret(value) -> None:
-    if isinstance(value, str) and value:
+    """Remember an exact secret. A value that is empty or only whitespace is NEVER registered (it would mask every
+    blank of every message)."""
+    if isinstance(value, str) and value.strip():
         _SECRETS.add(value)
 
 
-_BEARER = re.compile(r"(?i)\bbearer\s+\S+")
 # Sensitive field NAMES, masked whatever the value (headers, query strings, key=value text, JSON-looking text,
 # dict keys). Case-insensitive; "-" and "_" are interchangeable where a name has one.
 _SENSITIVE_NAMES = (r"proxy[-_]authorization", r"authorization", r"set[-_]cookie", r"cookie",
-                    r"x[-_]api[-_]key", r"api[-_]?key", r"access[-_]?token", r"refresh[-_]?token",
+                    r"x[-_]api[-_]key", r"api[-_]?key", r"x[-_]auth[-_]token", r"x[-_]access[-_]token",
+                    r"private[-_]token", r"access[-_]?token", r"refresh[-_]?token",
                     r"client[-_]?secret", r"password", r"token")
+# The names of the two token variables of this tool, recognised in ``NAME=value`` assignments only (a colon after
+# ZENODO_TOKEN is ordinary prose in this tool's own messages).
+_ASSIGNMENT_NAMES = (r"zenodo[-_](?:sandbox[-_])?token",)
 _NAME_ALT = "|".join(_SENSITIVE_NAMES)
-_SENSITIVE_KEY = re.compile(rf"(?i)(?:{_NAME_ALT})")
+_NAME_ALT_EQ = "|".join(_ASSIGNMENT_NAMES + _SENSITIVE_NAMES)
+_SENSITIVE_KEY = re.compile(rf"(?i)(?:{_NAME_ALT_EQ})")
+# An authentication scheme word followed by its credential. Applied FIRST (before any name=value pattern) so that
+# the credential is masked whatever the field it travels in; the credential stops at a quote or a separator.
+_SCHEME = re.compile(r"(?i)\b(?P<scheme>bearer|basic)\s+(?P<cred>[^\s\"'&<>,;]+)")
+_SCHEME_WORDS = r"(?:(?:bearer|basic|digest|negotiate|token)[ \t]+)?"
 # "Name: value" (a header or a JSON/dict member): a quoted value, else the rest of the line.
-_FIELD_COLON = re.compile(rf"(?i)(?<![\w-])(?P<name>{_NAME_ALT})(?P<kq>[\"']?)(?P<sep>\s*:\s*)"
+_FIELD_COLON = re.compile(rf"(?i)(?<![\w-])(?P<name>{_NAME_ALT})(?P<kq>[\"']?)(?P<sep>\s*:\s*|%3[Aa]\s*)"
                           r"(?P<val>\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\r\n]*)")
-# "name=value" (a query string or key=value text): a quoted value, else up to the next separator.
-_FIELD_EQ = re.compile(rf"(?i)(?<![\w-])(?P<name>{_NAME_ALT})(?P<kq>[\"']?)(?P<sep>\s*=\s*)"
-                       r"(?P<val>\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^&\s\"'<>]+)")
+# "name=value" (a query string or key=value text): a quoted value, else (scheme word and) credential up to the next
+# separator.
+_FIELD_EQ = re.compile(rf"(?i)(?<![\w-])(?P<name>{_NAME_ALT_EQ})(?P<kq>[\"']?)(?P<sep>\s*=\s*|%3[Dd])"
+                       rf"(?P<val>\"(?:[^\"\\]|\\.)*\"|'[^']*'|{_SCHEME_WORDS}[^&\s\"'<>]+)")
+# A name written with percent escapes (access%5Ftoken, X%2DApi%2DKey) followed by a separator: decoded before matching
+# so that the name patterns see it. Only a decoded name made of word characters and hyphens is substituted.
+_ENCODED_NAME = re.compile(r"(?<![\w%-])(?P<enc>[\w-]*(?:%[0-9A-Fa-f]{2}[\w-]*)+)(?=[\"']?(?:\s*[:=]|%3[AaDd]))")
+_SHORT_EDGE = (r"(?<![A-Za-z0-9_])", r"(?![A-Za-z0-9_])")
+
+
+def _decode_encoded_name(m) -> str:
+    from urllib.parse import unquote
+    decoded = unquote(m.group("enc"))
+    return decoded if re.fullmatch(r"[\w-]+", decoded) else m.group("enc")
 
 
 def _mask_field(m) -> str:
@@ -658,32 +682,67 @@ def _mask_field(m) -> str:
     return f"{m.group('name')}{m.group('kq')}{m.group('sep')}{quote}[REDACTED]{quote}"
 
 
+def _mask_scheme(m) -> str:
+    return f"{m.group('scheme')} [REDACTED]"
+
+
+def _pass_scheme(text: str) -> str:
+    return _SCHEME.sub(_mask_scheme, text)
+
+
+def _pass_field_colon(text: str) -> str:
+    return _FIELD_COLON.sub(_mask_field, _ENCODED_NAME.sub(_decode_encoded_name, text))
+
+
+def _pass_field_eq(text: str) -> str:
+    return _FIELD_EQ.sub(_mask_field, _ENCODED_NAME.sub(_decode_encoded_name, text))
+
+
+# The pattern passes. Each one is complete on its own (none relies on another having run first), so that the result
+# does not depend on their order; ``redact`` applies the scheme pass first.
+_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)
+
+
 def is_sensitive_name(key) -> bool:
     """True when a header / field / dict key NAME designates a credential, whatever its value."""
-    return isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key.strip().strip("\"'")) is not None
+    if not isinstance(key, str):
+        return False
+    from urllib.parse import unquote
+    return _SENSITIVE_KEY.fullmatch(unquote(key).strip().strip("\"'")) is not None
 
 
-def redact(text) -> str:
-    """str(text) with every registered secret, every credential-named field (Authorization, X-Api-Key, Cookie,
-    Set-Cookie, Proxy-Authorization, access_token, token, refresh_token, client_secret, password ...: headers,
-    query strings, key=value text, JSON-looking text) and any ``Bearer ...`` string replaced. This is the ONLY
-    redaction function: messages, HTTP bodies, exception texts and every value persisted in a run journal go
-    through it."""
+def redact(text, short_secrets: bool = True, passes=None) -> str:
+    """str(text) with every registered secret, every credential-named field (Authorization, X-Api-Key, X-Auth-Token,
+    Cookie, Set-Cookie, Proxy-Authorization, access_token, token, refresh_token, client_secret, password,
+    ZENODO_TOKEN= ...: headers, query strings, key=value text, JSON-looking text, percent-encoded names) and any
+    ``Bearer ...`` / ``Basic ...`` credential replaced. This is the ONLY redaction function: messages, HTTP bodies,
+    exception texts, every printed line and every value persisted in a run journal go through it.
+
+    A registered secret of at least MIN_BLIND_SECRET characters is replaced wherever it occurs. A SHORTER one is
+    replaced only as a whole token (not preceded or followed by a letter, digit or underscore): a blind substring
+    replacement of a 1-2 character secret would mangle every other text, journal keys included (the limit: such a
+    secret glued to other characters is not recognised). ``short_secrets=False`` skips them (used for dictionary
+    keys). ``passes`` is for tests only."""
     out = str(text)
     for secret in sorted(_SECRETS, key=len, reverse=True):
-        out = out.replace(secret, "[REDACTED]")
-    out = _FIELD_COLON.sub(_mask_field, out)
-    out = _FIELD_EQ.sub(_mask_field, out)
-    return _BEARER.sub("Bearer [REDACTED]", out)
+        if len(secret) >= MIN_BLIND_SECRET:
+            out = out.replace(secret, "[REDACTED]")
+        elif short_secrets:
+            out = re.sub(_SHORT_EDGE[0] + re.escape(secret) + _SHORT_EDGE[1], "[REDACTED]", out)
+    for one_pass in (_PATTERN_PASSES if passes is None else passes):
+        out = one_pass(out)
+    return out
 
 
 def redact_obj(obj):
     """``redact`` applied to every string (keys and values) of a JSON-like structure; the value of a
-    credential-named key (header dicts included) is masked whatever it is."""
+    credential-named key (header dicts included) is masked whatever it is. Keys are never touched by a SHORT
+    registered secret (it must not mangle the structure of a journal)."""
     if isinstance(obj, str):
         return redact(obj)
     if isinstance(obj, dict):
-        return {(redact(k) if isinstance(k, str) else k): ("[REDACTED]" if is_sensitive_name(k) else redact_obj(v))
+        return {(redact(k, short_secrets=False) if isinstance(k, str) else k):
+                ("[REDACTED]" if is_sensitive_name(k) else redact_obj(v))
                 for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [redact_obj(v) for v in obj]
@@ -692,14 +751,24 @@ def redact_obj(obj):
 
 def register_environment_secrets(environ=None) -> None:
     """Register the exact tokens loaded in this process: BOTH variables are registered whenever either is
-    present, whatever their length (an empty value is never registered), so that a token of the other
-    environment is also masked if it ever appears in a message or a journal."""
+    present, whatever their length (an empty or whitespace-only value is never registered), so that a token of
+    the other environment is also masked if it ever appears in a message or a journal."""
     environ = os.environ if environ is None else environ
     for name in (PRODUCTION_TOKEN_VAR, SANDBOX_TOKEN_VAR):
         raw = environ.get(name)
         if isinstance(raw, str):
             register_secret(raw)
             register_secret(raw.strip())
+
+
+import builtins as _builtins
+
+
+def print(*args, sep=" ", end="\n", file=None, flush=False):  # noqa: A001 - deliberate: the module's only print
+    """The print of this module: the text is redacted before it is written (every print site of this module goes
+    through ``redact``; ``tests`` check by AST that no other output call exists)."""
+    sep = " " if sep is None else sep
+    _builtins.print(redact(sep.join(str(a) for a in args)), end="\n" if end is None else end, file=file, flush=flush)
 
 
 def die(message) -> "NoReturn":  # noqa: F821
@@ -770,11 +839,11 @@ def resolve_token(sandbox: bool, environ=None) -> str:
     if not token:
         extra = (f" --sandbox never falls back to {PRODUCTION_TOKEN_VAR}: the production token is "
                  "never sent to the sandbox." if sandbox else "")
-        sys.exit(f"Error: {name} environment variable is not set or is empty.{extra} "
+        die(f"Error: {name} environment variable is not set or is empty.{extra} "
                  "(This script reads the process environment only; it does not load tools/.env.) "
                  "Nothing was sent.")
     if not TOKEN_SHAPE.fullmatch(token):
-        sys.exit(f"Error: the value of {name} contains a space, a control character or a non-ASCII "
+        die(f"Error: the value of {name} contains a space, a control character or a non-ASCII "
                  "character (a token is printable ASCII without whitespace); check how it was exported. "
                  "The value is not shown. Nothing was sent.")
     register_secret(token)
@@ -796,11 +865,23 @@ UNSAVED_OUTCOME = "PUBLISHED-UNSAVED"
 BLOCKING_OUTCOMES = ("RUNNING", "UNRECONCILED", "DRAFT-LEFT-BEHIND", UNSAVED_OUTCOME)
 PUBLISHED_OUTCOMES = ("PUBLISHED", "PUBLISHED-RECONCILED")
 # Fail closed (F-2): a journal blocks unless its outcome is in this explicit NON-blocking set. An absent, mistyped
-# or future outcome name therefore BLOCKS; its cure is --reconcile JOURNAL --quarantine --reason TEXT.
+# or future outcome name therefore BLOCKS; its cure is --lift-block JOURNAL --reason TEXT (a decision file; the
+# journal itself is never renamed, edited or deleted).
 NON_BLOCKING_OUTCOMES = PUBLISHED_OUTCOMES + ("NOT-PUBLISHED", "NOT-PUBLISHED-RECONCILED")
 KNOWN_OUTCOMES = BLOCKING_OUTCOMES + NON_BLOCKING_OUTCOMES
 JOURNAL_SUFFIX = ".run.json"
-QUARANTINE_SUFFIX = ".quarantined"
+DECISION_SUFFIX = ".decision.json"            # <journal>.decision.json: the operator's explicit, traceable UNBLOCK decision
+BACKUP_MARK = ".quarantine-copy-"             # <journal minus .json>.quarantine-copy-<UTC stamp>-<sha256 prefix>.json
+BACKUP_SHA_CHARS = 16
+# The kinds of block that no --reconcile can cure (and only those can be lifted by a decision):
+#   unreadable       the file cannot be read or is not a JSON object
+#   unknown-outcome  the outcome is absent or is not one of KNOWN_OUTCOMES
+#   identity         the identity digest is absent or does not match (older version, hand-written, edited)
+#   directory        the paper directory recorded in the journal no longer exists or is no longer what the recorded
+#                    paper_dir resolves to (moved or retargeted)
+# A journal that blocks with a known outcome, a consistent identity and an intact directory is NOT liftable: it is
+# reconciled (--outcome ...).
+LIFTABLE_KINDS = ("unreadable", "unknown-outcome", "identity", "directory")
 
 
 class JournalError(Exception):
@@ -850,13 +931,30 @@ def _temp_sibling(path: Path) -> Path:
     return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
 
 
+class AtomicWriteError(OSError):
+    """``path`` could not be replaced. Policy (N-9): the temporary file is written NEXT TO the target (a rename is
+    atomic only within one filesystem), and when the write fails it is REPORTED and KEPT, never deleted by this tool
+    (nothing here deletes anything the operator has not been told about): ``tmp`` is its path, or None when none
+    exists."""
+
+    def __init__(self, path, tmp, cause):
+        self.path, self.tmp, self.cause = path, tmp, cause
+        left = (f"The temporary file {tmp} was LEFT in place (this tool deletes nothing): look at it, then remove it "
+                "yourself." if tmp is not None else "No temporary file remains.")
+        super().__init__(f"cannot write {path} ({cause}). The file was not replaced. {left}")
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Replace ``path`` atomically: unique temp in the same directory, fsync, os.replace, fsync of the directory."""
+    """Replace ``path`` atomically: unique temp in the same directory, fsync, os.replace, fsync of the directory.
+    A failure before the replace raises AtomicWriteError (the temporary file is kept and named)."""
     tmp = _temp_sibling(path)
-    with open(tmp, "x", encoding="utf-8") as fh:
-        fh.write(text)
-        _fsync_file(fh)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "x", encoding="utf-8") as fh:
+            fh.write(text)
+            _fsync_file(fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise AtomicWriteError(path, tmp if os.path.lexists(tmp) else None, exc) from exc
     _fsync_dir(path.parent)
 
 
@@ -867,6 +965,21 @@ def _create_exclusive_text(path: Path, text: str) -> None:
     tmp = _temp_sibling(path)
     with open(tmp, "x", encoding="utf-8") as fh:
         fh.write(text)
+        _fsync_file(fh)
+    try:
+        os.link(tmp, path)
+    finally:
+        os.unlink(tmp)           # the temp THIS call just created (not a stray found on disk)
+    _fsync_dir(path.parent)
+
+
+def _create_exclusive_bytes(path: Path, data: bytes) -> None:
+    """Create ``path`` with ``data`` only if it does not exist (FileExistsError otherwise, never an overwrite): the
+    bytes are written and fsynced under a unique temp name, then hard-linked to ``path``; the temp name this call
+    created is released. A partial file is never visible under ``path``."""
+    tmp = _temp_sibling(path)
+    with open(tmp, "xb") as fh:
+        fh.write(data)
         _fsync_file(fh)
     try:
         os.link(tmp, path)
@@ -1027,6 +1140,49 @@ def _named_after(path: Path, paper_dir: Path) -> bool:
     return path.name.startswith(re.sub(r"[^A-Za-z0-9_.-]", "_", paper_dir.name) + "-")
 
 
+def journal_block_kind(data):
+    """Why a journal cannot be cured by --reconcile and may be lifted by a decision (one of LIFTABLE_KINDS), or None
+    (a non-blocking journal, or a normal blocking one that has to be reconciled)."""
+    if data is None:
+        return "unreadable"
+    outcome = data.get("outcome")
+    if not (isinstance(outcome, str) and outcome in KNOWN_OUTCOMES):
+        return "unknown-outcome"
+    if outcome in NON_BLOCKING_OUTCOMES:
+        return None
+    if journal_identity_problems(data):
+        return "identity"
+    recorded, real = data.get("paper_dir"), data.get("paper_dir_real")
+    if not (isinstance(recorded, str) and isinstance(real, str) and recorded and real and os.path.isdir(real)
+            and _realpath(recorded) == real and _realpath(real) == real):
+        return "directory"
+    return None
+
+
+def decision_path(journal: Path) -> Path:
+    return journal.with_name(journal.name + DECISION_SUFFIX)
+
+
+def journal_lift_decision_ok(path: Path, data) -> bool:
+    """True when ``<journal>.decision.json`` is an UNBLOCK decision for EXACTLY the bytes this journal has now, for
+    this journal's name and block kind, and the journal is of a liftable kind. Editing the journal afterwards (any
+    byte) makes the decision void: the journal blocks again."""
+    kind = journal_block_kind(data)
+    if kind not in LIFTABLE_KINDS:
+        return False
+    dec = decision_path(path)
+    try:
+        if dec.is_symlink() or not dec.is_file():
+            return False
+        decision = json.loads(dec.read_text(encoding="utf-8"))
+        current = hashlib.sha256(path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        return False
+    return (isinstance(decision, dict) and decision.get("decision") == "UNBLOCK"
+            and decision.get("journal") == path.name and decision.get("block_kind") == kind
+            and isinstance(decision.get("journal_sha256"), str) and decision["journal_sha256"] == current)
+
+
 def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), host=None, identity=None) -> list:
     """Blocking journals that concern this paper. A journal matches when ANY of these holds (all documented):
     the same paper directory (realpath); the same concept id on the same host; on the same host, the same
@@ -1037,9 +1193,12 @@ def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), hos
     here = _realpath(paper_dir)
     blocking = []
     for path, data in load_journals(state_dir):
+        if journal_lift_decision_ok(path, data):
+            continue                      # the operator's recorded decision for exactly this content
         if data is None:
             if _named_after(path, paper_dir):
-                blocking.append((path, {"outcome": "UNREADABLE", "paper_dir": str(paper_dir)}))
+                blocking.append((path, {"outcome": "UNREADABLE", "paper_dir": str(paper_dir),
+                                        "block_kind": "unreadable"}))
             continue
         outcome = data.get("outcome")
         known = isinstance(outcome, str) and outcome in KNOWN_OUTCOMES
@@ -1064,7 +1223,7 @@ def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), hos
             if why:
                 why.append("UNKNOWN OUTCOME (fail closed)")
         if why:
-            blocking.append((path, dict(data, matched_by=why)))
+            blocking.append((path, dict(data, matched_by=why, block_kind=journal_block_kind(data))))
     return blocking
 
 
@@ -1081,25 +1240,31 @@ def blocking_message(blocking: list) -> str:
         host = data.get("host") or PRODUCTION_HOST
         for note in (data.get("notes") or [])[-3:]:
             lines.append(f"    note: {note}")
-        if data.get("outcome") != "UNREADABLE" and not (isinstance(data.get("outcome"), str)
-                                                        and data["outcome"] in KNOWN_OUTCOMES):
-            lines.append(f"    this journal has an absent or unknown outcome ({data.get('outcome')!r}); it blocks "
-                         "because this tool fails closed. After checking "
-                         f"https://{host}/deposit yourself and reading the journal:")
-            lines.append(f"      zenodo_publish.py --reconcile {path} --quarantine --reason \"what you checked\" "
-                         "(renames it to *.quarantined in the same directory; nothing is deleted)")
-            continue
-        if data.get("outcome") == "UNREADABLE":
-            lines.append("    this journal cannot be read: its content is unknown. After checking "
-                         "https://zenodo.org/deposit yourself:")
-            lines.append(f"      zenodo_publish.py --reconcile {path} --quarantine --reason \"what you checked\" "
-                         "(renames it to *.quarantined in the same directory; nothing is deleted)")
+        kind = data.get("block_kind")
+        if kind in LIFTABLE_KINDS:
+            reason_text = {
+                "unreadable": "this journal cannot be read: its content is unknown",
+                "unknown-outcome": (f"this journal has an absent or unknown outcome ({data.get('outcome')!r}); it blocks "
+                                    "because this tool fails closed"),
+                "identity": ("its identity digest is absent or does not match (written by an earlier version of this "
+                             "tool, by hand, or edited): no --reconcile can be tied to it"),
+                "directory": ("the paper directory it records no longer exists or is no longer what it was (moved, or "
+                              "a link retargeted): no --reconcile can be tied to it"),
+            }[kind]
+            lines.append(f"    {reason_text}. After checking https://{host}/deposit yourself and reading the journal:")
+            lines.append(f"      zenodo_publish.py --lift-block {path} --reason \"what you checked\" "
+                         "(--record-url URL | --i-checked-the-account)")
+            lines.append("      (copies the journal beside itself, then writes <journal>.decision.json bound to this exact "
+                         "content; the journal is never renamed, edited or deleted. --backup-journal makes the copy alone.)")
+            if data.get("outcome") == UNSAVED_OUTCOME:
+                lines.append("      The journal says the publication SUCCEEDED: lifting the block does not undo that. Do "
+                             "NOT re-run the deposit; set zenodo_id and doi in zenodo.json by hand from the record page.")
             continue
         lines.append(f"    inspect: https://{host}/deposit  and  https://{host}/record/{data.get('deposition_id')}")
         if data.get("outcome") == UNSAVED_OUTCOME:
             lines.append("    The publication SUCCEEDED but the local state was not saved: a re-run would publish a "
-                         "duplicate. Write it down with (this tool writes only the paper directory recorded in "
-                         "the journal, nothing is sent):")
+                         "duplicate. Write it down with (this tool writes only <paper_dir_real>/zenodo.json, the real "
+                         "path recorded in the journal; nothing is sent):")
             lines.append(f"      zenodo_publish.py --reconcile {path} --outcome published --record-id N "
                          "--concept-id C --concept-doi D")
             continue
@@ -1122,37 +1287,52 @@ def read_journal_strict(path: Path) -> dict:
     except (OSError, ValueError) as exc:
         raise ReconcileRefused(
             f"cannot read the journal {path} ({redact(exc)}). If it is corrupt, after checking the account "
-            f"yourself: --reconcile {path} --quarantine --reason \"...\" (renames it, deletes nothing)") from exc
+            f"yourself: --lift-block {path} --reason \"...\" (--record-url URL | --i-checked-the-account); the "
+            "journal itself is never renamed, edited or deleted") from exc
     if not isinstance(data, dict):
-        raise ReconcileRefused(f"the journal {path} is not a JSON object. Use --quarantine (see --help).")
+        raise ReconcileRefused(f"the journal {path} is not a JSON object, so it cannot be read as a journal. "
+                               "After checking the account yourself: --lift-block (see --help).")
     return data
 
 
 MAX_ID_DIGITS = 12
 MIN_REASON_CHARS = 10
-DOI_SHAPE = re.compile(r"10\.\d{4,9}/\S+")
-ZENODO_DOI_PREFIX = re.compile(r"(?i)10\.5281/zenodo\.(.*)")
+# The registrant (DOI prefix) of the Zenodo hosts: a Zenodo concept DOI is exactly <registrant>/zenodo.<concept id>.
+ZENODO_REGISTRANTS = {PRODUCTION_HOST: "10.5281", SANDBOX_HOST: "10.5072"}
+DOI_SUFFIX_WORD = "zenodo."
+ASCII_DIGITS = "0123456789"
+
+
+def _is_ascii_digits(text) -> bool:
+    """True for a non-empty str made only of the characters 0-9 (NOT str.isdigit / isdecimal / ``\\d``: they accept
+    the digits of other scripts)."""
+    return isinstance(text, str) and text != "" and all(c in ASCII_DIGITS for c in text)
 
 
 def validate_id(value, what: str) -> str:
-    """A positive integer written as digits only (no sign, space or leading zero), at most MAX_ID_DIGITS long."""
+    """A positive integer written as ASCII digits only (no sign, space or leading zero), at most MAX_ID_DIGITS long."""
     text = str(value) if isinstance(value, int) and not isinstance(value, bool) else value
-    if not isinstance(text, str) or not re.fullmatch(rf"[1-9][0-9]{{0,{MAX_ID_DIGITS - 1}}}", text):
+    if not _is_ascii_digits(text) or text[0] == "0" or len(text) > MAX_ID_DIGITS:
         raise ReconcileRefused(f"{what} must be a positive integer written as digits only (no sign, space or "
                                f"leading zero, at most {MAX_ID_DIGITS} digits), got {redact(value)!r}. Nothing was written.")
     return text
 
 
-def validate_concept_doi(doi, concept_id) -> str:
-    """``10.<4-9 digits>/<non-blank suffix>``; a Zenodo DOI (10.5281/zenodo.N) must carry the concept id itself."""
-    if not isinstance(doi, str) or not DOI_SHAPE.fullmatch(doi):
-        raise ReconcileRefused(f"--concept-doi must look like 10.NNNN/suffix (no space), got {redact(doi)!r}. "
-                               "Nothing was written.")
-    m = ZENODO_DOI_PREFIX.fullmatch(doi)
-    if m and concept_id:
-        if not re.fullmatch(r"\d+", m.group(1)) or int(m.group(1)) != int(concept_id):
-            raise ReconcileRefused(f"--concept-doi {doi} embeds Zenodo record number {m.group(1)!r} but the concept id "
-                                   f"is {concept_id}: they must be equal. Nothing was written.")
+def validate_concept_doi(doi, concept_id, host=None, what: str = "--concept-doi") -> str:
+    """EXACTLY ``<registrant>/zenodo.<concept id>`` in ASCII: registrant 10.5281 (production), or 10.5072 for the
+    sandbox when ``host`` says so (either, when ``host`` is None); the word ``zenodo.`` in lower case; the number
+    validated like any id (ASCII digits only, no leading zero, no whitespace) and, when the concept id is known,
+    EQUAL to it (string equality: not a prefix, not a numeric comparison). Any other registrant or shape is refused."""
+    registrant, _, rest = doi.partition("/") if isinstance(doi, str) else ("", "", "")
+    allowed = [ZENODO_REGISTRANTS[host]] if host in ZENODO_REGISTRANTS else sorted(ZENODO_REGISTRANTS.values())
+    if registrant not in allowed or not rest.startswith(DOI_SUFFIX_WORD):
+        raise ReconcileRefused(f"{what} must be exactly {' or '.join(a + '/zenodo.<concept id>' for a in allowed)} "
+                               f"(the Zenodo registrant, ASCII, no case or whitespace variant, no other registrant), got "
+                               f"{redact(doi)!r}. Nothing was written.")
+    number = validate_id(rest[len(DOI_SUFFIX_WORD):], f"the number of {what}")
+    if concept_id not in (None, "") and number != str(concept_id):
+        raise ReconcileRefused(f"{what} {doi} embeds Zenodo record number {number!r} but the concept id is "
+                               f"{concept_id}: they must be equal. Nothing was written.")
     return doi
 
 
@@ -1204,13 +1384,16 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
     known = isinstance(data.get("outcome"), str) and data["outcome"] in KNOWN_OUTCOMES
     if not known:
         raise ReconcileRefused(f"the journal {path.name} has an absent or unknown outcome ({data.get('outcome')!r}): "
-                               f"it cannot be reconciled. After checking the account yourself: --reconcile {path} "
-                               "--quarantine --reason \"what you checked\" (renames it, deletes nothing)")
+                               f"it cannot be reconciled. After checking the account yourself: --lift-block {path} "
+                               "--reason \"what you checked\" (--record-url URL | --i-checked-the-account); the journal "
+                               "itself is never renamed, edited or deleted")
     if data["outcome"] not in BLOCKING_OUTCOMES:
         raise ReconcileRefused(f"the journal {path.name} is not unreconciled (outcome {data.get('outcome')!r}).")
     problems = journal_identity_problems(data)
     if problems:
-        raise ReconcileRefused(f"the journal {path.name} cannot be trusted: {problems[0]}. Nothing was written.")
+        raise ReconcileRefused(f"the journal {path.name} cannot be trusted: {problems[0]}. Nothing was written. If you "
+                               f"have checked the account and no reconcile can apply: --lift-block {path} --reason "
+                               "\"what you checked\" (--record-url URL | --i-checked-the-account).")
     jdir = data.get("paper_dir")
     if not jdir:
         raise ReconcileRefused(f"the journal {path.name} records no paper directory: it cannot be reconciled "
@@ -1221,6 +1404,8 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
             f"the journal belongs to the paper directory {jdir}, not {paper_dir_arg}: refusing. A reconcile "
             "writes only the paper directory recorded in the journal.")
     host = data.get("host") or PRODUCTION_HOST
+    if concept_doi not in (None, ""):
+        validate_concept_doi(concept_doi, cid_arg, host)          # the registrant must be this host's
     evidence = {}
     if outcome == "published":
         if not rid:
@@ -1229,7 +1414,7 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
                           if data.get("concept_id") else None)
         cdoi = concept_doi or data.get("concept_doi")
         if cdoi:
-            validate_concept_doi(cdoi, cid)
+            validate_concept_doi(cdoi, cid, host, "--concept-doi" if concept_doi else "the concept DOI recorded in the journal")
         writes_config = not data.get("sandbox") and data.get("kind") != "update"
         if writes_config:
             if not cid or not cdoi:
@@ -1246,10 +1431,14 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
                 raise ReconcileRefused(
                     f"the journal records paper_dir {jdir} but its realpath is now {_realpath(jdir)}, not the "
                     f"recorded paper_dir_real {recorded_real} (a symbolic link was retargeted, or the journal was "
-                    "edited): refusing. Nothing was written.")
+                    "edited): refusing. Nothing was written. (If you have checked the account, --lift-block "
+                    f"{path} lifts the block; it does not save any identifier.)")
             if not os.path.isdir(recorded_real):
                 raise ReconcileRefused(f"the paper directory recorded in the journal ({recorded_real}) no longer "
-                                       "exists: refusing. Nothing was written.")
+                                       "exists: refusing. Nothing was written. (If you have checked the account, "
+                                       f"--lift-block {path} lifts the block; it does not save any identifier: if the "
+                                       "journal says PUBLISHED-UNSAVED the publication happened, so set zenodo_id and "
+                                       "doi by hand and do NOT re-run the deposit.)")
             cfg_path = Path(recorded_real) / "zenodo.json"
             try:
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -1266,11 +1455,19 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
                     "started: it is not the file this journal was written for, nothing written. Restore it (git "
                     "diff shows the change) and reconcile again.")
             if cfg.get("zenodo_id") not in (None, "") and str(cfg["zenodo_id"]) != str(cid):
-                raise ReconcileRefused(f"{cfg_path} already has zenodo_id {cfg['zenodo_id']} but you assert "
+                raise ReconcileRefused(f"{cfg_path} already has zenodo_id {cfg['zenodo_id']!r} but you assert "
                                        f"concept {cid}: another concept, nothing written.")
+            if cfg.get("doi") not in (None, "") and cfg["doi"] != cdoi:
+                # no silent substitution: an existing DOI is never overwritten by a different one (an identical one is fine)
+                raise ReconcileRefused(f"{cfg_path} already has doi {cfg['doi']!r} but you assert {cdoi!r}: a DOI already "
+                                       "saved is never replaced by a different one. Nothing was written. If the saved "
+                                       "one is wrong, correct it by hand first.")
             if str(cfg.get("zenodo_id")) != str(cid) or cfg.get("doi") != cdoi:
                 cfg["zenodo_id"], cfg["doi"] = int(cid), cdoi
-                _atomic_write_text(cfg_path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+                try:
+                    _atomic_write_text(cfg_path, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+                except OSError as exc:
+                    raise ReconcileRefused(f"{exc}. Nothing else was written; the journal still blocks.") from exc
             check = json.loads(cfg_path.read_text(encoding="utf-8"))
             if str(check.get("zenodo_id")) != str(cid) or check.get("doi") != cdoi:
                 raise ReconcileRefused(f"{cfg_path} does not hold the identifiers after writing: check it by hand")
@@ -1301,39 +1498,147 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
     data["operator_evidence"] = evidence
     data["reconciled_at"] = _now()
     data.setdefault("notes", []).append(f"{_now()} reconciled by the operator: {outcome} {evidence}")
-    _atomic_write_text(path, _journal_text(data))
+    try:
+        _atomic_write_text(path, _journal_text(data))
+    except OSError as exc:
+        saved = (f" {evidence['config_written']} ALREADY holds the identifiers (the same command can be run again: an "
+                 "identical value is accepted)." if evidence.get("config_written") else "")
+        raise ReconcileRefused(f"{exc}.{saved} The journal was NOT updated and still blocks.") from exc
     return data
 
 
-def quarantine_journal(path: Path, reason: str) -> Path:
-    """Rename an UNREADABLE journal to <name>.quarantined (same directory, never deleted, never over a file).
-    Prints the path and the size of the corrupt content first. A readable journal is refused."""
+def _utc_stamp() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _read_journal_bytes(path: Path) -> bytes:
     if not path.name.endswith(JOURNAL_SUFFIX):
         raise ReconcileRefused(f"{path} is not a run journal (*{JOURNAL_SUFFIX})")
-    reason = validate_reason(reason)
     try:
-        size = path.stat().st_size
+        if path.is_symlink() or not path.is_file():
+            raise ReconcileRefused(f"{path} is not a regular file")
+        return path.read_bytes()
     except OSError as exc:
-        raise ReconcileRefused(f"cannot stat {path} ({redact(exc)})") from exc
+        raise ReconcileRefused(f"cannot read {path} ({redact(exc)})") from exc
+
+
+def _backup_name(path: Path, sha: str) -> str:
+    return f"{path.name[:-len('.json')]}{BACKUP_MARK}{_utc_stamp()}-{sha[:BACKUP_SHA_CHARS]}.json"
+
+
+def find_journal_backup(path: Path, sha: str):
+    """An existing copy of ``path`` beside it whose bytes have exactly this sha256, or None."""
+    prefix = f"{path.name[:-len('.json')]}{BACKUP_MARK}"
+    for candidate in sorted(path.parent.glob(f"{glob_escape(prefix)}*-{sha[:BACKUP_SHA_CHARS]}.json")):
+        try:
+            if (candidate.is_file() and not candidate.is_symlink()
+                    and hashlib.sha256(candidate.read_bytes()).hexdigest() == sha):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def glob_escape(text: str) -> str:
+    import glob
+    return glob.escape(text)
+
+
+def backup_journal(path: Path):
+    """COPY ``path`` to ``<name minus .json>.quarantine-copy-<UTC stamp>-<sha256 prefix>.json`` in the same directory
+    (exclusive create + fsync: an existing file is never overwritten). The original is only read, never renamed,
+    modified or deleted, and nothing is unblocked. An earlier identical copy is reused. Returns
+    (copy path, sha256 of the original, created)."""
+    raw = _read_journal_bytes(path)
+    sha = hashlib.sha256(raw).hexdigest()
+    existing = find_journal_backup(path, sha)
+    if existing is not None:
+        return existing, sha, False
+    target = path.with_name(_backup_name(path, sha))
     try:
-        content = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        content = None
-    # a journal that can be read AND carries a known outcome is reconciled, not quarantined; one with an absent or
-    # unknown outcome (which blocks, fail closed) has no other cure
-    if isinstance(content, dict) and isinstance(content.get("outcome"), str) and content["outcome"] in KNOWN_OUTCOMES:
-        raise ReconcileRefused(f"{path} is a readable journal: use --outcome published|not-published")
-    print(f"Journal to quarantine: {path} ({size} bytes; unreadable, or with an absent/unknown outcome). It will be renamed, not deleted.")
-    target = path.with_name(path.name + QUARANTINE_SUFFIX)
-    n = 0
-    while target.exists() or target.is_symlink():
-        n += 1
-        target = path.with_name(f"{path.name}{QUARANTINE_SUFFIX}.{n}")
-    os.rename(path, target)
-    _fsync_dir(path.parent)
-    note = target.with_name(target.name + ".note.txt")
-    _create_exclusive_text(note, redact(f"quarantined {_now()}: {reason}\n"))
-    return target
+        _create_exclusive_bytes(target, raw)
+    except FileExistsError as exc:
+        if target.is_file() and not target.is_symlink() and hashlib.sha256(target.read_bytes()).hexdigest() == sha:
+            return target, sha, False
+        raise ReconcileRefused(f"{target} already exists and does not hold this journal: refusing to overwrite it. "
+                               "Run the command again (the name carries the time) or move that file by hand.") from exc
+    except OSError as exc:
+        raise ReconcileRefused(f"cannot write the backup copy {target} ({redact(exc)}). Nothing was changed.") from exc
+    return target, sha, True
+
+
+def _operator() -> str:
+    import getpass
+    import platform
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001
+        user = "unknown-user"
+    return f"{user}@{platform.node() or 'unknown-host'}"
+
+
+def lift_block(path: Path, reason, record_url=None, checked_account=False) -> dict:
+    """Record the operator's decision to UNBLOCK a journal that no reconcile can cure (kinds in LIFTABLE_KINDS), and
+    nothing else: the journal is not renamed, modified or deleted. Steps: validate the evidence; make sure a backup
+    copy with the same sha256 exists (make it if not); write ``<journal>.decision.json`` by exclusive create (a
+    second lift is refused), recording the journal's sha256, who, when, the reason, the evidence and the decision.
+    The block check honours it only while the journal still has exactly these bytes."""
+    reason_text = validate_reason(reason)
+    raw = _read_journal_bytes(path)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        data = None
+    data = data if isinstance(data, dict) else None
+    kind = journal_block_kind(data)
+    if kind not in LIFTABLE_KINDS:
+        outcome = (data or {}).get("outcome")
+        raise ReconcileRefused(
+            f"the journal {path.name} is not of a kind a decision can lift (outcome {outcome!r}, identity and paper "
+            "directory consistent, or not blocking): reconcile it with --reconcile JOURNAL --outcome published|"
+            "not-published. Nothing was written.")
+    host_names = [(data or {}).get("host")] if (data or {}).get("host") else [PRODUCTION_HOST, SANDBOX_HOST]
+    evidence = {}
+    if record_url:
+        known_id = (data or {}).get("record_id") or (data or {}).get("deposition_id")
+        last = None
+        for host_name in host_names:
+            try:
+                evidence["record_url"] = validate_record_url(record_url, host_name, known_id)
+                break
+            except ReconcileRefused as exc:
+                last = exc
+        else:
+            raise last
+    elif checked_account:
+        evidence["checked_account"] = True
+    else:
+        raise ReconcileRefused("--lift-block needs evidence: --record-url URL (the record/draft page you inspected) "
+                               "or --i-checked-the-account. Nothing was written.")
+    dec = decision_path(path)
+    if dec.exists() or dec.is_symlink():
+        raise ReconcileRefused(f"{dec} already exists: a decision is never overwritten or repeated. If the journal was "
+                               "edited after that decision (it blocks again) move the old decision file aside BY HAND "
+                               "(this tool deletes nothing), then lift again. Nothing was written.")
+    sha = hashlib.sha256(raw).hexdigest()
+    copy_path = find_journal_backup(path, sha)
+    if copy_path is None:
+        copy_path, _, _ = backup_journal(path)
+    decision = redact_obj({
+        "schema": 1, "decision": "UNBLOCK", "journal": path.name, "journal_path": str(path),
+        "journal_sha256": sha, "block_kind": kind, "outcome_at_decision": (data or {}).get("outcome"),
+        "backup": copy_path.name, "backup_sha256": hashlib.sha256(copy_path.read_bytes()).hexdigest(),
+        "decided_by": _operator(), "decided_at": _now(), "reason": reason_text, "evidence": evidence,
+        "tool": "zenodo_publish.py"})
+    try:
+        _create_exclusive_text(dec, json.dumps(decision, indent=2, ensure_ascii=False) + "\n")
+    except FileExistsError as exc:
+        raise ReconcileRefused(f"{dec} appeared meanwhile: a decision is never overwritten. Nothing was written.") from exc
+    except OSError as exc:
+        raise ReconcileRefused(f"cannot write the decision file {dec} ({redact(exc)}). The journal still blocks.") from exc
+    decision["decision_path"] = str(dec)
+    decision["backup_path"] = str(copy_path)
+    return decision
 
 
 def journal_kind(data: dict) -> str:
@@ -1843,7 +2148,7 @@ def resolve_code_url(paper_dir: Path, config: dict) -> str:
     if remote and re.fullmatch(r"[\w.-]+/[\w.-]+", slug):
         return f"https://github.com/{slug}/tree/main/code"
 
-    sys.exit(
+    die(
         f"Error: {paper_dir.name} has a code/ directory but no resolvable code URL.\n"
         f"Its git remote is {remote or '(none)'}, which is not a GitHub repository.\n"
         'Add "code_url": "https://github.com/Cosmochrony/<repo>/tree/main/code" to zenodo.json.'
@@ -1984,26 +2289,44 @@ def _is_web_host(identifier) -> bool:
     return host == WEB_HOST or host.endswith("." + WEB_HOST)
 
 
-def merge_related_web_url(live_list, entry: dict, replace_identifier=None) -> list:
+# A related identifier of one of these relations, or a DOI-scheme one, is a citation / reference: never replaceable.
+PROTECTED_RELATIONS = ("cites", "iscitedby", "references", "isreferencedby")
+
+
+def _protected_entry(entry: dict) -> bool:
+    return (str(entry.get("relation") or "").lower() in PROTECTED_RELATIONS
+            or str(entry.get("scheme") or "").lower() == "doi")
+
+
+def merge_related_web_url(live_list, entry: dict, replace_identifier=None, previous_web_urls=(), notes=None) -> list:
     """The live ``related_identifiers`` with ONLY the web-page entry replaced or inserted; every other entry
-    (cites, isSupplementedBy of another resource, ...) is kept untouched and in place. Never an implicit
-    replacement of an entry whose role is not stated (N03).
+    (cites DOIs, another host's isSupplementedBy link, ...) is kept untouched and in place. Never an implicit
+    replacement of an entry whose role is not stated, nor of a foreign one (N03, N-4).
 
     1. ``replace_identifier`` (--replace-related-identifier, the operator's explicit choice): the single live entry
-       with that identifier is replaced, whatever its relation or resource_type; none: refused.
+       whose identifier equals it exactly is replaced; zero or several matches are refused, and so is an entry of
+       relation cites / isCitedBy / references (or of scheme doi), which is never replaceable.
     2. The live entry with the same identifier AND relation is replaced in place.
-    3. Otherwise the candidates are the live entries with the same relation and scheme whose resource_type is the
-       web entry's or absent. If some candidate's host is cosmochrony.org only those remain. Several candidates:
-       refused as ambiguous. Exactly one: it is replaced if it states the same resource_type; if it states none it
-       is NOT replaced implicitly: refused, naming it (pass --replace-related-identifier IDENTIFIER to replace it).
-    4. No candidate: the entry is appended."""
+    3. A candidate is admissible when ALL hold: the same relation (isSupplementedBy), scheme (url) and resource_type
+       (other) as the web entry, AND its identifier is on cosmochrony.org, or equals the new value, or equals a
+       previously recorded web_url of this paper (``previous_web_urls``). One admissible candidate is replaced,
+       several are refused as ambiguous. An entry of that relation/scheme that states NO resource_type is never
+       replaced implicitly (refused, naming it) unless it is on cosmochrony.org / the new value / a previous value
+       and is then treated as a candidate that must be named.
+    4. Otherwise the entry is appended; a same-role entry of another host is kept (reported in ``notes``)."""
     items = copy.deepcopy(live_list) if isinstance(live_list, list) else []
     dicts = [i for i, e in enumerate(items) if isinstance(e, dict)]
+    notes = notes if notes is not None else []
     if replace_identifier:
         named = [i for i in dicts if items[i].get("identifier") == replace_identifier]
         if len(named) != 1:
             raise ValueError(f"--replace-related-identifier {replace_identifier!r} matches {len(named)} live "
                              "related identifiers (it must match exactly one)")
+        if _protected_entry(items[named[0]]):
+            raise ValueError(f"--replace-related-identifier {replace_identifier!r} designates an entry of relation "
+                             f"{items[named[0]].get('relation')!r} / scheme {items[named[0]].get('scheme')!r}: a "
+                             "citation, a reference or a DOI is never replaceable")
+        notes.append(f"replacing the related identifier {json.dumps(items[named[0]], ensure_ascii=False, sort_keys=True)}")
         items[named[0]] = copy.deepcopy(entry)
         return items
     exact = [i for i in dicts if items[i].get("identifier") == entry.get("identifier")
@@ -2011,30 +2334,46 @@ def merge_related_web_url(live_list, entry: dict, replace_identifier=None) -> li
     if exact:
         items[exact[0]] = copy.deepcopy(entry)
         return items
+    known = {entry.get("identifier"), *(u for u in previous_web_urls if isinstance(u, str) and u)}
     same_role = [i for i in dicts if items[i].get("relation") == entry.get("relation")
                  and items[i].get("scheme") == entry.get("scheme")
                  and items[i].get("resource_type") in (None, entry.get("resource_type"))]
-    on_web_host = [i for i in same_role if _is_web_host(items[i].get("identifier"))]
-    if on_web_host:
-        same_role = on_web_host
-    if len(same_role) > 1:
-        raise ValueError(f"{len(same_role)} live related identifiers have the same relation/scheme/resource_type "
-                         "as the web page entry: cannot tell which one is the web url; edit it by hand, or name "
-                         "it with --replace-related-identifier IDENTIFIER")
-    if same_role:
-        target = items[same_role[0]]
+    web_like = [i for i in same_role if _is_web_host(items[i].get("identifier")) or items[i].get("identifier") in known]
+    if web_like:
+        if len(web_like) > 1:
+            raise ValueError(f"{len(web_like)} live related identifiers have the same relation/scheme/resource_type "
+                             "as the web page entry and are on cosmochrony.org or are known web urls of this paper: "
+                             "cannot tell which one is the web url; edit it by hand, or name it with "
+                             "--replace-related-identifier IDENTIFIER")
+        target = items[web_like[0]]
         if target.get("resource_type") is None:
             raise ValueError(f"the only live candidate for the web url entry ({target.get('identifier')!r}, "
                              f"relation {target.get('relation')!r}, scheme {target.get('scheme')!r}) states no "
                              "resource_type: it is not replaced implicitly. If it IS the web page entry, re-run with "
                              f"--replace-related-identifier {target.get('identifier')}")
-        items[same_role[0]] = copy.deepcopy(entry)
-    else:
-        items.append(copy.deepcopy(entry))
+        items[web_like[0]] = copy.deepcopy(entry)
+        return items
+    typeless = [i for i in same_role if items[i].get("resource_type") is None]
+    if typeless:
+        if len(same_role) > 1:
+            raise ValueError(f"{len(same_role)} live related identifiers have the same relation/scheme/resource_type "
+                             "as the web page entry: cannot tell which one is the web url; edit it by hand, or name "
+                             "it with --replace-related-identifier IDENTIFIER")
+        target = items[typeless[0]]
+        raise ValueError(f"the only live candidate for the web url entry ({target.get('identifier')!r}, "
+                         f"relation {target.get('relation')!r}, scheme {target.get('scheme')!r}) states no "
+                         "resource_type: it is not replaced implicitly. If it IS the web page entry, re-run with "
+                         f"--replace-related-identifier {target.get('identifier')}")
+    for i in same_role:
+        notes.append(f"kept the related identifier {items[i].get('identifier')!r} (relation "
+                     f"{items[i].get('relation')!r}, resource_type {items[i].get('resource_type')!r}): another host, "
+                     "not the web page entry; the web entry is appended")
+    items.append(copy.deepcopy(entry))
     return items
 
 
-def build_update_payload(live: dict, built: dict, fields, code_url: str = "", replace_identifier=None) -> dict:
+def build_update_payload(live: dict, built: dict, fields, code_url: str = "", replace_identifier=None,
+                         previous_web_urls=(), notes=None) -> dict:
     """The metadata to PUT: a deep copy of ``live`` with ONLY the requested fields replaced."""
     payload = copy.deepcopy(live)
     for field in sorted(fields):
@@ -2049,7 +2388,8 @@ def build_update_payload(live: dict, built: dict, fields, code_url: str = "", re
             entries = built.get("related_identifiers") or []
             if len(entries) != 1:
                 raise ValueError("field 'web-url' was requested but the local state has no web_url")
-            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier)
+            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier,
+                                                 previous_web_urls, notes)
         elif key in built:
             payload[key] = copy.deepcopy(built[key])
         else:
@@ -2148,7 +2488,7 @@ def refuse_if_unpublished_state(client, zenodo_id, latest_id: int, host: str):
         die(f"Error: cannot determine whether a draft already exists ({redact(exc)}). "
             "Nothing was created. Refusing to proceed.")
     if problems:
-        sys.exit(
+        die(
             "Error: an unpublished draft/edit session of this concept already exists:\n  "
             + "\n  ".join(problems)
             + f"\nNothing was created and nothing was discarded. Inspect https://{host}/deposit "
@@ -2465,8 +2805,18 @@ def verify_upload_answer(answer, digest: dict):
     return f"{name} {value} matches the bytes sent"
 
 
+def previous_web_urls_of(config: dict) -> tuple:
+    """The web page url(s) this paper had before the current ``web_url``, as recorded by hand in zenodo.json
+    (``previous_web_url``: a string or a list of strings); they identify the paper's own live web entry when its url
+    changed (the only way a non-cosmochrony.org entry is replaced without --replace-related-identifier)."""
+    raw = config.get("previous_web_url") if isinstance(config, dict) else None
+    values = [raw] if isinstance(raw, str) else list(raw) if isinstance(raw, list) else []
+    return tuple(v for v in values if isinstance(v, str) and v)
+
+
 def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, env_label: str,
-                   host: str, on_published=None, fields=(), confirm=None, replace_identifier=None) -> tuple[int, str | None]:
+                   host: str, on_published=None, fields=(), confirm=None, replace_identifier=None,
+                   previous_web_urls=()) -> tuple[int, str | None]:
     """--update: metadata-only edit in place. Returns (dep_id, doi).
 
     The PUT is the LIVE metadata with ONLY ``fields`` replaced. Before anything is created the whole-metadata
@@ -2486,10 +2836,14 @@ def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, 
     if not isinstance(live, dict) or not live:
         die(f"Error: the live metadata of record {dep_id} cannot be read: refusing to build an update "
             "from anything else. Nothing was created.")
+    notices: list = []
     try:
-        payload = build_update_payload(live, metadata_built, fields, code_url, replace_identifier)
+        payload = build_update_payload(live, metadata_built, fields, code_url, replace_identifier,
+                                       previous_web_urls, notices)
     except ValueError as exc:
         die(f"Error: {exc}. Nothing was created.")
+    for notice in notices:
+        print(f"  Note: {notice}")
     diff, digest = metadata_diff(live, payload)
     if not diff:
         raise NothingToUpdate(f"the requested fields {sorted(fields)} already equal the live metadata of "
@@ -2699,12 +3053,12 @@ def validate_sandbox_state_path(path: Path, repo_root: Path, paper_dir: Path) ->
     p = path.expanduser().resolve()
     for root in (repo_root.resolve(), paper_dir.resolve()):
         if p == root or root in p.parents:
-            sys.exit(f"Error: --sandbox-state {p} lies inside {root}: a repository could commit it. "
+            die(f"Error: --sandbox-state {p} lies inside {root}: a repository could commit it. "
                      "Use a path under the OS temp/scratch directory.")
     if p.is_dir():
-        sys.exit(f"Error: --sandbox-state {p} is a directory")
+        die(f"Error: --sandbox-state {p} is a directory")
     if p.exists():
-        sys.exit(f"Error: --sandbox-state {p} already exists: refusing to overwrite it. Choose a new path.")
+        die(f"Error: --sandbox-state {p} already exists: refusing to overwrite it. Choose a new path.")
     return p
 
 
@@ -2729,8 +3083,21 @@ def _rel(path: Path, root: Path) -> str:
         return str(path)
 
 
+class RedactingParser(argparse.ArgumentParser):
+    """An argument parser whose error texts (which echo the offending argument values) pass through ``redact``."""
+
+    def exit(self, status=0, message=None):
+        if message:
+            self._print_message(redact(message), sys.stderr)
+        raise SystemExit(status)
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: error: {message}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = RedactingParser(
         description="Publish a Cosmochrony paper to Zenodo",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -2757,9 +3124,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument(f"--set-{field}", action="store_true", dest="set_" + field.replace("-", "_"),
                             help=f"--update: replace the live {UPDATABLE_FIELDS[field]!r} with the local value")
     parser.add_argument("--replace-related-identifier", metavar="IDENTIFIER",
-                        help="--update --set-web-url: the live related identifier to replace by the web page entry "
-                             "when it cannot be recognised as the web entry (an entry without resource_type is never "
-                             "replaced implicitly; none matching: the web entry is appended)")
+                        help="--update --set-web-url: the exact identifier of the ONE live related identifier to replace "
+                             "by the web page entry when it is not recognised as the web entry (it must match exactly "
+                             "one live entry, otherwise the run is refused; a cites / isCitedBy / references entry or "
+                             "a DOI entry is never replaceable). Without it a foreign entry is kept and the web entry "
+                             "is appended; an entry with no resource_type is never replaced implicitly")
     parser.add_argument("--apply-local-metadata", metavar="F1,F2", default="",
                         help="--update: comma list of fields to take from local state "
                              f"({', '.join(UPDATABLE_FIELDS)}); equivalent to the --set-* flags")
@@ -2783,9 +3152,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expect-pdf-sha256", metavar="HEX",
                         help="--finish-after-fail: digest of the uploaded PDF when no run journal records it")
     parser.add_argument("--reconcile", type=Path, metavar="JOURNAL",
-                        help="Record, locally, what you found on the server for a blocking journal "
-                             "(needs --outcome, or --quarantine for an unreadable one); no network. Writes only "
-                             "the paper directory recorded IN THE JOURNAL")
+                        help="Record, locally, what you found on the server for a blocking journal (needs --outcome; "
+                             "a journal that cannot be read, has no known outcome or no verifiable identity is not "
+                             "reconciled: --lift-block); no network. Writes only <paper_dir_real>/zenodo.json, "
+                             "the real path recorded IN THE JOURNAL")
     parser.add_argument("--outcome", choices=("published", "not-published"),
                         help="--reconcile: what you verified on the server")
     parser.add_argument("--record-id", metavar="N",
@@ -2794,20 +3164,34 @@ def build_parser() -> argparse.ArgumentParser:
                         help="--reconcile published (production deposit): concept recid (a positive integer, digits only), "
                              "written to zenodo.json")
     parser.add_argument("--concept-doi", metavar="D",
-                        help="--reconcile published (production deposit): concept DOI, 10.NNNN/suffix; 10.5281/zenodo.N "
-                             "must carry the concept id, written to zenodo.json")
+                        help="--reconcile published (production deposit): exactly 10.5281/zenodo.<concept id> (ASCII; "
+                             "the number must EQUAL the concept id; no other registrant), written to zenodo.json; an "
+                             "existing different doi there is refused, never replaced")
     parser.add_argument("--record-url", metavar="URL",
-                        help="--reconcile not-published: an https URL on the journal's host, containing the record id, of the "
-                             "record/draft page you inspected")
+                        help="--reconcile not-published / --lift-block: an https URL on the journal's host, containing the "
+                             "record id, of the record/draft page you inspected")
     parser.add_argument("--i-checked-the-account", action="store_true",
-                        help="--reconcile not-published without --record-url: you checked the account yourself "
-                             "(needs --reason)")
+                        help="--reconcile not-published / --lift-block without --record-url: you checked the account "
+                             "yourself (needs --reason)")
     parser.add_argument("--reason", metavar="TEXT",
-                        help="--reconcile: what you checked, at least 10 characters after stripping blanks; stored in the "
-                             "journal (needed with --i-checked-the-account and --quarantine)")
+                        help="--reconcile / --lift-block: what you checked, at least 10 characters after stripping blanks; "
+                             "stored in the journal or the decision file (needed with --i-checked-the-account and "
+                             "--lift-block)")
     parser.add_argument("--quarantine", action="store_true",
-                        help="--reconcile JOURNAL --quarantine --reason TEXT: rename an UNREADABLE journal to "
-                             "*.quarantined in its directory (prints its size and path; nothing is deleted)")
+                        help="REMOVED (always refused): it renamed the journal. Use --backup-journal JOURNAL (a copy "
+                             "only) and --lift-block JOURNAL (an explicit, traceable decision file; the journal is "
+                             "never renamed, edited or deleted)")
+    parser.add_argument("--backup-journal", type=Path, metavar="JOURNAL",
+                        help="Copy JOURNAL beside itself to <name>.quarantine-copy-<UTC stamp>-<sha256 prefix>.json "
+                             "(exclusive create, fsynced; never overwrites). Nothing is unblocked, the original is "
+                             "not touched. No network")
+    parser.add_argument("--lift-block", type=Path, metavar="JOURNAL",
+                        help="Record your decision to UNBLOCK a journal that no --reconcile can cure (unreadable; "
+                             "absent/unknown outcome; identity digest absent or mismatching; paper directory moved): "
+                             "needs --reason TEXT (>= 10 characters) and --record-url URL or --i-checked-the-account. "
+                             "Makes sure a backup copy with the same sha256 exists, then writes JOURNAL.decision.json "
+                             "(exclusive create). The decision counts only while the journal has exactly these bytes; "
+                             "the journal itself is never renamed, edited or deleted. No network")
     parser.add_argument("--skip-checks", action="store_true",
                         help="Bypass the pre-deposit check battery only (never the version-label guard, "
                              "the journal block or the diff confirmation)")
@@ -2823,19 +3207,41 @@ def requested_fields(args, parser) -> set:
     return fields
 
 
+def run_backup_journal(args) -> None:
+    path = args.backup_journal.expanduser().resolve()
+    try:
+        copy_path, sha, created = backup_journal(path)
+    except ReconcileRefused as exc:
+        die(f"Error: {exc}")
+    print(f"{'Copied' if created else 'Already copied (identical bytes)'}: {path.name} -> {copy_path.name} "
+          f"(sha256 {sha}). The journal itself was not touched and still blocks if it blocked: --lift-block is "
+          "the explicit decision.")
+
+
+def run_lift_block(args) -> None:
+    path = args.lift_block.expanduser().resolve()
+    try:
+        info = lift_block(path, args.reason, args.record_url, args.i_checked_the_account)
+    except ReconcileRefused as exc:
+        die(f"Error: {exc}")
+    print(f"Decision recorded: {info['decision_path']} (UNBLOCK for {path.name}, sha256 {info['journal_sha256']}, "
+          f"kind {info['block_kind']}). Backup copy: {info['backup_path']}. The journal itself was not renamed, "
+          "edited or deleted; the decision counts only while the journal keeps exactly these bytes.")
+    if info.get("outcome_at_decision") == UNSAVED_OUTCOME:
+        print("Consequences: this journal said the publication SUCCEEDED (PUBLISHED-UNSAVED). Lifting the block "
+              "saves nothing: edit zenodo.json by hand (zenodo_id = the concept record id, doi = the concept DOI, "
+              "read on the record page) and do NOT re-run the deposit: a re-run would publish it a SECOND time.")
+    else:
+        print("Consequences: this journal no longer blocks. The next run for this paper MAY CREATE A NEW DEPOSITION; "
+              "nothing in this tool can detect a publication that did happen. Make sure no draft or edit session is "
+              "left at https://zenodo.org/deposit and that the record is not already published.")
+
+
 def run_reconcile(args, parser) -> None:
     path = args.reconcile.expanduser().resolve()
-    if args.quarantine:
-        try:
-            target = quarantine_journal(path, args.reason or "")
-        except ReconcileRefused as exc:
-            die(f"Error: {exc}")
-        print(f"Quarantined: {path.name} -> {target.name} (same directory; nothing deleted). The journal no "
-              "longer blocks: make sure no draft or edit session is left at https://zenodo.org/deposit and that "
-              "the record is not published before the next run.")
-        return
     if not args.outcome:
-        parser.error("--reconcile needs --outcome published|not-published (or --quarantine for an unreadable journal)")
+        parser.error("--reconcile needs --outcome published|not-published (a journal that cannot be read or has no "
+                     "known outcome is not reconciled: see --lift-block)")
     try:
         data = reconcile_journal(path, args.outcome, args.record_id, args.concept_id, args.concept_doi,
                                  record_url=args.record_url, checked_account=args.i_checked_the_account,
@@ -2872,14 +3278,31 @@ def finalize_journal(journal, client=None) -> None:
 
 
 def main(argv=None):
+    register_environment_secrets()        # BEFORE the arguments are parsed: an argparse error echoes the values it refuses
     parser = build_parser()
     args = parser.parse_args(argv)
-    register_environment_secrets()        # the exact tokens loaded in this process are masked everywhere
 
-    if not args.reconcile and (args.outcome or args.quarantine or args.record_url or args.i_checked_the_account
-                               or args.reason or args.record_id or args.concept_id or args.concept_doi):
-        parser.error("--outcome/--quarantine/--record-id/--concept-id/--concept-doi/--record-url/"
-                     "--i-checked-the-account/--reason only make sense with --reconcile")
+    if args.quarantine:
+        parser.error("--quarantine was removed: it renamed the journal. Use --backup-journal JOURNAL (a copy only, "
+                     "nothing is unblocked) and --lift-block JOURNAL --reason TEXT (--record-url URL | "
+                     "--i-checked-the-account) (a decision file; the journal is never renamed, edited or deleted)")
+    if args.backup_journal and (args.reconcile or args.lift_block or args.outcome or args.record_url
+                                or args.i_checked_the_account or args.reason or args.record_id or args.concept_id
+                                or args.concept_doi):
+        parser.error("--backup-journal takes no other reconcile option (it only copies the journal)")
+    if args.lift_block and (args.reconcile or args.outcome or args.record_id or args.concept_id or args.concept_doi):
+        parser.error("--lift-block only takes --reason and --record-url / --i-checked-the-account")
+    if not args.reconcile and not args.lift_block and not args.backup_journal and (
+            args.outcome or args.record_url or args.i_checked_the_account or args.reason or args.record_id
+            or args.concept_id or args.concept_doi):
+        parser.error("--outcome/--record-id/--concept-id/--concept-doi/--record-url/"
+                     "--i-checked-the-account/--reason only make sense with --reconcile (or --lift-block)")
+    if args.backup_journal:
+        run_backup_journal(args)
+        return
+    if args.lift_block:
+        run_lift_block(args)
+        return
     if args.journal and not args.finish_after_fail:
         parser.error("--journal only makes sense with --finish-after-fail")
     if args.reconcile:
@@ -2909,11 +3332,11 @@ def main(argv=None):
 
     paper_dir = args.paper_dir.resolve()
     if not paper_dir.is_dir():
-        sys.exit(f"Error: {paper_dir} is not a directory")
+        die(f"Error: {paper_dir} is not a directory")
 
     config_path = paper_dir / "zenodo.json"
     if not config_path.exists():
-        sys.exit(
+        die(
             f"Error: {config_path} not found.\n"
             "Create it from tools/zenodo.example.json and fill in bib_key / web_url."
         )
@@ -2925,7 +3348,7 @@ def main(argv=None):
     # spurious NEW deposition for material that is already published under another DOI.
     if config.get("retired"):
         superseded = config.get("superseded_by")
-        sys.exit(
+        die(
             f"Error: {paper_dir.name} is marked retired in zenodo.json and must not be deposited.\n"
             + (f"Reason: {config['retired_reason']}\n" if config.get("retired_reason") else "")
             + (f"Cite {superseded} instead.\n" if superseded else "")
@@ -3020,7 +3443,11 @@ def main(argv=None):
                 snap = json.loads(args.live_snapshot.read_text(encoding="utf-8"))
                 live = snap.get("metadata") if isinstance(snap.get("metadata"), dict) else snap
                 try:
-                    payload = build_update_payload(live, dry_meta, fields, code_url, args.replace_related_identifier)
+                    notices: list = []
+                    payload = build_update_payload(live, dry_meta, fields, code_url, args.replace_related_identifier,
+                                                   previous_web_urls_of(config), notices)
+                    for notice in notices:
+                        print(f"  Note: {notice}")
                     diff, digest = metadata_diff(live, payload)
                     print("  Whole-metadata diff, live snapshot -> to be sent:")
                     print(diff or "  (no difference)")
@@ -3037,7 +3464,7 @@ def main(argv=None):
     if args.finish_after_fail:
         zid, concept_doi = config.get("zenodo_id"), config.get("doi")
         if not zid or not concept_doi:
-            sys.exit("Error: zenodo.json has no zenodo_id/doi: the publication was not saved locally, "
+            die("Error: zenodo.json has no zenodo_id/doi: the publication was not saved locally, "
                      "so there is nothing to finish. Reconcile the journal (it says PUBLISHED-UNSAVED) or set "
                      "them from the record first.")
         pdf_path = find_pdf(paper_dir)
@@ -3110,7 +3537,7 @@ def main(argv=None):
             print("\nPre-deposit checks FAILED:")
             for prob in problems:
                 print(f"  !! {prob}")
-            sys.exit(
+            die(
                 "\nRefusing to deposit. Fix the above, or re-run with --skip-checks "
                 "if you have judged them not to apply."
             )
@@ -3198,19 +3625,20 @@ def main(argv=None):
         # the file bucket remains locked for published records. Use new version for files.
         if args.update:
             if not zenodo_id:
-                sys.exit("Error: --update needs an existing record: zenodo_id in zenodo.json"
+                die("Error: --update needs an existing record: zenodo_id in zenodo.json"
                          + (" (on the sandbox: --sandbox-zenodo-id)" if args.sandbox else "") + ".")
             try:
                 dep_id, doi = deposit_update(client, metadata, code_url, int(zenodo_id), env_label, host,
                                              on_published=save_sandbox_state if args.sandbox else settle_update,
                                              fields=fields, confirm=args.yes_apply_diff,
-                                             replace_identifier=args.replace_related_identifier)
+                                             replace_identifier=args.replace_related_identifier,
+                                             previous_web_urls=previous_web_urls_of(config))
             except NothingToUpdate as exc:
                 print(f"Nothing to update: {exc}.")
                 finalize_journal(journal, client)
                 return
             except PostPublishFailure as exc:
-                sys.exit(str(exc))
+                die(str(exc))
             doi = doi or config.get("doi", "")
             print(f"\nUpdated! (metadata only — files unchanged)")
             print(f"  DOI:    {doi}")
@@ -3224,10 +3652,10 @@ def main(argv=None):
                                  on_published=saver)
         except PostPublishFailure as exc:
             if journal.outcome() == UNSAVED_OUTCOME:
-                sys.exit(str(exc) + f"\n!! The publication SUCCEEDED but the local state is not saved: the journal "
+                die(str(exc) + f"\n!! The publication SUCCEEDED but the local state is not saved: the journal "
                          f"({journal.path}) says {UNSAVED_OUTCOME} and blocks every re-run. "
                          + _manual_state_hint(args.sandbox, client))
-            sys.exit(str(exc) + "\n!! PDF archive and DOI cascade were SKIPPED (a sandbox run skips them "
+            die(str(exc) + "\n!! PDF archive and DOI cascade were SKIPPED (a sandbox run skips them "
                      "always). Once the record is fixed, run them with --finish-after-fail.")
         if args.sandbox:
             print("\n[sandbox] PDF archive and DOI cascade skipped by contract: no production file was written.")

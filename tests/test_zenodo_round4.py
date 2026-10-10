@@ -283,7 +283,7 @@ class UnknownOutcomeBlocks(unittest.TestCase):
         blocked, msg, f = self.blocked(root, paper)
         self.assertTrue(blocked, msg)
         self.assertIn(str(jp), msg)
-        self.assertIn("--quarantine", msg)
+        self.assertIn("--lift-block", msg)
         self.assertIn("absent or unknown outcome", msg)
         self.assertEqual(f.built, [])
 
@@ -345,29 +345,29 @@ class UnknownOutcomeBlocks(unittest.TestCase):
                       paper_dir="/nowhere/else", host="zenodo.org")
         self.assertFalse(self.blocked(root2, paper2)[0])
 
-    def test_the_quarantine_cure_works_on_a_readable_journal_with_an_unknown_outcome_and_unblocks(self):
+    def test_the_lift_block_cure_works_on_a_readable_journal_with_an_unknown_outcome_and_unblocks(self):
         root, paper = workspace()
         jp = self.journal_with(root, paper, outcome="PUBLISHD")
-        content = jp.read_text()
-        code, out, _ = reconcile(jp, "--quarantine", "--reason", REASON, root=root)
+        content = jp.read_bytes()
+        code, out, _ = run_main(["--lift-block", str(jp), "--i-checked-the-account", "--reason", REASON], {}, root)
         self.assertIsNone(code, code)
-        moved = Path(str(jp) + ".quarantined")
-        self.assertFalse(jp.exists())
-        self.assertEqual(moved.read_text(), content)                    # renamed, content untouched
+        self.assertEqual(jp.read_bytes(), content)                      # NOT renamed, NOT touched (was: renamed)
+        self.assertTrue(Path(str(jp) + ".decision.json").exists())
         self.assertFalse(self.blocked(root, paper)[0])
 
-    def test_quarantine_still_refuses_a_readable_journal_with_a_known_outcome(self):
+    def test_lift_block_still_refuses_a_readable_journal_with_a_known_outcome(self):
         root, paper = workspace()
         j = make_blocking_journal(root, paper)
-        code, _, _ = reconcile(j.path, "--quarantine", "--reason", REASON, root=root)
-        self.assertIn("readable journal", str(code))
+        code, _, _ = run_main(["--lift-block", str(j.path), "--i-checked-the-account", "--reason", REASON], {}, root)
+        self.assertIn("reconcile", str(code))
         self.assertTrue(j.path.exists())
+        self.assertFalse(Path(str(j.path) + ".decision.json").exists())
 
-    def test_reconcile_of_an_unknown_outcome_points_at_the_quarantine(self):
+    def test_reconcile_of_an_unknown_outcome_points_at_lift_block(self):
         root, paper = workspace()
         jp = self.journal_with(root, paper, outcome="PUBLISHD")
         code, _, _ = reconcile(jp, *published_args(), root=root)
-        self.assertIn("--quarantine", str(code))
+        self.assertIn("--lift-block", str(code))
         self.assertIn("absent or unknown outcome", str(code))
         self.assertEqual(json.loads(jp.read_text())["outcome"], "PUBLISHD")
 
@@ -409,20 +409,21 @@ class ReconcileInputValidation(unittest.TestCase):
         self.refused("--outcome", "published", "--record-id", "301", "--concept-id", "5",
                      "--concept-doi", "10.5281/zenodo.6", expect="must be equal")
         self.refused("--outcome", "published", "--record-id", "301", "--concept-id", "5",
-                     "--concept-doi", "10.5281/zenodo.abc", expect="must be equal")
+                     "--concept-doi", "10.5281/zenodo.abc", expect="positive integer")
         self.refused("--outcome", "published", "--record-id", "301", "--concept-id", "5",
-                     "--concept-doi", "10.5281/ZENODO.50", expect="must be equal")
+                     "--concept-doi", "10.5281/ZENODO.50", expect="must be exactly")
 
     def test_a_consistent_zenodo_doi_and_a_foreign_doi_are_accepted(self):
         code, _, _ = reconcile(self.jp, *published_args(doi="10.5281/zenodo.5"), root=self.root)
         self.assertIsNone(code, code)
 
-    def test_a_non_zenodo_doi_is_not_compared_with_the_concept_id(self):
+    def test_a_non_zenodo_doi_is_refused_for_a_zenodo_concept(self):       # was: accepted (N-1 closes it)
         root, paper = workspace(zenodo_id=None, doi=None)
         jp = make_blocking_journal(root, paper).path
+        snap = Bytes(paper / "zenodo.json", jp)
         code, _, _ = reconcile(jp, *published_args(doi="10.9999/anything.123"), root=root)
-        self.assertIsNone(code, code)
-        self.assertEqual(json.loads((paper / "zenodo.json").read_text())["doi"], "10.9999/anything.123")
+        self.assertIn("must be exactly", str(code))
+        self.assertTrue(snap.unchanged())
 
     def test_the_doi_check_also_applies_when_the_concept_id_comes_from_the_journal(self):
         root, paper = workspace(zenodo_id=None, doi=None)
@@ -444,11 +445,11 @@ class ReconcileInputValidation(unittest.TestCase):
         self.refused("--outcome", "not-published", "--record-url", "https://zenodo.org/deposit/301",
                      "--reason", "ok", expect="--reason")
 
-    def test_the_quarantine_reason_follows_the_same_rule(self):
+    def test_the_lift_block_reason_follows_the_same_rule(self):
         bad = state_dir_for(self.root) / "paper-1.run.json"
         bad.write_text("{trunc")
         for reason in ("", "  ", "x", "123456789"):
-            code, _, _ = reconcile(bad, "--quarantine", "--reason", reason, root=self.root)
+            code, _, _ = run_main(["--lift-block", str(bad), "--i-checked-the-account", "--reason", reason], {}, self.root)
             self.assertIn("--reason", str(code), reason)
             self.assertTrue(bad.exists())
 
@@ -588,10 +589,11 @@ class RedactionByValue(unittest.TestCase):
             zp.register_environment_secrets({"ZENODO_TOKEN": "   "})
             self.assertEqual(zp.redact("nothing to hide"), "nothing to hide")
 
-    def test_a_one_character_secret_is_registered(self):
+    def test_a_one_character_secret_is_registered_and_masked_as_a_whole_token(self):
         with mock.patch.object(zp, "_SECRETS", set()):
             zp.register_secret("Q")
-            self.assertEqual(zp.redact("xQy"), "x[REDACTED]y")
+            self.assertEqual(zp.redact("x Q y"), "x [REDACTED] y")
+            self.assertEqual(zp.redact("xQy"), "xQy")          # no blind substring replacement of a short secret
 
     def test_a_whole_run_masks_a_short_sandbox_token_in_streams_and_journal(self):
         root, paper = workspace(zenodo_id=5, doi="10.0/c")
@@ -668,7 +670,7 @@ class WebUrlNeverReplacedImplicitly(unittest.TestCase):
             zp.merge_related_web_url(dup, ENTRY, "https://a")
 
     def test_the_explicit_identifier_replaces_whatever_the_relation_or_type(self):
-        live = [{"identifier": "https://a", "relation": "cites", "scheme": "url", "resource_type": "software"}]
+        live = [{"identifier": "https://a", "relation": "isDocumentedBy", "scheme": "url", "resource_type": "software"}]
         self.assertEqual(zp.merge_related_web_url(live, ENTRY, "https://a"), [ENTRY])
 
     def test_replace_related_identifier_needs_set_web_url(self):
@@ -678,8 +680,10 @@ class WebUrlNeverReplacedImplicitly(unittest.TestCase):
         self.assertNotIn("edit", c.names())
 
     def test_N03_two_candidates_are_refused_as_ambiguous(self):
-        live = [{"identifier": "https://a", "relation": "isSupplementedBy", "scheme": "url", "resource_type": "other"},
-                {"identifier": "https://b", "relation": "isSupplementedBy", "scheme": "url", "resource_type": "other"}]
+        live = [{"identifier": "https://cosmochrony.org/a", "relation": "isSupplementedBy", "scheme": "url",
+                 "resource_type": "other"},
+                {"identifier": "https://cosmochrony.org/b", "relation": "isSupplementedBy", "scheme": "url",
+                 "resource_type": "other"}]
         with self.assertRaises(ValueError) as cm:
             zp.merge_related_web_url(live, ENTRY)
         self.assertIn("cannot tell which one is the web url", str(cm.exception))
@@ -697,7 +701,7 @@ class WebUrlNeverReplacedImplicitly(unittest.TestCase):
 
     def test_a_single_typed_entry_is_replaced_in_place(self):
         live = [{"identifier": "10.1/abc", "relation": "cites", "scheme": "doi"},
-                {"identifier": "https://old.example", "relation": "isSupplementedBy", "scheme": "url",
+                {"identifier": "https://cosmochrony.org/science/old/", "relation": "isSupplementedBy", "scheme": "url",
                  "resource_type": "other"}]
         self.assertEqual(zp.merge_related_web_url(live, ENTRY), [live[0], ENTRY])
 
@@ -722,8 +726,9 @@ class WebUrlNeverReplacedImplicitly(unittest.TestCase):
                  "resource_type": "other"},
                 {"identifier": "https://other.example/y", "relation": "isSupplementedBy", "scheme": "url",
                  "resource_type": "other"}]
-        with self.assertRaises(ValueError):
-            zp.merge_related_web_url(live, ENTRY)
+        # neither host is the web host: both foreign typed entries are KEPT and the web entry is appended; had
+        # evilcosmochrony.org been taken for the web host, its entry would have been replaced
+        self.assertEqual(zp.merge_related_web_url(live, ENTRY), live + [ENTRY])
 
     def test_R17_an_entry_with_the_same_identifier_but_another_relation_is_not_the_web_entry(self):
         live = [{"identifier": "https://new.example", "relation": "cites", "scheme": "url"}]
@@ -733,11 +738,11 @@ class WebUrlNeverReplacedImplicitly(unittest.TestCase):
         self.assertEqual(zp.merge_related_web_url(both, ENTRY), [live[0], ENTRY])
 
     def test_the_live_list_is_not_mutated(self):
-        live = [{"identifier": "https://old.example", "relation": "isSupplementedBy", "scheme": "url",
+        live = [{"identifier": "https://cosmochrony.org/science/old/", "relation": "isSupplementedBy", "scheme": "url",
                  "resource_type": "other"}]
         frozen = copy.deepcopy(live)
         zp.merge_related_web_url(live, ENTRY)
-        zp.merge_related_web_url(live, ENTRY, "https://old.example")
+        zp.merge_related_web_url(live, ENTRY, "https://cosmochrony.org/science/old/")
         self.assertEqual(live, frozen)
 
     def test_the_dry_run_diff_reports_the_refusal(self):

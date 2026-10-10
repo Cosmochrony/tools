@@ -320,7 +320,7 @@ class BlockKeying(unittest.TestCase):
 
 class ReconcileSafety(unittest.TestCase):
     def unreconciled(self, **cfg):
-        root, paper = workspace(zenodo_id=5, doi="10.0/c", **cfg)
+        root, paper = workspace(zenodo_id=5, doi=None, **cfg)
         sim = Sim(publish="timeout_pending")
         client, _ = real_client(sim)
         run_main([str(paper), "--skip-checks"], PROD_ONLY, root, Factory(client))
@@ -332,7 +332,7 @@ class ReconcileSafety(unittest.TestCase):
         other_root, other = workspace(zenodo_id=7, doi="10.0/other")
         before = (other / "zenodo.json").read_text()
         code, _, _ = run_main([str(other), "--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
-                               "--concept-id", "999", "--concept-doi", "10.9999/zzz"], {}, root)
+                               "--concept-id", "999", "--concept-doi", "10.5281/zenodo.999"], {}, root)
         self.assertIn("belongs to the paper directory", str(code))
         self.assertEqual((other / "zenodo.json").read_text(), before)
         self.assertEqual(json.loads(jp.read_text())["outcome"], "UNRECONCILED")
@@ -350,13 +350,13 @@ class ReconcileSafety(unittest.TestCase):
         cfg = json.loads((paper / "zenodo.json").read_text())
         before = (paper / "zenodo.json").read_text()
         code, _, _ = run_main(["--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
-                               "--concept-id", "999", "--concept-doi", "10.9999/zzz"], {}, root)
+                               "--concept-id", "999", "--concept-doi", "10.5281/zenodo.999"], {}, root)
         self.assertIn("another concept", str(code))
         cfg["bib_key"] = "SomethingElse"
         (paper / "zenodo.json").write_text(json.dumps(cfg))
         before = (paper / "zenodo.json").read_text()
         code, _, _ = run_main(["--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
-                               "--concept-id", "5", "--concept-doi", "10.9999/zzz"], {}, root)
+                               "--concept-id", "5", "--concept-doi", "10.5281/zenodo.5"], {}, root)
         self.assertIn("not the same paper", str(code))
         self.assertEqual((paper / "zenodo.json").read_text(), before)
 
@@ -398,37 +398,38 @@ class ReconcileSafety(unittest.TestCase):
         bad = state_dir_for(root) / "paper-20260101T000000Z-1-abc123.run.json"
         bad.write_text("{trunc")
         code, _, _ = run_main([str(paper), "--skip-checks"], ENV, root, Factory())
-        self.assertIn("--quarantine", str(code))
+        self.assertIn("--lift-block", str(code))
         code, _, _ = run_main(["--reconcile", str(bad), "--outcome", "not-published", "--record-url",
                                "https://zenodo.org/x"], {}, root)
-        self.assertIn("--quarantine", str(code))
-        code, _, _ = run_main(["--reconcile", str(bad), "--quarantine"], {}, root)
+        self.assertIn("--lift-block", str(code))
+        code, _, _ = run_main(["--lift-block", str(bad), "--i-checked-the-account"], {}, root)
         self.assertIn("--reason", str(code))
         self.assertTrue(bad.exists())
-        code, out, _ = run_main(["--reconcile", str(bad), "--quarantine", "--reason", "checked /deposit"], {}, root)
+        code, out, _ = run_main(["--lift-block", str(bad), "--i-checked-the-account", "--reason", "checked /deposit"],
+                                {}, root)
         self.assertIsNone(code, code)
-        self.assertIn("6 bytes", out)
         self.assertIn(str(bad), out)
-        moved = Path(str(bad) + ".quarantined")
-        self.assertFalse(bad.exists())
-        self.assertEqual(moved.read_text(), "{trunc")                      # renamed, content untouched
-        self.assertTrue(Path(str(moved) + ".note.txt").exists())
-        self.assertEqual(moved.parent, bad.parent)
+        self.assertEqual(bad.read_text(), "{trunc")                        # NOT renamed, content untouched (was: renamed)
+        self.assertTrue(Path(str(bad) + ".decision.json").exists())
+        self.assertEqual(len(list(bad.parent.glob("*.quarantine-copy-*.json"))), 1)
         code, _, _ = run_main([str(paper), "--skip-checks"], ENV, root, Factory())
         self.assertNotIn("REFUSING", str(code))
 
-    def test_quarantine_never_overwrites_and_refuses_a_readable_journal(self):
+    def test_lift_block_never_overwrites_and_refuses_a_readable_journal_with_a_known_outcome(self):
         root, paper, jp = self.unreconciled()
-        code, _, _ = run_main(["--reconcile", str(jp), "--quarantine", "--reason", "checked the account"], {}, root)
-        self.assertIn("readable journal", str(code))
+        code, _, _ = run_main(["--lift-block", str(jp), "--i-checked-the-account", "--reason", "checked the account"],
+                              {}, root)
+        self.assertIn("reconcile", str(code))
         self.assertTrue(jp.exists())
         bad = state_dir_for(root) / "paper-1.run.json"
         bad.write_text("[1]")
-        taken = Path(str(bad) + ".quarantined")
+        taken = Path(str(bad) + ".decision.json")
         taken.write_text("earlier")
-        run_main(["--reconcile", str(bad), "--quarantine", "--reason", "checked the account"], {}, root)
+        code, _, _ = run_main(["--lift-block", str(bad), "--i-checked-the-account", "--reason", "checked the account"],
+                              {}, root)
+        self.assertIn("already exists", str(code))
         self.assertEqual(taken.read_text(), "earlier")
-        self.assertEqual(Path(str(bad) + ".quarantined.1").read_text(), "[1]")
+        self.assertEqual(bad.read_text(), "[1]")
 
     def test_the_config_written_by_a_reconcile_is_read_back(self):
         root, paper, jp = self.unreconciled()
@@ -440,7 +441,7 @@ class ReconcileSafety(unittest.TestCase):
             return real(path, text)
         with mock.patch.object(zp, "_atomic_write_text", lying):
             code, _, _ = run_main(["--reconcile", str(jp), "--outcome", "published", "--record-id", "1",
-                                   "--concept-id", "5", "--concept-doi", "10.9999/zzz"], {}, root)
+                                   "--concept-id", "5", "--concept-doi", "10.5281/zenodo.5"], {}, root)
         self.assertIn("does not hold the identifiers", str(code))
         self.assertEqual(json.loads(jp.read_text())["outcome"], "UNRECONCILED")
 
@@ -1042,7 +1043,7 @@ LIVE = {"title": "Old", "description": "D", "version": "0.9", "keywords": ["a"],
         "license": "cc-by-4.0", "upload_type": "publication", "publication_type": "workingpaper", "language": "eng",
         "related_identifiers": [
             {"identifier": "10.1/abc", "relation": "cites", "scheme": "doi"},
-            {"identifier": "https://old.example", "relation": "isSupplementedBy", "scheme": "url",
+            {"identifier": "https://cosmochrony.org/science/old/", "relation": "isSupplementedBy", "scheme": "url",
              "resource_type": "other"},
             {"identifier": "https://github.com/x/y", "relation": "isSupplementedBy", "scheme": "url",
              "resource_type": "software"},

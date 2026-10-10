@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -78,8 +79,22 @@ COVER_STATUS = re.compile(
 RELEASE_PATHS = ("tex/", "README", "zenodo.json", "CITATION.cff", "compile.sh")
 
 
+# A child of the battery (grep, git, pdfinfo, pdflatex...) must never inherit a credential: the variables whose NAME
+# looks like a secret are removed from its environment (a repository's git configuration, a hook or an alias runs
+# with this environment). Everything else (PATH, HOME, LANG, TMPDIR, TEXMF*, python variables...) is kept.
+_SECRET_NAME = re.compile(r"(?i)(^ZENODO_|^GH_|^GITHUB_|^NETLIFY_|^ORCID|TOKEN|SECRET|PASSW|API[-_]?KEY|CREDENTIAL|^AWS_)")
+
+
+def child_env(environ=None) -> dict:
+    """The environment handed to every subprocess of this module: ``environ`` (default os.environ) WITHOUT any
+    variable whose name looks like a secret (ZENODO_*, GH_*, GITHUB_*, NETLIFY_*, ORCID*, *TOKEN*, *SECRET*,
+    *PASSW*, *API_KEY*, *CREDENTIAL*, AWS_*)."""
+    environ = os.environ if environ is None else environ
+    return {k: v for k, v in environ.items() if not _SECRET_NAME.search(k)}
+
+
 def sh(cmd: str, cwd: Path | None = None) -> tuple[int, str]:
-    r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+    r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, env=child_env())
     return r.returncode, r.stdout.strip()
 
 
@@ -93,7 +108,7 @@ def sh_raw(cmd: str, cwd: Path | None = None) -> tuple[int, str]:
     change instead of an uncommitted release file. When the first dirty file is
     the only modified release file, the guard passes a deposit it should refuse.
     """
-    r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+    r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, env=child_env())
     return r.returncode, r.stdout.rstrip("\n")
 
 
@@ -114,6 +129,7 @@ def read_pdf_metadata(path: Path) -> tuple[dict[str, str], str | None]:
             capture_output=True,
             text=True,
             check=False,
+            env=child_env(),
         )
     except OSError as exc:
         return {}, str(exc)
