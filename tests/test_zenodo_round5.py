@@ -974,7 +974,7 @@ SECRET_ENV = {"GH_HOST": "h", "ZENODO_TOKEN": "zt-1", "ZENODO_SANDBOX_TOKEN": "z
               "NETLIFY_PAT": "n", "NETLIFY_AUTH_TOKEN": "n", "MY_API_KEY": "k", "SOME_SECRET": "s", "DB_PASSWORD": "p",
               "AWS_ACCESS_KEY_ID": "a", "ORCID_KEY": "o", "FOO_TOKEN": "t", "gh_token": "g"}
 KEPT_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/home/x", "LANG": "C", "TMPDIR": "/tmp", "TEXMFHOME": "/tex", "PYTHONPATH": "/py",
-            "LC_ALL": "C", "SSH_AUTH_SOCK": "/s"}
+            "LC_ALL": "C"}
 
 
 class ChildrenNeverSeeASecret(unittest.TestCase):
@@ -1000,9 +1000,9 @@ class ChildrenNeverSeeASecret(unittest.TestCase):
             self.assertEqual({k: v for k, v in env.items() if k in KEPT_ENV}, KEPT_ENV)
 
     def test_N7_a_real_child_of_the_battery_does_not_see_the_token(self):
-        with mock.patch.dict(os.environ, {"ZENODO_TOKEN": "visible-token-123", "GH_TOKEN": "gh-123", "KEEPME": "ok"}):
+        with mock.patch.dict(os.environ, {"ZENODO_TOKEN": "visible-token-123", "GH_TOKEN": "gh-123", "TEXMFHOME": "ok"}):
             rc, out = pc.sh("env")
-        self.assertIn("KEEPME=ok", out)
+        self.assertIn("TEXMFHOME=ok", out)
         self.assertNotIn("visible-token-123", out)
         self.assertNotIn("ZENODO_TOKEN", out)
         self.assertNotIn("GH_TOKEN", out)

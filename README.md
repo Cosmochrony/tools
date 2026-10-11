@@ -110,12 +110,12 @@ name as well as by value.
   `isReferencedBy` entry, a DOI-scheme entry and every other relation or scheme (`isVersionOf`, `isPartOf`, `hasPart`,
   handle, urn, ...) is refused; the replaced entry is printed with the diff. (A `previous_web_url` key that an older
   `zenodo.json` may still hold is ignored: it is no longer read.)
-* Redaction (below) applies scheme words first, decodes percent-encoded names, knows `X-Auth-Token`, `X-Access-Token`,
-  `Private-Token` and `ZENODO_TOKEN=` / `ZENODO_SANDBOX_TOKEN=`, never registers a blank secret, masks a registered
-  secret shorter than 8 characters only as a whole token, registers the environment tokens before the arguments are
-  parsed, and every output of the tool goes through it.
-* The commands of the pre-deposit battery run WITHOUT any variable whose name looks like a secret (`ZENODO_*`, `GH_*`,
-  `GITHUB_*`, `NETLIFY_*`, `ORCID*`, `*TOKEN*`, `*SECRET*`, `*PASSW*`, `*API_KEY*`, `*CREDENTIAL*`, `AWS_*`).
+* Redaction (below) applies scheme words first, decodes percent-encoded names, masks the ENTIRE value of an
+  `Authorization` / `Proxy-Authorization` field whatever its scheme, masks compound credential names by a suffix rule,
+  never registers a blank secret, masks a registered secret shorter than 8 characters only as a whole token,
+  registers the environment tokens before the arguments are parsed, installs a redacting `excepthook` in `main()` (an
+  exception that escapes it, also when `sandbox_launch.py` embeds the tool), and every output of the tool goes through it.
+* Every child process gets an ALLOW-LIST environment, not a deny-list (see "The environment of the child processes").
 * A `zenodo.json` or journal write that fails reports the temporary file it left (next to the target, because an
   atomic rename works within one filesystem) and keeps it: this tool deletes nothing.
 
@@ -134,7 +134,7 @@ python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome published|not-pu
 Run in the foreground, from the version branch (the branch name is the version label), after the
 pre-deposit checks and the independent review. `python3 -m unittest discover -s tests` runs the offline
 suite (over 500 tests, no network: a socket guard fails any real connection). `python3 tests/mutation_check.py`
-re-applies the in-memory mutants (264 mutants in all, of which 4 new in the sixth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
+re-applies the in-memory mutants (298 mutants in all, of which 45 new in the sixth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
 processes, or `--only-new` / `--ids ID1,ID2` for a subset; `--count` prints these numbers from the script); **its expected result is: every mutant killed except
 exactly one survivor, `M16b`, a documented equivalent mutant** (it removes an unreachable defensive assertion; its
 reachable counterpart M16 is killed). The script exits 0 only in that case and 1 for any other survivor, skipped
@@ -163,19 +163,39 @@ without whitespace; one containing a newline, a space or a control character is 
 A token is **masked by value and by field name**, not guaranteed absent: every exception text, HTTP body and URL that
 reaches the console, and every value written to a run journal, goes through one function (`redact`) that masks (a) the
 exact value of every registered secret: both `ZENODO_TOKEN` and `ZENODO_SANDBOX_TOKEN` as soon as either is present,
-whatever their length (an empty value is never registered), (b) any `Bearer ...` string, and (c) the value of any
-field whose NAME is `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Auth-Token`, `X-Access-Token`,
-`Private-Token`, `Cookie`, `Set-Cookie`, `access_token`, `token`, `refresh_token`, `client_secret` or `password`
-(case-insensitive; `-` and `_` alike; a name written with percent escapes such as `access%5Ftoken` is decoded first;
-`ZENODO_TOKEN=` and `ZENODO_SANDBOX_TOKEN=` assignments), in header dicts, URL query strings, `key=value` text and
-JSON-looking text; the scheme word (`Bearer`, `Basic`) of an `Authorization` value is consumed with its credential
-in every form (`Authorization=Bearer X`, `Authorization: Basic X`, quoted, JSON), the scheme patterns being applied
-first. Every `print` of the tool, every message of `sys.exit` and every argument-parsing error passes through the same
-function (the environment tokens are registered before the arguments are parsed); the only raw output calls of the
-module are the three that redact, and a test pins that by AST. The journal is redacted before the
-file is written (all its strings, its keys, and the value of every credential-named key). **Limits:** a secret that is
-neither registered nor attached to one of those names (for instance a token printed bare, a differently named field such
-as `api_secret`, `session` or `bearer:X`, or a token typed in a `--reason`) is not recognised; a registered secret
+whatever their length (an empty value is never registered), (b) any `Bearer ...`, `Bearer: ...` or `Basic ...` string, (c) the ENTIRE value of any `Authorization` /
+`Proxy-Authorization` field, whatever its scheme (`Bearer`, `Basic`, `Digest`, `Negotiate`, `Token`, `ApiKey`, `OAuth`,
+`GitHub`, `AWS4-HMAC-SHA256 Credential=..., Signature=...`, any other word, or a bare credential), in the `Name: value`,
+`Name=value`, quoted, JSON and repr forms, up to the end of the header value (a line end, a literal `\r`/`\n` in a repr,
+the closing quote, or `&` in a query string) without eating the field that follows, and (d) the value of any field whose
+NAME is a credential name by this rule (case-insensitive; the name is split into words on `_`, `-`, `.`, spaces and
+camelCase boundaries, and a name written with percent escapes such as `access%5Ftoken` is decoded first): it **ends in**
+`token`, `secret`, `password`, `passwd`, `passphrase`, `credential(s)`, `authorization`, `cookie` or `signature`, or it
+**contains** `apikey`, or two consecutive words `access|secret|private` + `key`, or it is `auth|signing|encryption|ssh|
+session|master|client|license` + `_key`. Masked, for example: `token`, `access_token`, `refresh_token`, `auth_token`,
+`id_token`, `authToken`, `bearer_token`, `x-amz-security-token`, `X-CSRF-Token`, `X-Auth-Token`, `api_secret`,
+`client_secret`, `db_password`, `gpg_passphrase`, `session_cookie`, `Set-Cookie`, `request_signature`, `credentials`,
+`x-api-key`, `API_KEY`, `api_key_id`, `apiKey`, `private_key`, `ssh_private_key`, `AWS_SECRET_ACCESS_KEY`,
+`accessKeyId`, `signing_key`, `ZENODO_TOKEN=` and `ZENODO_SANDBOX_TOKEN=` assignments (a colon after those two names
+is ordinary prose in this tool's messages and is left readable). NOT masked, on purpose (ordinary bibliographic or
+technical text): a bare `key`, `bib_key`, `sort_key`, `cache_key`, `primary_key`, `public_key`, `zenodo_id`, `doi`,
+`keywords`, `publication_date`, `token_count`, `tokens`, `max_tokens`, `author`, `authorization_url`, `cookies`,
+`signature_algorithm`, `password_policy`, `secretary`. The unquoted value of a field written `Name=value` runs to the end
+of the line or the next `&`: a field written after it on the same line, separated by a space, is masked with it
+(documented over-masking, the price of a value that may hold spaces). The scheme patterns are applied first, and each
+pass is complete on its own, so the result does not depend on their order. Every `print` of the tool, every message of
+`sys.exit`, every argument-parsing error and every exception that escapes `main()` passes through the same function (the
+environment tokens are registered before the arguments are parsed, and the redacting `excepthook` is installed by
+`main()` itself, not only under `__main__`, because `sandbox_launch.py` and `inject_failures.py` import the module and
+call it); the only raw output calls of the module are the three that redact, and a test pins that by AST. The
+journal is redacted before the file is written (all its strings, its keys, and the value of every credential-named key).
+**Single choke point.** An exception text leaves the process by `print` / `die` / the argument parser / the journal
+serialiser / the excepthook only, and each of them redacts: `redact(exc)` written at a call site is a second line of
+defence, which is why mutating that one argument alone (`tests/mutation_check.py`, historical mutant E1) was an
+EQUIVALENT mutation; E1 now mutates the choke point (the module `print` on stderr) and is killed. **Limits:** a secret that is
+neither registered nor attached to one of those names (for instance a token printed bare, a differently named field such as `session` or
+`auth`, or a token typed in a `--reason`) is not recognised; a name built from words glued without a separator and
+without a listed ending (`mytok`) is not either; a registered secret
 **shorter than 8 characters** is masked only as a whole token (not preceded or followed by a letter, digit or
 underscore) and never inside a dictionary key, because a blind substring replacement of a one- or two-character secret
 would mangle every other text and the keys of a journal: such a secret glued to other characters is not masked. The
@@ -183,6 +203,33 @@ output of `predeposit_check.py` run as its own command is not redacted (it print
 never reads a token). The client refuses to be built with a token equal to the other host's
 variable, and refuses to send a request (bucket upload links included) to any host but its own, so the
 production token cannot reach the sandbox, nor the sandbox token production.
+
+### The environment of the child processes (an allow-list)
+
+Every child process of the tool receives an explicit ALLOW-LIST environment: a variable that is not named in the list is
+not passed, whatever its name (a custom variable, a token under a name nobody thought of, `*_KEY`, `COOKIE`, `AUTH`,
+`JWT`, `PASSPHRASE`, `HTTPS_PROXY` / `PIP_INDEX_URL` carrying a password, `SSH_AUTH_SOCK`, `GIT_ASKPASS`,
+`GIT_SSH_COMMAND`, `GIT_CONFIG_VALUE_*`, `DOCKER_CONFIG`, `KUBECONFIG`, `DYLD_*`, `LD_*`...). The constant is
+`predeposit_check.CHILD_ENV_ALLOW` (the commands of the pre-deposit battery: `grep -a`, `git`, `pdfinfo`, and whatever a
+paper's own check runs through `sh()`: `pdflatex` and `bibtex` build a real paper under exactly this environment, a test
+runs them) and `zenodo_publish._GIT_ENV_KEEP` (the local `git` calls of the tool). The names, by purpose:
+
+| Purpose | Names passed |
+|---|---|
+| process | `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `TZ`, `TMPDIR` |
+| locale | `LANG`, `LANGUAGE`, `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, `LC_TIME` |
+| TeX Live | `TEXINPUTS`, `BIBINPUTS`, `BSTINPUTS`, `TEXFONTS`, `TFMFONTS`, `TEXMFHOME`, `TEXMFVAR`, `TEXMFCONFIG`, `TEXMFCACHE`, `TEXMFCNF`, `TEXMFOUTPUT`, `TEXMFDOTDIR`, `TEXMFLOCAL`, `TEXMFSYSVAR`, `TEXMFSYSCONFIG`, `SOURCE_DATE_EPOCH`, `FORCE_SOURCE_DATE`, `openout_any`, `openin_any`, `shell_escape`, `max_print_line`, `error_line`, `half_error_line` |
+| python | `PYTHONPATH`, `PYTHONHOME`, `PYTHONUTF8`, `PYTHONIOENCODING`, `PYTHONHASHSEED`, `PYTHONDONTWRITEBYTECODE`, `PYTHONPYCACHEPREFIX`, `PYTHONUNBUFFERED`, `PYTHONWARNINGS`, `VIRTUAL_ENV` |
+| git (no credential) | `GIT_DIR`, `GIT_WORK_TREE`, `GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`, `GIT_EXEC_PATH`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_TERMINAL_PROMPT`, `GIT_OPTIONAL_LOCKS` |
+
+Deliberately NOT passed: the proxy variables (a proxy URL may embed a password; the battery needs none for a public
+https remote), `SSL_CERT_*` / `CURL_CA_BUNDLE`, `SSH_AUTH_SOCK` (an agent socket is a credential: verify an ssh remote by
+hand), `LD_LIBRARY_PATH` / `DYLD_*` / `LD_PRELOAD` (they change which code a child loads), and every `GIT_*` name not in
+the table. A prefix is never an allow rule (`TEXMF_SECRET`, `PYTHONSECRET_X`, `LC_SECRET`, `GIT_SECRET_THING` are not
+passed); tests prove: the 26 names the review listed and 27 more do not reach a child, a custom variable does not, every
+allowed name that is set is passed, the allow-list holds no secret-looking name, the git names of the two lists agree,
+and `pdflatex` + `bibtex` still build a small paper. `desync_audit.py` and `repo_metadata_sync.py` are separate scripts
+(local `git` / `find` only, never reached from a deposit) and keep their own behaviour.
 
 ### The run journal (`--state-dir`)
 
@@ -391,10 +438,10 @@ python3 tools/pilot/sandbox_launch.py -- <paper_dir>/ \
 * reads only `ZENODO_SANDBOX_TOKEN` (missing or empty: refuses to start, nothing sent); `sandbox_launch.py` asks for
   it on the terminal (no echo) and keeps it in its own process: it is never in an argument vector (nothing for `ps`
   to show), and the launcher refuses if `ZENODO_TOKEN` is present. It is in the environment of that process; the
-  four `git` calls of `zenodo_publish.py` run with a reduced environment (`PATH`, `HOME`, locale, `TMPDIR`, `GIT_*`)
-  that does not carry it; the commands of the pre-deposit battery (`predeposit_check.py`, run in-process unless
-  `--skip-checks`) are child processes too and run with an environment WITHOUT any secret-looking variable
-  (`ZENODO_*`, `GH_*`, `NETLIFY_*`, `*TOKEN*`, `*SECRET*`, ...), so none of the children of this tool sees the token;
+  four `git` calls of `zenodo_publish.py` run with an allow-list environment (`PATH`, `HOME`, locale, `TMPDIR` and the
+  credential-free `GIT_*` names) that does not carry it; the commands of the pre-deposit battery (`predeposit_check.py`,
+  run in-process unless `--skip-checks`) are child processes too and run with the allow-list environment of "The
+  environment of the child processes", so none of the children of this tool sees the token;
 * `--sandbox-state PATH` is mandatory, must lie outside the workspace and **must not exist** (an existing file is
   refused, never overwritten); a unique temp file next to it is created **before any request** as a writability
   probe and is the file later moved into place, so no residue is left; the result is always printed in full, and if

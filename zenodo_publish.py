@@ -76,16 +76,23 @@ Guards (all offline-tested; the server semantics they rely on are listed as UNPR
     mismatch is refused).
   * Secrets are MASKED, by value and by field name (not proven absent): the exact value of ZENODO_TOKEN and
     ZENODO_SANDBOX_TOKEN (both, as soon as either is set; a blank value never; a value shorter than 8 characters
-    only as a whole token), any "Bearer ..." / "Basic ..." credential (scheme patterns applied first), and the
-    value of any field named Authorization, Proxy-Authorization, X-Api-Key, Api-Key, X-Auth-Token, X-Access-Token,
-    Private-Token, Cookie, Set-Cookie, access_token, token, refresh_token, client_secret or password, or a
-    ZENODO_TOKEN= / ZENODO_SANDBOX_TOKEN= assignment (case-insensitive; percent-encoded names decoded; header dicts,
-    query strings, key=value and JSON-looking text), before printing (every print, every exit message, every
-    argument-parsing error) and before any journal write. A secret that is neither registered nor attached to such a
+    only as a whole token), any "Bearer ..." / "Bearer: ..." / "Basic ..." credential (scheme patterns applied first),
+    the ENTIRE value of any Authorization / Proxy-Authorization field whatever its scheme (Bearer, Basic, Digest,
+    Negotiate, Token, ApiKey, OAuth, GitHub, AWS4-HMAC-SHA256 ..., or none), up to the end of the header value (line
+    end, closing quote, "&" in a query string), and the value of any field whose NAME ends in token, secret, password,
+    passwd, passphrase, credential(s), authorization, cookie or signature, or contains apikey / access_key / secret_key /
+    private_key, or is <auth|signing|encryption|ssh|session|master|client|license>_key (auth_token, id_token,
+    api_secret, client_secret, session_cookie, x-amz-security-token, private_key, X-Api-Key, access_token ...; words are
+    split on _ - . and camelCase). A bare ``key`` and any other <word>_key (bib_key), zenodo_id, keywords, token_count,
+    max_tokens are NOT masked. Names are case-insensitive, percent-encoded names are decoded, ZENODO_TOKEN= /
+    ZENODO_SANDBOX_TOKEN= assignments are masked (a colon after them is prose); header dicts, query strings, key=value
+    and JSON-looking text; before printing (every print, every exit message, every argument-parsing error, an exception
+    that escapes main()) and before any journal write. A secret that is neither registered nor attached to such a
     name (another field name, a token typed in a --reason), or a short secret glued to other characters, is not
     recognised. A token with whitespace or control characters is refused unseen; every numeric environment setting
     is validated before any request. The git calls of this module and the commands of the pre-deposit battery run
-    with an environment without any secret-looking variable.
+    with an ALLOW-LIST environment (predeposit_check.CHILD_ENV_ALLOW, zenodo_publish._GIT_ENV_KEEP): a variable that
+    is not named there is not passed, whatever its name.
 
 UNPROVEN (never observed on a server): the semantics of DELETE vs actions/discard, custom acceptance for
 workingpaper, latest_draft on clean published records, X-Total/Link headers, status=draft including edit
@@ -655,44 +662,115 @@ def register_secret(value) -> None:
 
 
 # Sensitive field NAMES, masked whatever the value (headers, query strings, key=value text, JSON-looking text,
-# dict keys). Case-insensitive; "-" and "_" are interchangeable where a name has one.
-_SENSITIVE_NAMES = (r"proxy[-_]authorization", r"authorization", r"set[-_]cookie", r"cookie",
-                    r"x[-_]api[-_]key", r"api[-_]?key", r"x[-_]auth[-_]token", r"x[-_]access[-_]token",
-                    r"private[-_]token", r"access[-_]?token", r"refresh[-_]?token",
-                    r"client[-_]?secret", r"password", r"token")
-# The names of the two token variables of this tool, recognised in ``NAME=value`` assignments only (a colon after
-# ZENODO_TOKEN is ordinary prose in this tool's own messages).
-_ASSIGNMENT_NAMES = (r"zenodo[-_](?:sandbox[-_])?token",)
-_NAME_ALT = "|".join(_SENSITIVE_NAMES)
-_NAME_ALT_EQ = "|".join(_ASSIGNMENT_NAMES + _SENSITIVE_NAMES)
-_SENSITIVE_KEY = re.compile(rf"(?i)(?:{_NAME_ALT_EQ})")
+# dict keys). A name is split into words on "_", "-", "." and whitespace and on camelCase boundaries (authToken,
+# APIKey, AWSSecretAccessKey) and is SENSITIVE when, case-insensitively:
+#   * its words, joined, END with one of CREDENTIAL_SUFFIXES (token, secret, password, passwd, passphrase,
+#     credential(s), authorization, cookie, signature): auth_token, id_token, api_secret, client_secret, db_password,
+#     session_cookie, x-amz-security-token, Proxy-Authorization, accesstoken, ...;
+#   * its words, joined, CONTAIN "apikey" (x-api-key, API_KEY, api_key_id, apiKey), or it holds two consecutive words
+#     (access|secret|private, key): AWS_SECRET_ACCESS_KEY, ssh_private_key, privateKey, accessKeyId, ...;
+#   * its last word is "key" and the word before it is one of KEY_QUALIFIERS (auth_key, signing_key, session_key...).
+# A bare ``key`` and every other ``<word>_key`` (bib_key, sort_key, cache_key, primary_key) is NOT sensitive: it is
+# ordinary bibliographic or technical text, and so are token_count, max_tokens, keywords, zenodo_id, publication_date.
+CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd", "passphrase", "credential", "credentials",
+                       "authorization", "cookie", "signature")
+CREDENTIAL_KEY_PAIRS = (("access", "key"), ("secret", "key"), ("private", "key"))
+KEY_QUALIFIERS = ("auth", "signing", "encryption", "ssh", "session", "master", "client", "license")
+# The two token variables of this tool are credential names too, but a colon after them is ordinary prose in this
+# tool's own messages ("ZENODO_TOKEN: the production token ..."): they are masked in NAME=value assignments only.
+_PROSE_NAMES = ("zenodo_token", "zenodo_sandbox_token")
+_NAME_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+
+
+def credential_name_words(name: str) -> list:
+    """The lower-case words of a field name: runs of letters or digits, so every other character (_ - . whitespace) is a
+    separator, and a camelCase boundary (authToken, APIKey) is one too."""
+    return [w.lower() for w in _NAME_WORDS.findall(name)]
+
+
+def is_credential_name(name) -> bool:
+    """True when ``name`` designates a credential by the rules above, whatever its value."""
+    if not isinstance(name, str):
+        return False
+    words = credential_name_words(name)
+    if not words:
+        return False
+    joined = "".join(words)
+    if joined.endswith(CREDENTIAL_SUFFIXES) or "apikey" in joined:
+        return True
+    if any(pair in CREDENTIAL_KEY_PAIRS for pair in zip(words, words[1:])):
+        return True
+    return len(words) >= 2 and words[-1] == "key" and words[-2] in KEY_QUALIFIERS
+
+
 # An authentication scheme word followed by its credential. Applied FIRST (before any name=value pattern) so that
 # the credential is masked whatever the field it travels in; the credential stops at a quote or a separator.
-_SCHEME = re.compile(r"(?i)\b(?P<scheme>bearer|basic)\s+(?P<cred>[^\s\"'&<>,;]+)")
-_SCHEME_WORDS = r"(?:(?:bearer|basic|digest|negotiate|token)[ \t]+)?"
-# "Name: value" (a header or a JSON/dict member): a quoted value, else the rest of the line.
-_FIELD_COLON = re.compile(rf"(?i)(?<![\w-])(?P<name>{_NAME_ALT})(?P<kq>[\"']?)(?P<sep>\s*:\s*|%3[Aa]\s*)"
-                          r"(?P<val>\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\r\n]*)")
-# "name=value" (a query string or key=value text): a quoted value, else (scheme word and) credential up to the next
+_SCHEME = re.compile(r"(?i)\b(?P<scheme>bearer:?|basic)\s+(?P<cred>[^\s\\\"'&<>,;]+)")
+# The head of a field: its name, an optional (possibly escaped) quote, the separator.
+_HEAD_COLON = re.compile(r"(?<![\w.-])(?P<name>\w[\w.-]*)(?P<kq>\\?[\"']?)(?P<sep>[ \t]*:[ \t]*|%3[Aa][ \t]*)")
+_HEAD_EQ = re.compile(r"(?<![\w.-])(?P<name>\w[\w.-]*)(?P<kq>\\?[\"']?)(?P<sep>[ \t]*=[ \t]*|%3[Dd])")
+# A quoted value: "..." (escapes allowed), '...' or an escaped \"...\" inside JSON-looking text.
+_QUOTED = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'[^']*'|\\\"(?:[^\\]|\\(?!\"))*\\\"")
+# An UNQUOTED value that is a whole header value: it runs to the end of the line or the closing quote, whatever its
+# scheme (Bearer, ApiKey, AWS4-HMAC-SHA256 Credential=..., Digest realm="x", ...) and may hold spaces and commas, but
+# it stops at a real or escaped line end (\r, \n written as text), at an unbalanced quote (the closing quote of the
+# text that embeds it) and, in the name=value form, at "&" and "<" ">". A balanced name="value" piece is part of it.
+_HEADER_COLON = re.compile(r"(?:[\w.-]+=\"[^\"\r\n]*\"|[\w.-]+='[^'\r\n]*'|\\(?![rn\"'])|[^\r\n\"'\\])*")
+_HEADER_EQ = re.compile(r"(?:[\w.-]+=\"[^\"\r\n]*\"|[\w.-]+='[^'\r\n]*'|\\(?![rn\"'])|[^\r\n\"'\\&<>])*")
+# A short value of any other credential name in the name=value form: (scheme word and) credential up to the next
 # separator.
-_FIELD_EQ = re.compile(rf"(?i)(?<![\w-])(?P<name>{_NAME_ALT_EQ})(?P<kq>[\"']?)(?P<sep>\s*=\s*|%3[Dd])"
-                       rf"(?P<val>\"(?:[^\"\\]|\\.)*\"|'[^']*'|{_SCHEME_WORDS}[^&\s\"'<>]+)")
+_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)[ \t]+)?[^&\s\"'<>]+", re.IGNORECASE)
 # A name written with percent escapes (access%5Ftoken, X%2DApi%2DKey) followed by a separator: decoded before matching
-# so that the name patterns see it. Only a decoded name made of word characters and hyphens is substituted.
-_ENCODED_NAME = re.compile(r"(?<![\w%-])(?P<enc>[\w-]*(?:%[0-9A-Fa-f]{2}[\w-]*)+)(?=[\"']?(?:\s*[:=]|%3[AaDd]))")
+# so that the name rules see it. Only a decoded name made of word characters, dots and hyphens is substituted.
+_ENCODED_NAME = re.compile(r"(?<![\w.%-])(?P<enc>[\w.-]*(?:%[0-9A-Fa-f]{2}[\w.-]*)+)(?=[\"']?(?:\s*[:=]|%3[AaDd]))")
 _SHORT_EDGE = (r"(?<![A-Za-z0-9_])", r"(?![A-Za-z0-9_])")
+_AUTH_WORDS = ("authorization",)
 
 
 def _decode_encoded_name(m) -> str:
     from urllib.parse import unquote
     decoded = unquote(m.group("enc"))
-    return decoded if re.fullmatch(r"[\w-]+", decoded) else m.group("enc")
+    return decoded if re.fullmatch(r"[\w.-]+", decoded) else m.group("enc")
 
 
-def _mask_field(m) -> str:
-    val = m.group("val")
-    quote = val[0] if val[:1] in ("'", '"') and len(val) >= 2 and val[-1] == val[0] else ""
-    return f"{m.group('name')}{m.group('kq')}{m.group('sep')}{quote}[REDACTED]{quote}"
+def _is_auth_name(name: str) -> bool:
+    return "".join(credential_name_words(name)).endswith(_AUTH_WORDS)
+
+
+def _value_end(text: str, pos: int, colon: bool, auth: bool) -> int:
+    """Index just after the value that starts at ``pos``."""
+    q = _QUOTED.match(text, pos)
+    if q:
+        return q.end()
+    if colon:
+        return _HEADER_COLON.match(text, pos).end()
+    if auth:
+        return _HEADER_EQ.match(text, pos).end()
+    m = _TOKEN_EQ.match(text, pos)
+    return m.end() if m else pos
+
+
+def _mask_fields(text: str, head, colon: bool) -> str:
+    """Mask the value of every credential-named field whose head (name, quote, separator) ``head`` finds. A head of
+    a name that is not sensitive consumes only itself, so a sensitive field written after it is still found."""
+    out, last, pos = [], 0, 0
+    while True:
+        m = head.search(text, pos)
+        if m is None:
+            break
+        name = m.group("name")
+        sensitive = is_credential_name(name) and not (colon and "_".join(credential_name_words(name)) in _PROSE_NAMES)
+        if not sensitive:
+            pos = m.end()
+            continue
+        end = _value_end(text, m.end(), colon, _is_auth_name(name))
+        val = text[m.end():end]
+        quote = val[0] if val[:1] in ("'", '"') and len(val) >= 2 and val[-1] == val[0] else ""
+        out.append(text[last:m.end()])
+        out.append(f"{quote}[REDACTED]{quote}")
+        last = pos = max(end, m.end())
+    out.append(text[last:])
+    return "".join(out)
 
 
 def _mask_scheme(m) -> str:
@@ -704,11 +782,11 @@ def _pass_scheme(text: str) -> str:
 
 
 def _pass_field_colon(text: str) -> str:
-    return _FIELD_COLON.sub(_mask_field, _ENCODED_NAME.sub(_decode_encoded_name, text))
+    return _mask_fields(_ENCODED_NAME.sub(_decode_encoded_name, text), _HEAD_COLON, True)
 
 
 def _pass_field_eq(text: str) -> str:
-    return _FIELD_EQ.sub(_mask_field, _ENCODED_NAME.sub(_decode_encoded_name, text))
+    return _mask_fields(_ENCODED_NAME.sub(_decode_encoded_name, text), _HEAD_EQ, False)
 
 
 # The pattern passes. Each one is complete on its own (none relies on another having run first), so that the result
@@ -721,7 +799,7 @@ def is_sensitive_name(key) -> bool:
     if not isinstance(key, str):
         return False
     from urllib.parse import unquote
-    return _SENSITIVE_KEY.fullmatch(unquote(key).strip().strip("\"'")) is not None
+    return is_credential_name(unquote(key).strip().strip("\"'"))
 
 
 def redact(text, short_secrets: bool = True, passes=None) -> str:
@@ -2111,15 +2189,23 @@ def archive_pdf(repo_root: Path, pdf_path: Path, name_stem: str, version: str | 
 
 # ── Metadata builder ───────────────────────────────────────────────────────────
 
-_GIT_ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "USER", "LOGNAME", "SSH_AUTH_SOCK")
+_GIT_ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "USER", "LOGNAME",
+                 # the GIT_* variables that carry no credential (the same names as predeposit_check.CHILD_ENV_ALLOW; a
+                 # test pins the equality). GIT_ASKPASS, GIT_SSH_COMMAND, GIT_CONFIG_PARAMETERS, GIT_CONFIG_KEY_* /
+                 # GIT_CONFIG_VALUE_*, GIT_TRACE_CURL... and SSH_AUTH_SOCK are NOT passed: the git calls of this
+                 # module are local (branch, git dir, remote url) and need none of them.
+                 "GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+                 "GIT_EXEC_PATH", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+                 "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS")
 
 
 def git_env(environ=None) -> dict:
-    """The environment of the ``git`` children of this module: PATH, HOME, the locale, TMPDIR and ``GIT_*`` only,
-    so that no ZENODO_* variable (in particular no token) is handed to a child. (Children inherit the environment of
-    their parent unless it is scrubbed.)"""
+    """The environment of the ``git`` children of this module: an ALLOW-LIST (_GIT_ENV_KEEP): PATH, HOME, the locale,
+    TMPDIR and the GIT_* variables that carry no credential. Nothing else is passed (no ZENODO_* variable, no token
+    under any name, no SSH agent socket, no GIT_ASKPASS). Children inherit the environment of their parent unless it
+    is scrubbed."""
     environ = os.environ if environ is None else environ
-    return {k: v for k, v in environ.items() if k in _GIT_ENV_KEEP or k.startswith("GIT_")}
+    return {k: v for k, v in environ.items() if k in _GIT_ENV_KEEP}
 
 
 def get_git_branch(paper_dir: Path) -> str | None:
@@ -3277,6 +3363,10 @@ def finalize_journal(journal, client=None) -> None:
 
 
 def main(argv=None):
+    # An exception that escapes main() is printed by the interpreter, not by this module's print: its text can carry a
+    # secret (a header value in a requests error). The redacting hook is installed HERE, not only under __main__,
+    # because the sandbox launcher and the failure-injection harness import this module and call main().
+    sys.excepthook = _redacting_excepthook
     register_environment_secrets()        # BEFORE the arguments are parsed: an argparse error echoes the values it refuses
     parser = build_parser()
     args = parser.parse_args(argv)

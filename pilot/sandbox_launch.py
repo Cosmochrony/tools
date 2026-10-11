@@ -9,7 +9,8 @@ into THIS process's environment only; the tool then runs in-process. Consequence
   * the token is never in an argument vector (nothing for `ps` to show, in this process or in any child). It IS in
     the environment of this process: a child process inherits that environment unless it is scrubbed. The tool
     runs its `git` helper calls and the commands of the pre-deposit battery (predeposit_check.py) with an
-    environment WITHOUT any secret-looking variable (ZENODO_*, GH_*, *TOKEN*, ...); any other child would inherit it;
+    ALLOW-LIST environment (only the named variables: PATH, HOME, locale, TMPDIR, TeX Live and python variables, no
+    proxy, no SSH agent socket, no credential-bearing GIT_*; see tools/README.md); any other child would inherit it;
   * the process environment is reduced to PATH and HOME plus ZENODO_SANDBOX_TOKEN, and the launcher refuses if
     the production variable ZENODO_TOKEN is present at all;
   * the arguments after `--` must contain --sandbox (the tool then reads ONLY ZENODO_SANDBOX_TOKEN).
@@ -61,7 +62,7 @@ def main(argv=None, getpass_fn=getpass.getpass, zp=None) -> int:
     try:
         zp.main(passthrough)
     except SystemExit as exc:
-        return exc.code if isinstance(exc.code, int) else (print(exc.code, file=sys.stderr) or 1)
+        return exc.code if isinstance(exc.code, int) else (print(zp.redact(exc.code), file=sys.stderr) or 1)
     return 0
 
 

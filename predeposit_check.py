@@ -79,18 +79,46 @@ COVER_STATUS = re.compile(
 RELEASE_PATHS = ("tex/", "README", "zenodo.json", "CITATION.cff", "compile.sh")
 
 
-# A child of the battery (grep, git, pdfinfo, pdflatex...) must never inherit a credential: the variables whose NAME
-# looks like a secret are removed from its environment (a repository's git configuration, a hook or an alias runs
-# with this environment). Everything else (PATH, HOME, LANG, TMPDIR, TEXMF*, python variables...) is kept.
-_SECRET_NAME = re.compile(r"(?i)(^ZENODO_|^GH_|^GITHUB_|^NETLIFY_|^ORCID|TOKEN|SECRET|PASSW|API[-_]?KEY|CREDENTIAL|^AWS_)")
+# A child of the battery must never inherit a credential. The environment handed to every child is an ALLOW-LIST
+# (CHILD_ENV_ALLOW): a variable that is not named here is not passed, whatever its name (a custom variable, a token
+# under a name nobody thought of, *_KEY, COOKIE, AUTH, JWT, PASSPHRASE, an HTTPS_PROXY / PIP_INDEX_URL carrying a
+# password, SSH_AUTH_SOCK, GIT_ASKPASS, GIT_SSH_COMMAND, GIT_CONFIG_VALUE_*, DOCKER_CONFIG, KUBECONFIG, DYLD_*...).
+#
+# What the battery runs (read from this module): grep -a (log counts), git (branch, rev-parse, status, ls-remote of a
+# public https remote), pdfinfo and, through the same helpers, whatever a paper's own release check needs. The TeX
+# Live tools (pdflatex, bibtex) are not run by the battery itself, but a paper's compile.sh or a check built on sh()
+# may run them, so the variables TeX Live reads are allowed: it was verified that pdflatex + bibtex build a real paper
+# under exactly this environment (tests/test_zenodo_round6.py).
+#
+# Deliberately NOT passed, with the reason: HTTP(S)_PROXY / ALL_PROXY / NO_PROXY and their lower-case forms (a proxy URL
+# may embed a password; the battery needs no proxy for a public remote); SSL_CERT_FILE / SSL_CERT_DIR / CURL_CA_BUNDLE
+# (no TLS client of ours); SSH_AUTH_SOCK (an agent socket is a credential: an ssh remote is verified by hand);
+# LD_LIBRARY_PATH / DYLD_* (they change which code a child loads); every GIT_* except the path / locale-neutral ones
+# below (GIT_ASKPASS, GIT_SSH_COMMAND, GIT_CONFIG_PARAMETERS, GIT_CONFIG_KEY_*/VALUE_* can carry a credential).
+CHILD_ENV_ALLOW = frozenset({
+    # process basics
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TZ", "TMPDIR",
+    # locale
+    "LANG", "LANGUAGE", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
+    # TeX Live (pdflatex, bibtex, kpathsea) and reproducible builds
+    "TEXINPUTS", "BIBINPUTS", "BSTINPUTS", "TEXFONTS", "TFMFONTS", "TEXMFHOME", "TEXMFVAR", "TEXMFCONFIG",
+    "TEXMFCACHE", "TEXMFCNF", "TEXMFOUTPUT", "TEXMFDOTDIR", "TEXMFLOCAL", "TEXMFSYSVAR", "TEXMFSYSCONFIG",
+    "SOURCE_DATE_EPOCH", "FORCE_SOURCE_DATE", "openout_any", "openin_any", "shell_escape", "max_print_line",
+    "error_line", "half_error_line",
+    # python children
+    "PYTHONPATH", "PYTHONHOME", "PYTHONUTF8", "PYTHONIOENCODING", "PYTHONHASHSEED", "PYTHONDONTWRITEBYTECODE",
+    "PYTHONPYCACHEPREFIX", "PYTHONUNBUFFERED", "PYTHONWARNINGS", "VIRTUAL_ENV",
+    # git (no credential-bearing GIT_* variable)
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_EXEC_PATH",
+    "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS",
+})
 
 
 def child_env(environ=None) -> dict:
-    """The environment handed to every subprocess of this module: ``environ`` (default os.environ) WITHOUT any
-    variable whose name looks like a secret (ZENODO_*, GH_*, GITHUB_*, NETLIFY_*, ORCID*, *TOKEN*, *SECRET*,
-    *PASSW*, *API_KEY*, *CREDENTIAL*, AWS_*)."""
+    """The environment handed to every subprocess of this module: ONLY the variables named in CHILD_ENV_ALLOW,
+    taken from ``environ`` (default os.environ). A variable that is not listed is not passed."""
     environ = os.environ if environ is None else environ
-    return {k: v for k, v in environ.items() if not _SECRET_NAME.search(k)}
+    return {k: v for k, v in environ.items() if k in CHILD_ENV_ALLOW}
 
 
 def sh(cmd: str, cwd: Path | None = None) -> tuple[int, str]:

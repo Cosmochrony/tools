@@ -165,7 +165,7 @@ def main(argv=None, zp=None, requests_mod=None, environ=None) -> int:
         zp.main(passthrough)
         status = 0
     except SystemExit as exc:
-        print(f"[inject_failures] zenodo_publish exited with: {exc.code!r}")
+        print(f"[inject_failures] zenodo_publish exited with: {zp.redact(repr(exc.code))}")
         status = exc.code if isinstance(exc.code, int) else 1
     except KeyboardInterrupt:
         print("[inject_failures] zenodo_publish ended with KeyboardInterrupt (exit 130 expected)")

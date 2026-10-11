@@ -897,11 +897,11 @@ class PinIsAFullPrefix(unittest.TestCase):
 
 class GitChildrenEnvironment(unittest.TestCase):
     SECRET_ENV = {"ZENODO_TOKEN": PROD_TOKEN, "ZENODO_SANDBOX_TOKEN": SBX_TOKEN, "PATH": os.environ.get("PATH", ""),
-                  "HOME": "/home/x", "GIT_DIR_HINT": "1", "OTHER": "o", "LANG": "C"}
+                  "HOME": "/home/x", "GIT_DIR": "1", "OTHER": "o", "LANG": "C"}
 
     def test_git_env_keeps_only_what_git_needs_and_never_a_zenodo_variable(self):
         env = zp.git_env(self.SECRET_ENV)
-        self.assertEqual(set(env), {"PATH", "HOME", "GIT_DIR_HINT", "LANG"})
+        self.assertEqual(set(env), {"PATH", "HOME", "GIT_DIR", "LANG"})
         self.assertNotIn(PROD_TOKEN, env.values())
         self.assertNotIn(SBX_TOKEN, env.values())
 

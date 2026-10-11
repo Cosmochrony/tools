@@ -8,7 +8,7 @@ before any production deposit. Every step below is an instruction for the operat
 | File | Role |
 |---|---|
 | `checksums_before_after.sh` | **Read-only** snapshot / compare of the production state (paper `zenodo.json`, `pdfs/`, bibliographies, `git status` of the paper and of `tools`). Never deletes, refuses to overwrite a snapshot, refuses a LABEL that is not a plain file name (no `/`, no `..`, no leading `.` or `-`). |
-| `sandbox_launch.py` | Runs `zenodo_publish.py` (or one `inject_failures.py` case) against the sandbox with the token **read from the terminal** (getpass) and kept in that Python process only: never in an argument vector (it is in the environment of that process; the four `git` calls of `zenodo_publish.py` run with a reduced environment that does not carry it, while the pre-deposit battery's commands inherit it), environment reduced to `PATH`, `HOME` and the token. Refuses without `--sandbox` or if `ZENODO_TOKEN` exists. |
+| `sandbox_launch.py` | Runs `zenodo_publish.py` (or one `inject_failures.py` case) against the sandbox with the token **read from the terminal** (getpass) and kept in that Python process only: never in an argument vector (it is in the environment of that process; the `git` calls of `zenodo_publish.py` and the commands of the pre-deposit battery run with an allow-list environment that does not carry it), environment reduced to `PATH`, `HOME` and the token. Refuses without `--sandbox` or if `ZENODO_TOKEN` exists. |
 | `inject_failures.py` | Scratch harness: wraps `ZenodoClient._request` (and, for two cases, `build_metadata` / `get_record`) **in memory** to inject one failure case F-a..F-i, then calls `zenodo_publish.main`. Refuses unless `--sandbox` is given, `ZENODO_TOKEN` is absent from the environment and every request URL is `https://sandbox.zenodo.org/...`. The tool file is never modified. |
 
 The tests of both (`tests/test_pilot_harness.py`) run offline against the `Sim` double.
@@ -40,7 +40,7 @@ SNAP() { sh tools/pilot/checksums_before_after.sh snapshot "$1" "<PAPER_DIR>" "<
 ```
 
 `RUN` is `sandbox_launch.py`: it takes the sandbox token from the terminal (not echoed, not in the history, **not in
-any argument vector**; it lives in the environment of the launcher's own process, so it is in no command line, the `git` calls of `zenodo_publish.py` and the commands of the pre-deposit battery run with an environment without any secret-looking variable), `--sandbox` makes the tool read only
+any argument vector**; it lives in the environment of the launcher's own process, so it is in no command line, the `git` calls of `zenodo_publish.py` and the commands of the pre-deposit battery run with an allow-list environment: only named variables are passed), `--sandbox` makes the tool read only
 `ZENODO_SANDBOX_TOKEN`, and both the launcher and the harness refuse if `ZENODO_TOKEN` is present. Every `RUN` call
 therefore starts with `--` before the tool's own arguments (see the commands below). Run every command in the foreground. After each step run
 `SNAP after-Pn` and `sh tools/pilot/checksums_before_after.sh compare "$SCR/snap/before.snapshot" "$SCR/snap/after-Pn.snapshot"`:
