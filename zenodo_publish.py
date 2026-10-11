@@ -16,7 +16,9 @@ Usage (production):
     python tools/zenodo_publish.py --reconcile JOURNAL --outcome not-published (--record-url URL | --i-checked-the-account --reason TXT)
     python tools/zenodo_publish.py --backup-journal JOURNAL                          # copy only; nothing is unblocked
     python tools/zenodo_publish.py --lift-block JOURNAL --reason TXT (--record-url URL | --i-checked-the-account)
-                                                          # a journal no reconcile can cure: a decision file, the journal is untouched
+                                  [--paper-dir DIR] [--record-id N --concept-id C --concept-doi D]
+                                                          # a journal no reconcile can cure: a decision file, the journal is untouched;
+                                                          # a journal that records a publication needs zenodo_id and doi in zenodo.json first
 
 Sandbox (never touches a production id, DOI, pdfs/ or bibliography; see tools/README.md):
     python tools/pilot/sandbox_launch.py -- PAPER/ --sandbox --sandbox-state /tmp/new-state.json --state-dir DIR
@@ -43,8 +45,13 @@ Guards (all offline-tested; the server semantics they rely on are listed as UNPR
     mismatching; paper directory moved) is lifted by --lift-block JOURNAL --reason TXT (--record-url URL |
     --i-checked-the-account): a SEPARATE file JOURNAL.decision.json (journal sha256, who, when, reason, evidence,
     UNBLOCK), made after --backup-journal's copy (JOURNAL beside itself, never overwritten); the journal is never
-    renamed, edited or deleted, and the decision counts only while the journal has exactly those bytes. Every value
-    written to a journal is masked first (see the last bullet).
+    renamed, edited or deleted, and the decision counts only while the journal has exactly those bytes. A journal
+    that records a CONFIRMED or LIKELY publication (PUBLISHED-UNSAVED, UNRECONCILED, a publish request sent) is
+    lifted ONLY when the paper's zenodo.json already holds the published zenodo_id and doi (the journal's, or given
+    with --record-id/--concept-id/--concept-doi; --paper-dir DIR when the directory moved), else the lift is REFUSED
+    and says what to restore by hand; the decision then holds only while zenodo.json keeps those ids, so a lift never
+    lets a run publish the paper a first time again. Every value written to a journal is masked first (see the last
+    bullet).
   * A run REFUSES when a draft/edit session of the concept already exists, and on any failure cleans up ONLY the
     server state this run certainly created (an uncertain outcome is reported and searched for, never assumed
     away; ambiguity discards nothing). The cleanup call comes from an explicit kind table (CLEANUP_CALLS):
@@ -679,6 +686,12 @@ KEY_QUALIFIERS = ("auth", "signing", "encryption", "ssh", "session", "master", "
 # The two token variables of this tool are credential names too, but a colon after them is ordinary prose in this
 # tool's own messages ("ZENODO_TOKEN: the production token ..."): they are masked in NAME=value assignments only.
 _PROSE_NAMES = ("zenodo_token", "zenodo_sandbox_token")
+# Bare English nouns that a field name is made of but that also read as ordinary prose in an abstract ("the Lorentzian
+# signature: (-,+,+,+)"): written alone, they are masked only where a field name can stand (start of the text or of a
+# line, after a quote, a brace, a comma, "&", "?" or ";"), not after a word and a space. Compound names (x-amz-signature,
+# request_signature) are masked everywhere.
+_PROSE_NOUNS = ("signature", "credential", "credentials")
+_AFTER_WORD = re.compile(r"[A-Za-z0-9][ \t]+$")
 _NAME_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 
 
@@ -759,7 +772,11 @@ def _mask_fields(text: str, head, colon: bool) -> str:
         if m is None:
             break
         name = m.group("name")
-        sensitive = is_credential_name(name) and not (colon and "_".join(credential_name_words(name)) in _PROSE_NAMES)
+        words = credential_name_words(name)
+        sensitive = is_credential_name(name) and not (colon and "_".join(words) in _PROSE_NAMES)
+        if sensitive and len(words) == 1 and words[0] in _PROSE_NOUNS \
+                and _AFTER_WORD.search(text[max(0, m.start("name") - 8):m.start("name")]):
+            sensitive = False
         if not sensitive:
             pos = m.end()
             continue
@@ -1254,24 +1271,96 @@ def decision_path(journal: Path) -> Path:
     return journal.with_name(journal.name + DECISION_SUFFIX)
 
 
-def journal_lift_decision_ok(path: Path, data) -> bool:
-    """True when ``<journal>.decision.json`` is an UNBLOCK decision for EXACTLY the bytes this journal has now, for
-    this journal's name and block kind, and the journal is of a liftable kind. Editing the journal afterwards (any
-    byte) makes the decision void: the journal blocks again."""
+def journal_records_publication(data) -> bool:
+    """True when the journal records a CONFIRMED or LIKELY publication: PUBLISHED-UNSAVED (confirmed), UNRECONCILED
+    (the publish request was sent, the outcome is not settled), RUNNING / any other outcome whose last write request
+    was the publish call, or a journal that already carries a record id or a DOI. A journal that proves nothing was
+    published (RUNNING before the publish request, DRAFT-LEFT-BEHIND, NOT-PUBLISHED...) or that cannot be read is NOT
+    in this class."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("outcome") in (UNSAVED_OUTCOME, "UNRECONCILED"):
+        return True
+    if str(data.get("last_write") or "").rstrip("/").endswith("/actions/publish"):
+        return True
+    return bool(data.get("record_id") or data.get("doi"))
+
+
+def config_ids_problem(cfg_path: Path, concept_id, concept_doi, bib_key=None):
+    """None when ``cfg_path`` (a zenodo.json) holds EXACTLY ``zenodo_id`` == concept_id and ``doi`` == concept_doi
+    (and, when given, the journal's bib_key); else a sentence saying what to restore. String equality: not a prefix,
+    not a numeric comparison, no case or whitespace variant."""
+    try:
+        cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"{cfg_path} cannot be read ({redact(exc)})"
+    if not isinstance(cfg, dict):
+        return f"{cfg_path} is not a JSON object"
+    if bib_key and cfg.get("bib_key") != bib_key:
+        return f"{cfg_path} has bib_key {cfg.get('bib_key')!r}, the journal was written for {bib_key!r}: not the same paper"
+    zid = cfg.get("zenodo_id")
+    zid_text = str(zid) if isinstance(zid, int) and not isinstance(zid, bool) else zid
+    problems = []
+    if zid_text != str(concept_id):
+        problems.append(f"{cfg_path} holds zenodo_id {zid!r} but the published concept is {concept_id!r}: set "
+                        f"\"zenodo_id\": {concept_id} by hand")
+    if cfg.get("doi") != concept_doi:
+        problems.append(f"{cfg_path} holds doi {cfg.get('doi')!r} but the published concept DOI is {concept_doi!r}: set "
+                        f"\"doi\": \"{concept_doi}\" by hand")
+    return "; ".join(problems) or None
+
+
+def journal_lift_decision_problem(path: Path, data, paper_dir=None):
+    """None when ``<journal>.decision.json`` is an UNBLOCK decision to honour now; else why not (a sentence), or the
+    empty string when there is no decision at all.
+
+    It is honoured only for EXACTLY the bytes the journal has now (editing it afterwards voids the decision), for this
+    journal's name and block kind, and while the journal is of a liftable kind. For a journal that records a confirmed
+    or likely publication (journal_records_publication) the decision must also carry the VERIFIED RESTORATION of the
+    published identity, and it holds only while ``<paper_dir>/zenodo.json`` of the run that asks STILL holds those
+    ids: a lift never lets a run publish a paper for the first time again."""
     kind = journal_block_kind(data)
     if kind not in LIFTABLE_KINDS:
-        return False
+        return ""
     dec = decision_path(path)
     try:
         if dec.is_symlink() or not dec.is_file():
-            return False
+            return ""
         decision = json.loads(dec.read_text(encoding="utf-8"))
         current = hashlib.sha256(path.read_bytes()).hexdigest()
     except (OSError, ValueError):
-        return False
-    return (isinstance(decision, dict) and decision.get("decision") == "UNBLOCK"
+        return "the decision file cannot be read"
+    if not (isinstance(decision, dict) and decision.get("decision") == "UNBLOCK"
             and decision.get("journal") == path.name and decision.get("block_kind") == kind
-            and isinstance(decision.get("journal_sha256"), str) and decision["journal_sha256"] == current)
+            and isinstance(decision.get("journal_sha256"), str) and decision["journal_sha256"] == current):
+        return "the decision file does not match this journal (it was edited after the decision)"
+    if not journal_records_publication(data):
+        return None
+    restored = decision.get("identity_restored")
+    if not isinstance(restored, dict):
+        return ("the journal records a publication and this decision carries no verified restoration of the published "
+                "identity: lift it again after restoring zenodo_id and doi in zenodo.json")
+    cid, cdoi = restored.get("concept_id"), restored.get("doi")
+    if not (isinstance(cid, str) and _is_ascii_digits(cid) and cid[0] != "0" and len(cid) <= MAX_ID_DIGITS
+            and any(cdoi == f"{r}/{DOI_SUFFIX_WORD}{cid}" for r in ZENODO_REGISTRANTS.values())):
+        return "the decision's recorded identity is not a concept id with its exact DOI"
+    jc, jd = data.get("concept_id"), data.get("concept_doi")
+    if jc not in (None, "") and str(jc) != cid:
+        return f"the journal's concept id {jc!r} is not the one the decision verified ({cid})"
+    if jd not in (None, "") and jd != cdoi:
+        return f"the journal's concept DOI {jd!r} is not the one the decision verified ({cdoi})"
+    if paper_dir is None:
+        return "no paper directory to verify zenodo.json in"
+    problem = config_ids_problem(Path(paper_dir) / "zenodo.json", cid, cdoi, data.get("bib_key"))
+    if problem:
+        return (f"the decision holds only while zenodo.json still carries the published identity of this journal "
+                f"(concept {cid}, {cdoi}): {problem}")
+    return None
+
+
+def journal_lift_decision_ok(path: Path, data, paper_dir=None) -> bool:
+    """True when the decision of ``journal_lift_decision_problem`` is honoured."""
+    return journal_lift_decision_problem(path, data, paper_dir) is None
 
 
 def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), host=None, identity=None) -> list:
@@ -1284,12 +1373,13 @@ def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), hos
     here = _realpath(paper_dir)
     blocking = []
     for path, data in load_journals(state_dir):
-        if journal_lift_decision_ok(path, data):
-            continue                      # the operator's recorded decision for exactly this content
+        decision_problem = journal_lift_decision_problem(path, data, paper_dir)
+        if decision_problem is None:
+            continue                      # the operator's recorded decision for exactly this content (and identity)
         if data is None:
             if _named_after(path, paper_dir):
                 blocking.append((path, {"outcome": "UNREADABLE", "paper_dir": str(paper_dir),
-                                        "block_kind": "unreadable"}))
+                                        "block_kind": "unreadable", "decision_note": decision_problem or None}))
             continue
         outcome = data.get("outcome")
         known = isinstance(outcome, str) and outcome in KNOWN_OUTCOMES
@@ -1314,7 +1404,8 @@ def find_blocking_journals(state_dir: Path, paper_dir: Path, concept_ids=(), hos
             if why:
                 why.append("UNKNOWN OUTCOME (fail closed)")
         if why:
-            blocking.append((path, dict(data, matched_by=why, block_kind=journal_block_kind(data))))
+            blocking.append((path, dict(data, matched_by=why, block_kind=journal_block_kind(data),
+                                        decision_note=decision_problem or None)))
     return blocking
 
 
@@ -1343,13 +1434,25 @@ def blocking_message(blocking: list) -> str:
                               "a link retargeted): no --reconcile can be tied to it"),
             }[kind]
             lines.append(f"    {reason_text}. After checking https://{host}/deposit yourself and reading the journal:")
+            if journal_records_publication(data) and not data.get("sandbox"):
+                lines.append("      The journal records a PUBLICATION (confirmed or likely): a lift needs the published "
+                             "identity RESTORED first. Set \"zenodo_id\" (the concept record id) and \"doi\" (the concept "
+                             "DOI, 10.5281/zenodo.<concept id>) in the paper's zenodo.json by hand, from the record page, "
+                             "then run --lift-block again (with --paper-dir DIR when the directory moved, and "
+                             "--record-id N --concept-id C --concept-doi D when the journal does not record them); with "
+                             "an intact directory and a consistent journal --reconcile writes them for you:")
             lines.append(f"      zenodo_publish.py --lift-block {path} --reason \"what you checked\" "
                          "(--record-url URL | --i-checked-the-account)")
-            lines.append("      (copies the journal beside itself, then writes <journal>.decision.json bound to this exact "
+            lines.append("      (verifies the published identity in zenodo.json when the journal records a publication, "
+                         "copies the journal beside itself, then writes <journal>.decision.json bound to this exact "
                          "content; the journal is never renamed, edited or deleted. --backup-journal makes the copy alone.)")
-            if data.get("outcome") == UNSAVED_OUTCOME:
-                lines.append("      The journal says the publication SUCCEEDED: lifting the block does not undo that. Do "
-                             "NOT re-run the deposit; set zenodo_id and doi in zenodo.json by hand from the record page.")
+            if data.get("outcome") == "DRAFT-LEFT-BEHIND" or (
+                    data.get("outcome") == "RUNNING" and int(data.get("writes_sent") or 0) > 0
+                    and not journal_records_publication(data)):
+                lines.append(f"      A draft or edit session may be left at https://{host}/deposit: discard it BY HAND "
+                             "before lifting (this tool does not clean up after a lift).")
+            if data.get("decision_note"):
+                lines.append(f"      A decision file exists but is NOT honoured: {data['decision_note']}")
             continue
         lines.append(f"    inspect: https://{host}/deposit  and  https://{host}/record/{data.get('deposition_id')}")
         if data.get("outcome") == UNSAVED_OUTCOME:
@@ -1524,13 +1627,15 @@ def reconcile_journal(path: Path, outcome: str, record_id=None, concept_id=None,
                     f"the journal records paper_dir {jdir} but its realpath is now {_realpath(jdir)}, not the "
                     f"recorded paper_dir_real {recorded_real} (a symbolic link was retargeted, or the journal was "
                     "edited): refusing. Nothing was written. (If you have checked the account, --lift-block "
-                    f"{path} lifts the block; it does not save any identifier.)")
+                    f"{path} lifts the block once zenodo.json holds the published zenodo_id and doi, which it does "
+                    "not write for you: set them by hand first.)")
             if not os.path.isdir(recorded_real):
                 raise ReconcileRefused(f"the paper directory recorded in the journal ({recorded_real}) no longer "
                                        "exists: refusing. Nothing was written. (If you have checked the account, "
-                                       f"--lift-block {path} lifts the block; it does not save any identifier: if the "
-                                       "journal says PUBLISHED-UNSAVED the publication happened, so set zenodo_id and "
-                                       "doi by hand and do NOT re-run the deposit.)")
+                                       f"--lift-block {path} lifts the block only once the published zenodo_id and doi "
+                                       "are in the zenodo.json of the directory that now holds the paper (it saves none "
+                                       "itself): if the journal says PUBLISHED-UNSAVED the publication happened, so set "
+                                       "them by hand, then --lift-block JOURNAL --paper-dir DIR.)")
             cfg_path = Path(recorded_real) / "zenodo.json"
             try:
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -1607,7 +1712,10 @@ def _read_journal_bytes(path: Path) -> bytes:
     if not path.name.endswith(JOURNAL_SUFFIX):
         raise ReconcileRefused(f"{path} is not a run journal (*{JOURNAL_SUFFIX})")
     try:
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink():
+            raise ReconcileRefused(f"{path} is a symbolic link, not a regular file (the decision and the copy are "
+                                   f"named after the journal itself): give its real path {_realpath(path)}")
+        if not path.is_file():
             raise ReconcileRefused(f"{path} is not a regular file")
         return path.read_bytes()
     except OSError as exc:
@@ -1669,12 +1777,81 @@ def _operator() -> str:
     return f"{user}@{platform.node() or 'unknown-host'}"
 
 
-def lift_block(path: Path, reason, record_url=None, checked_account=False) -> dict:
+def _merge_asserted(operator, recorded, what: str):
+    """The operator's value and the journal's value of one identifier: equal when both are given."""
+    if operator not in (None, "") and recorded not in (None, "") and str(operator) != str(recorded):
+        raise ReconcileRefused(f"{what}: you give {operator!r} but the journal records {recorded!r}: they must be equal. "
+                               "Nothing was written.")
+    return operator if operator not in (None, "") else (recorded if recorded not in (None, "") else None)
+
+
+def verify_published_identity(data, record_id=None, concept_id=None, concept_doi=None, paper_dir_arg=None) -> dict:
+    """The VERIFIED RESTORATION of the published identity that a lift of a journal recording a publication requires:
+    the ``zenodo.json`` of the paper directory (the explicit one, else the realpath recorded in the journal) must hold
+    ``zenodo_id`` == the published concept id and ``doi`` == the concept DOI (exactly ``10.5281/zenodo.<concept id>``),
+    and the journal's own identity (bib_key; the zenodo.json content hash when the journal is trustworthy). The concept
+    id and DOI come from the journal; the ones the operator gives (--concept-id, --concept-doi, --record-id) must
+    equal the journal's when it has them and are validated like a reconcile's. Raises ReconcileRefused, telling what
+    to restore. Reads only; writes nothing."""
+    data = data if isinstance(data, dict) else {}
+    host = data.get("host") if isinstance(data.get("host"), str) and data.get("host") else PRODUCTION_HOST
+    rid_arg = validate_id(record_id, "--record-id") if record_id not in (None, "") else None
+    cid_arg = validate_id(concept_id, "--concept-id") if concept_id not in (None, "") else None
+    if concept_doi not in (None, ""):
+        validate_concept_doi(concept_doi, cid_arg, host)
+    jrid = validate_id(data["record_id"], "the record id recorded in the journal") if data.get("record_id") not in (None, "") else None
+    jcid = validate_id(data["concept_id"], "the concept id recorded in the journal") if data.get("concept_id") not in (None, "") else None
+    rid = _merge_asserted(rid_arg, jrid, "--record-id")
+    cid = _merge_asserted(cid_arg, jcid, "--concept-id")
+    cdoi = _merge_asserted(concept_doi, data.get("concept_doi"), "--concept-doi")
+    if cdoi:
+        validate_concept_doi(cdoi, cid, host, "--concept-doi" if concept_doi else "the concept DOI recorded in the journal")
+    if not cid or not cdoi:
+        raise ReconcileRefused("the journal does not record the concept id and DOI of the publication: give "
+                               "--concept-id C --concept-doi D (read on the record page) and --record-id N; they must "
+                               "be the ones zenodo.json holds. Nothing was written.")
+    if paper_dir_arg is not None:
+        pdir = Path(_realpath(paper_dir_arg))
+    else:
+        real = data.get("paper_dir_real")
+        if not (isinstance(real, str) and real and os.path.isdir(real)):
+            raise ReconcileRefused("the paper directory recorded in the journal does not exist (moved?): give the "
+                                   "directory that now holds the paper (--lift-block JOURNAL PAPER_DIR, or --paper-dir "
+                                   "DIR), restored with zenodo_id and doi. Nothing was written.")
+        pdir = Path(real)
+    cfg_path = pdir / "zenodo.json"
+    if not pdir.is_dir():
+        raise ReconcileRefused(f"{pdir} is not a directory. Nothing was written.")
+    problem = config_ids_problem(cfg_path, cid, cdoi, data.get("bib_key"))
+    if problem:
+        raise ReconcileRefused(
+            f"the published identity is not restored: {problem}. A lift of a journal that records a publication needs "
+            f"zenodo.json to hold it, or a run could publish the paper a SECOND TIME as a first publication: set "
+            f"\"zenodo_id\" and \"doi\" in {cfg_path} by hand (from the record page), then run --lift-block again "
+            "(or --reconcile --outcome published when the directory is intact). Nothing was written.")
+    raw = cfg_path.read_bytes()
+    if data.get("config_core_sha256") and not journal_identity_problems(data):
+        if config_core_fingerprint(json.loads(raw.decode("utf-8"))) != data["config_core_sha256"]:
+            raise ReconcileRefused(f"{cfg_path} no longer has the content (apart from zenodo_id and doi) it had when the "
+                                   "run started: it is not the file this journal was written for. Restore it and lift "
+                                   "again. Nothing was written.")
+    return {"concept_id": cid, "doi": cdoi, "record_id": rid, "zenodo_json": str(cfg_path),
+            "zenodo_json_sha256": hashlib.sha256(raw).hexdigest(), "bib_key": data.get("bib_key")}
+
+
+def lift_block(path: Path, reason, record_url=None, checked_account=False, record_id=None, concept_id=None,
+               concept_doi=None, paper_dir=None) -> dict:
     """Record the operator's decision to UNBLOCK a journal that no reconcile can cure (kinds in LIFTABLE_KINDS), and
     nothing else: the journal is not renamed, modified or deleted. Steps: validate the evidence; make sure a backup
     copy with the same sha256 exists (make it if not); write ``<journal>.decision.json`` by exclusive create (a
     second lift is refused), recording the journal's sha256, who, when, the reason, the evidence and the decision.
-    The block check honours it only while the journal still has exactly these bytes."""
+    The block check honours it only while the journal still has exactly these bytes.
+
+    A journal that records a CONFIRMED or LIKELY publication (journal_records_publication: PUBLISHED-UNSAVED,
+    UNRECONCILED, a last write that was the publish call, a record id or DOI) is lifted ONLY after the published
+    identity is verified in the paper's zenodo.json (verify_published_identity: nothing is written otherwise, not even
+    the backup); the decision records it and holds only while zenodo.json keeps it. A journal that proves nothing was
+    published keeps the earlier rules (a DRAFT-LEFT-BEHIND draft is for the operator to discard by hand first)."""
     reason_text = validate_reason(reason)
     raw = _read_journal_bytes(path)
     try:
@@ -1712,6 +1889,14 @@ def lift_block(path: Path, reason, record_url=None, checked_account=False) -> di
         raise ReconcileRefused(f"{dec} already exists: a decision is never overwritten or repeated. If the journal was "
                                "edited after that decision (it blocks again) move the old decision file aside BY HAND "
                                "(this tool deletes nothing), then lift again. Nothing was written.")
+    given = any(v not in (None, "") for v in (record_id, concept_id, concept_doi))
+    identity = None
+    if (data or {}).get("sandbox"):
+        if given:
+            raise ReconcileRefused("--record-id/--concept-id/--concept-doi do not apply to a SANDBOX journal: the "
+                                   "paper's zenodo.json holds no sandbox identity. Nothing was written.")
+    elif journal_records_publication(data) or given:
+        identity = verify_published_identity(data, record_id, concept_id, concept_doi, paper_dir)
     sha = hashlib.sha256(raw).hexdigest()
     copy_path = find_journal_backup(path, sha)
     if copy_path is None:
@@ -1721,6 +1906,7 @@ def lift_block(path: Path, reason, record_url=None, checked_account=False) -> di
         "journal_sha256": sha, "block_kind": kind, "outcome_at_decision": (data or {}).get("outcome"),
         "backup": copy_path.name, "backup_sha256": hashlib.sha256(copy_path.read_bytes()).hexdigest(),
         "decided_by": _operator(), "decided_at": _now(), "reason": reason_text, "evidence": evidence,
+        "records_publication": journal_records_publication(data), "identity_restored": identity,
         "tool": "zenodo_publish.py"})
     try:
         _create_exclusive_text(dec, json.dumps(decision, indent=2, ensure_ascii=False) + "\n")
@@ -3274,9 +3460,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Record your decision to UNBLOCK a journal that no --reconcile can cure (unreadable; "
                              "absent/unknown outcome; identity digest absent or mismatching; paper directory moved): "
                              "needs --reason TEXT (>= 10 characters) and --record-url URL or --i-checked-the-account. "
-                             "Makes sure a backup copy with the same sha256 exists, then writes JOURNAL.decision.json "
-                             "(exclusive create). The decision counts only while the journal has exactly these bytes; "
-                             "the journal itself is never renamed, edited or deleted. No network")
+                             "A journal that records a publication (PUBLISHED-UNSAVED, UNRECONCILED, a publish request "
+                             "sent) is lifted ONLY if the paper's zenodo.json already holds the published zenodo_id and "
+                             "doi (the journal's, or the ones you give with --record-id/--concept-id/--concept-doi); "
+                             "otherwise it is REFUSED, saying what to restore by hand. The decision then holds only "
+                             "while zenodo.json keeps those ids. Makes sure a backup copy with the same sha256 exists, "
+                             "then writes JOURNAL.decision.json (exclusive create). The decision counts only while "
+                             "the journal has exactly these bytes; the journal itself is never renamed, edited or "
+                             "deleted. No network")
+    parser.add_argument("--paper-dir", type=Path, metavar="DIR", dest="paper_dir_opt",
+                        help="--lift-block: the paper directory whose zenodo.json must hold the published identity "
+                             "(default: the real path recorded in the journal; needed when the directory moved). "
+                             "The positional paper_dir does the same")
     parser.add_argument("--skip-checks", action="store_true",
                         help="Bypass the pre-deposit check battery only (never the version-label guard, "
                              "the journal block or the diff confirmation)")
@@ -3292,8 +3487,14 @@ def requested_fields(args, parser) -> set:
     return fields
 
 
+def _journal_arg(path: Path) -> Path:
+    """The journal path as given on the command line, made absolute but NOT resolved: a symbolic link is not followed
+    (it is refused by ``_read_journal_bytes``), so a decision or a copy is never made under another journal's name."""
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
 def run_backup_journal(args) -> None:
-    path = args.backup_journal.expanduser().resolve()
+    path = _journal_arg(args.backup_journal)
     try:
         copy_path, sha, created = backup_journal(path)
     except ReconcileRefused as exc:
@@ -3304,22 +3505,33 @@ def run_backup_journal(args) -> None:
 
 
 def run_lift_block(args) -> None:
-    path = args.lift_block.expanduser().resolve()
+    path = _journal_arg(args.lift_block)
     try:
-        info = lift_block(path, args.reason, args.record_url, args.i_checked_the_account)
+        explicit = args.paper_dir_opt or args.paper_dir
+        info = lift_block(path, args.reason, args.record_url, args.i_checked_the_account, args.record_id,
+                          args.concept_id, args.concept_doi, explicit.expanduser() if explicit else None)
     except ReconcileRefused as exc:
         die(f"Error: {exc}")
     print(f"Decision recorded: {info['decision_path']} (UNBLOCK for {path.name}, sha256 {info['journal_sha256']}, "
           f"kind {info['block_kind']}). Backup copy: {info['backup_path']}. The journal itself was not renamed, "
           "edited or deleted; the decision counts only while the journal keeps exactly these bytes.")
-    if info.get("outcome_at_decision") == UNSAVED_OUTCOME:
-        print("Consequences: this journal said the publication SUCCEEDED (PUBLISHED-UNSAVED). Lifting the block "
-              "saves nothing: edit zenodo.json by hand (zenodo_id = the concept record id, doi = the concept DOI, "
-              "read on the record page) and do NOT re-run the deposit: a re-run would publish it a SECOND time.")
+    ident = info.get("identity_restored")
+    if ident:
+        print(f"Published identity VERIFIED in {ident['zenodo_json']} (zenodo_id {ident['concept_id']}, doi "
+              f"{ident['doi']}). Consequences: the next run for this paper is an update or a NEW VERSION of that "
+              "concept, never a first publication. The decision holds only while zenodo.json keeps these two values: "
+              "remove them and the journal blocks again. If the journal said the publication SUCCEEDED, a re-run "
+              "would publish a further version of it: do that on purpose only.")
+    elif info.get("outcome_at_decision") == UNSAVED_OUTCOME or info.get("records_publication"):
+        print("Consequences: this SANDBOX journal records a publication. Lifting the block saves nothing: a next run "
+              "MAY CREATE A NEW sandbox deposition (the sandbox state file, not zenodo.json, holds its result).")
     else:
         print("Consequences: this journal no longer blocks. The next run for this paper MAY CREATE A NEW DEPOSITION; "
               "nothing in this tool can detect a publication that did happen. Make sure no draft or edit session is "
               "left at https://zenodo.org/deposit and that the record is not already published.")
+    if info.get("outcome_at_decision") == "DRAFT-LEFT-BEHIND":
+        print("A draft or edit session was left behind by that run: discard it BY HAND at https://zenodo.org/deposit "
+              "(or the sandbox) before the next run; this tool does not clean up after a lift.")
 
 
 def run_reconcile(args, parser) -> None:
@@ -3379,8 +3591,14 @@ def main(argv=None):
                                 or args.i_checked_the_account or args.reason or args.record_id or args.concept_id
                                 or args.concept_doi):
         parser.error("--backup-journal takes no other reconcile option (it only copies the journal)")
-    if args.lift_block and (args.reconcile or args.outcome or args.record_id or args.concept_id or args.concept_doi):
-        parser.error("--lift-block only takes --reason and --record-url / --i-checked-the-account")
+    if args.lift_block and (args.reconcile or args.outcome):
+        parser.error("--lift-block only takes --reason, --record-url / --i-checked-the-account and, for a journal that "
+                     "records a publication, --record-id / --concept-id / --concept-doi and the paper directory "
+                     "(--paper-dir)")
+    if args.paper_dir_opt and not args.lift_block:
+        parser.error("--paper-dir only makes sense with --lift-block (the positional paper_dir is used otherwise)")
+    if args.paper_dir_opt and args.paper_dir and _realpath(args.paper_dir_opt) != _realpath(args.paper_dir):
+        parser.error("--paper-dir and the positional paper_dir name different directories")
     if not args.reconcile and not args.lift_block and not args.backup_journal and (
             args.outcome or args.record_url or args.i_checked_the_account or args.reason or args.record_id
             or args.concept_id or args.concept_doi):

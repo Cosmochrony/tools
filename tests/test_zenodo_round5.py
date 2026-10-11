@@ -430,8 +430,8 @@ class Journals:
         return j.path
 
     @staticmethod
-    def identity(root, paper, how="edit"):
-        j = make_blocking_journal(root, paper)
+    def identity(root, paper, how="edit", outcome="RUNNING"):
+        j = make_blocking_journal(root, paper, outcome=outcome)
         if how == "edit":
             tamper(j.path, bib_key="SomethingElse")
         elif how == "no-digest":
@@ -441,7 +441,7 @@ class Journals:
         return j.path
 
     @staticmethod
-    def moved(root, paper, outcome="UNRECONCILED"):
+    def moved(root, paper, outcome="RUNNING"):
         j = make_blocking_journal(root, paper, outcome=outcome)
         moved = paper.parent / "paper-moved"
         os.rename(paper, moved)
@@ -750,8 +750,7 @@ class LiftBlock(unittest.TestCase):
 
     def test_lift_block_takes_no_reconcile_option(self):
         jp = Journals.unknown_outcome(self.root, self.paper)
-        for extra in (["--outcome", "published"], ["--record-id", "5"], ["--concept-id", "5"], ["--concept-doi", GOOD_DOI],
-                      ["--reconcile", str(jp)]):
+        for extra in (["--outcome", "published"], ["--reconcile", str(jp)]):
             code, _, _ = run_main(["--lift-block", str(jp), "--i-checked-the-account", "--reason", REASON, *extra], {}, self.root)
             self.assertEqual(code, 2, extra)
         self.assertFalse(decision_of(jp).exists())
@@ -766,19 +765,27 @@ class LiftBlock(unittest.TestCase):
 
 
 class LiftBlockKindsAndConsequences(unittest.TestCase):
-    def test_a_published_unsaved_journal_whose_directory_moved_is_refused_by_reconcile_and_lifted_with_its_consequences(self):
+    def test_a_published_unsaved_journal_whose_directory_moved_is_refused_by_reconcile_and_lifted_only_with_the_published_identity(self):
         root, paper = workspace(zenodo_id=None, doi=None)
         jp, moved = Journals.moved(root, paper, outcome=zp.UNSAVED_OUTCOME)
+        tamper(jp, concept_id="5", concept_doi=GOOD_DOI, record_id=301)
         snap = Bytes(moved / "zenodo.json", jp)
         code, _, _ = reconcile(jp, *published_args(), root=root)
         self.assertIn("no longer exists", str(code))
         self.assertIn("--lift-block", str(code))
         self.assertTrue(snap.unchanged())
-        code, out, _ = lift(jp, root)
+        # the sixth pass: a lift needs the published identity in zenodo.json (REVIEW-TOOL-5 F-9)
+        code, out, _ = lift(jp, root, "--paper-dir", str(moved))
+        self.assertIn("published identity is not restored", str(code))
+        self.assertFalse(decision_of(jp).exists())
+        cfg = json.loads((moved / "zenodo.json").read_text())
+        cfg.update(zenodo_id=5, doi=GOOD_DOI)
+        (moved / "zenodo.json").write_text(json.dumps(cfg, indent=2) + "\n")
+        snap = Bytes(moved / "zenodo.json", jp)
+        code, out, _ = lift(jp, root, "--paper-dir", str(moved))
         self.assertIsNone(code, code)
-        self.assertIn("SUCCEEDED", out)
-        self.assertIn("do NOT re-run the deposit", out)
-        self.assertIn("by hand", out)
+        self.assertIn("VERIFIED", out)
+        self.assertIn("never a first publication", out)
         self.assertTrue(snap.unchanged())                                           # nothing is saved, nothing is edited
         self.assertEqual(json.loads(decision_of(jp).read_text())["block_kind"], "directory")
         self.assertEqual(json.loads(decision_of(jp).read_text())["outcome_at_decision"], zp.UNSAVED_OUTCOME)

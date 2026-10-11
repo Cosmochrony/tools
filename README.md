@@ -134,7 +134,7 @@ python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome published|not-pu
 Run in the foreground, from the version branch (the branch name is the version label), after the
 pre-deposit checks and the independent review. `python3 -m unittest discover -s tests` runs the offline
 suite (over 500 tests, no network: a socket guard fails any real connection). `python3 tests/mutation_check.py`
-re-applies the in-memory mutants (298 mutants in all, of which 45 new in the sixth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
+re-applies the in-memory mutants (348 mutants in all, of which 95 new in the sixth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
 processes, or `--only-new` / `--ids ID1,ID2` for a subset; `--count` prints these numbers from the script); **its expected result is: every mutant killed except
 exactly one survivor, `M16b`, a documented equivalent mutant** (it removes an unreachable defensive assertion; its
 reachable counterpart M16 is killed). The script exits 0 only in that case and 1 for any other survivor, skipped
@@ -182,7 +182,7 @@ technical text): a bare `key`, `bib_key`, `sort_key`, `cache_key`, `primary_key`
 `keywords`, `publication_date`, `token_count`, `tokens`, `max_tokens`, `author`, `authorization_url`, `cookies`,
 `signature_algorithm`, `password_policy`, `secretary`. The unquoted value of a field written `Name=value` runs to the end
 of the line or the next `&`: a field written after it on the same line, separated by a space, is masked with it
-(documented over-masking, the price of a value that may hold spaces). The scheme patterns are applied first, and each
+(documented over-masking, the price of a value that may hold spaces). A bare `signature`, `credential` or `credentials` is also ordinary prose (the Lorentzian signature of a metric, in an abstract that `--dry-run` prints): written alone it is masked only where a field name can stand (start of the text or of a line, after a quote, a brace, a comma, `&`, `?`), never after a word and a space; the compound names (`x-amz-signature`, `request_signature`, `aws_credentials`) are masked everywhere. The scheme patterns are applied first, and each
 pass is complete on its own, so the result does not depend on their order. Every `print` of the tool, every message of
 `sys.exit`, every argument-parsing error and every exception that escapes `main()` passes through the same function (the
 environment tokens are registered before the arguments are parsed, and the redacting `excepthook` is installed by
@@ -295,14 +295,34 @@ python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome not-published --
 python3 tools/zenodo_publish.py --backup-journal <JOURNAL>        # copy only: nothing is unblocked, the original is not touched
 python3 tools/zenodo_publish.py --lift-block <JOURNAL> --reason "what you checked" --i-checked-the-account
 python3 tools/zenodo_publish.py --lift-block <JOURNAL> --reason "what you checked" --record-url https://zenodo.org/deposit/N
+# a journal that records a publication: zenodo.json must hold the published zenodo_id and doi first; --paper-dir when the directory moved
+python3 tools/zenodo_publish.py --lift-block <JOURNAL> --paper-dir <DIR> --reason "what you checked" --i-checked-the-account [--record-id N --concept-id C --concept-doi D]
 ```
 
 `--lift-block` never renames, edits or deletes the journal: it makes sure a copy with the same sha256 exists, then writes
 `<JOURNAL>.decision.json` by exclusive create (a second lift is refused: move the old decision aside by hand if the
 journal was edited after it and blocks again). A decision counts only while the journal has exactly the bytes it
-recorded. For a `PUBLISHED-UNSAVED` journal whose directory moved, `--reconcile` still refuses; `--lift-block` may
-unblock it and then states that the publication HAPPENED: nothing is saved, set `zenodo_id` and `doi` in `zenodo.json`
-by hand and do NOT re-run the deposit. `--reconcile --outcome not-published` is refused for a `PUBLISHED-UNSAVED`
+recorded.
+
+**A lift after a publication needs the published identity (sixth pass).** A journal that records a CONFIRMED or LIKELY
+publication (`PUBLISHED-UNSAVED`, `UNRECONCILED`, any journal whose last write request was `.../actions/publish`, or one
+that already carries a record id or a DOI) is lifted ONLY if the paper's `zenodo.json` already holds the published
+`zenodo_id` (the concept record id) and `doi` (exactly `10.5281/zenodo.<concept id>`): the journal's own values when it
+records them, otherwise the ones you give with `--concept-id C --concept-doi D` (and `--record-id N`), validated like a
+reconcile's and equal to the journal's when both exist. The file checked is the one of the realpath recorded in the
+journal, or of `--paper-dir DIR` (also the positional `paper_dir`) when the directory moved; it must have the journal's
+`bib_key` and, when the journal is trustworthy, its content hash. Otherwise `--lift-block` REFUSES, before it writes the
+backup or the decision, and prints what to restore (set `zenodo_id` and `doi` by hand from the record page, then run
+`--lift-block` again; use `--reconcile --outcome published` when the directory is intact). The decision records the
+verified ids, the `zenodo.json` path and its sha256 at lift time, and the block check honours it **only while the
+`zenodo.json` of the run that asks STILL holds those ids** (an old decision without the verification, ids removed later,
+another concept, a copy of the paper without ids: the run stays blocked and says why). After such a lift the next run is
+an update or a NEW VERSION of the concept, never a first publication; if the journal said the publication SUCCEEDED, a
+re-run publishes a further version, so do that on purpose only. A journal that proves nothing was published (`RUNNING`
+before the publish request, `DRAFT-LEFT-BEHIND`, unreadable or unknown outcome) keeps the earlier rules: for a draft
+left behind, discard the draft or edit session by hand BEFORE lifting (the tool says so; it does not clean up after a
+lift); a SANDBOX journal has no production `zenodo.json` to restore, takes none of the identity options, and a next run
+may create a new sandbox deposition. `--reconcile --outcome not-published` is refused for a `PUBLISHED-UNSAVED`
 journal (the publication did succeed). A sandbox journal never
 writes any `zenodo.json`. If the journal cannot be written before a write request, the request is not sent. The
 journal file is created exclusively (written under a unique temp name, then hard-linked: never over an existing

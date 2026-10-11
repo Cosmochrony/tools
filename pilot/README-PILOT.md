@@ -154,6 +154,9 @@ python3 tools/zenodo_publish.py --reconcile "$SCR/journals/<JOURNAL>.run.json" -
 #   python3 tools/zenodo_publish.py --lift-block <FILE> --reason "..." --i-checked-the-account      (or --record-url URL)
 #   -> writes <FILE>.decision.json (journal sha256, who, when, reason, evidence); the journal is never renamed, edited or deleted;
 #      the decision counts only while the journal keeps exactly those bytes
+#   a journal that records a publication (PUBLISHED-UNSAVED, UNRECONCILED, publish request sent) is lifted only when the paper's
+#   zenodo.json already holds the published zenodo_id and doi (--paper-dir DIR if the directory moved; --record-id/--concept-id/--concept-doi if the
+#   journal does not record them): otherwise it is refused and says what to restore by hand
 # inputs are validated before anything is written: ids are positive integers in ASCII digits, the URL is https on the journal's host and contains
 # the record id, --reason has at least 10 characters; a production deposit is reconciled as published with --concept-id C --concept-doi D
 # (D must be exactly 10.5281/zenodo.C; the sandbox registrant is 10.5072; a different doi already in zenodo.json is refused)

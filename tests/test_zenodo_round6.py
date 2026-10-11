@@ -554,5 +554,691 @@ class ChildEnvironmentIsAnAllowList(unittest.TestCase):
         self.assertEqual(pc.grep_count(pc.UNDEF_RE, d / "main.log"), 0)
 
 
+# ── F-9: lifting a block after a CONFIRMED publication never allows a new first publication ───────────────────
+
+PUB = dict(concept_id="5", concept_doi=GOOD_DOI, record_id=301, doi="10.5281/zenodo.301")
+
+
+def set_ids(paper, zenodo_id=5, doi=GOOD_DOI, **more):
+    p = Path(paper) / "zenodo.json"
+    cfg = json.loads(p.read_text())
+    cfg.update(zenodo_id=zenodo_id, doi=doi, **more)
+    p.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+def drop_ids(paper):
+    p = Path(paper) / "zenodo.json"
+    cfg = json.loads(p.read_text())
+    cfg.update(zenodo_id=None, doi=None)
+    p.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+class LiftOfAPublishedJournal(unittest.TestCase):
+    def setUp(self):
+        self.root, self.paper = workspace(zenodo_id=None, doi=None)
+
+    def published_unsaved(self, moved=True, **extra):
+        """PUBLISHED-UNSAVED whose paper directory moved (liftable kind 'directory'); returns (journal, new dir)."""
+        j = make_blocking_journal(self.root, self.paper, outcome="PUBLISHED-UNSAVED", **{**PUB, **extra})
+        if not moved:
+            return j.path, self.paper
+        new = self.paper.parent / "paper-moved"
+        os.rename(self.paper, new)
+        return j.path, new
+
+    def lift_cli(self, jp, *extra, evidence=("--i-checked-the-account",)):
+        return run_main(["--lift-block", str(jp), *evidence, "--reason", REASON, *extra], {}, self.root)
+
+    def blocked_run(self, paper):
+        f = Factory()
+        code, out, err = run_main([str(paper), "--skip-checks"], PROD_ONLY, self.root, f)
+        return f, str(code), out
+
+    # -- refused without the published identity on disk
+    def test_F9_a_published_unsaved_lift_is_refused_when_zenodo_json_holds_no_ids(self):
+        jp, new = self.published_unsaved()
+        snap = Bytes(jp, new / "zenodo.json")
+        code, out, err = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIsInstance(code, str)
+        self.assertIn("published identity is not restored", code)
+        self.assertIn("zenodo_id", code)
+        self.assertIn("set", code)
+        self.assertTrue(snap.unchanged())
+        self.assertFalse(decision_of(jp).exists())
+        self.assertEqual(list(jp.parent.glob("*.quarantine-copy-*")), [], "no backup is made before the check")
+        f, code, _ = self.blocked_run(new)
+        self.assertIn("REFUSING TO START", code)
+        self.assertEqual(f.client.calls, [])
+
+    def test_F9_the_refusal_names_the_two_values_to_set_and_the_reconcile_alternative(self):
+        jp, new = self.published_unsaved()
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIn('"zenodo_id"', code)
+        self.assertIn('"doi"', code)
+        self.assertIn("--reconcile", code)
+        self.assertIn("5", code)
+        self.assertIn(GOOD_DOI, code)
+
+    def test_F9_the_directory_that_moved_must_be_named(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        code, _, _ = self.lift_cli(jp)           # no --paper-dir, the recorded directory is gone
+        self.assertIsInstance(code, str)
+        self.assertIn("does not exist", code)
+        self.assertFalse(decision_of(jp).exists())
+
+    # -- accepted with the ids restored
+    def test_F9_accepted_when_the_ids_are_restored_and_the_decision_records_them(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        code, out, err = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIsNone(code, code)
+        d = json.loads(decision_of(jp).read_text())
+        r = d["identity_restored"]
+        self.assertEqual((r["concept_id"], r["doi"], r["record_id"]), ("5", GOOD_DOI, "301"))
+        self.assertEqual(r["zenodo_json"], str(new / "zenodo.json"))
+        self.assertEqual(r["zenodo_json_sha256"], sha(new / "zenodo.json"))
+        self.assertTrue(d["records_publication"])
+        self.assertIn("VERIFIED", out)
+        self.assertIn("never a first publication", out)
+
+    def test_F9_the_positional_paper_dir_does_the_same_as_the_flag(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        code, _, _ = self.lift_cli(jp, str(new))
+        self.assertIsNone(code, code)
+
+    def test_F9_an_intact_directory_needs_no_paper_dir(self):
+        jp, paper = self.published_unsaved(moved=False)
+        tamper(jp, title="An edited title")      # an edited journal: identity kind, liftable
+        set_ids(paper)
+        code, _, _ = self.lift_cli(jp)
+        self.assertIsNone(code, code)
+        self.assertEqual(json.loads(decision_of(jp).read_text())["identity_restored"]["zenodo_json"],
+                         str(Path(self.paper) / "zenodo.json"))
+
+    # -- the decision holds only while the ids are there
+    def test_F9_ids_removed_later_block_again_and_restored_they_are_honoured_again(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        self.assertIsNone(self.lift_cli(jp, "--paper-dir", str(new))[0])
+        f, code, _ = self.blocked_run(new)
+        self.assertNotIn("REFUSING TO START", code)
+        drop_ids(new)
+        f, code, _ = self.blocked_run(new)
+        self.assertIn("REFUSING TO START", code)
+        self.assertIn("NOT honoured", code)
+        self.assertIn("zenodo.json", code)
+        self.assertEqual(f.client.calls, [])
+        set_ids(new)
+        f, code, _ = self.blocked_run(new)
+        self.assertNotIn("REFUSING TO START", code)
+
+    def test_F9_a_zenodo_json_of_another_concept_blocks(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        self.assertIsNone(self.lift_cli(jp, "--paper-dir", str(new))[0])
+        set_ids(new, zenodo_id=6, doi="10.5281/zenodo.6")
+        f, code, _ = self.blocked_run(new)
+        self.assertIn("REFUSING TO START", code)
+        self.assertEqual(f.client.calls, [])
+
+    def test_F9_only_the_ids_matter_to_the_decision_not_the_rest_of_zenodo_json(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        self.assertIsNone(self.lift_cli(jp, "--paper-dir", str(new))[0])
+        set_ids(new, version="2.0", web_url="https://elsewhere.example")
+        f, code, _ = self.blocked_run(new)
+        self.assertNotIn("REFUSING TO START", code)
+
+    # -- ids belonging to another concept are refused
+    def test_F9_ids_of_another_concept_on_disk_are_refused(self):
+        jp, new = self.published_unsaved()
+        set_ids(new, zenodo_id=6, doi="10.5281/zenodo.6")
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIn("published identity is not restored", code)
+        self.assertFalse(decision_of(jp).exists())
+
+    def test_F9_a_prefix_a_numeric_equal_or_a_doi_variant_is_not_the_same_identity(self):
+        jp, new = self.published_unsaved()
+        for zid, doi in ((50, "10.5281/zenodo.50"), (5, "10.5281/zenodo.50"), (50, GOOD_DOI), (5, GOOD_DOI + " "),
+                         (5, GOOD_DOI.upper()), (5, "https://doi.org/" + GOOD_DOI), ("05", GOOD_DOI), (5.0, GOOD_DOI),
+                         (True, GOOD_DOI), ([5], GOOD_DOI), (None, GOOD_DOI), (5, None), (5, "")):
+            set_ids(new, zenodo_id=zid, doi=doi)
+            code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+            self.assertIsInstance(code, str, (zid, doi))
+            self.assertFalse(decision_of(jp).exists(), (zid, doi))
+
+    def test_F9_a_string_zenodo_id_equal_to_the_concept_id_is_accepted(self):
+        jp, new = self.published_unsaved()
+        set_ids(new, zenodo_id="5")
+        self.assertIsNone(self.lift_cli(jp, "--paper-dir", str(new))[0])
+
+    def test_F9_another_paper_in_the_directory_is_refused(self):
+        jp, new = self.published_unsaved()
+        set_ids(new, bib_key="Other2026")
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIn("not the same paper", code)
+        self.assertFalse(decision_of(jp).exists())
+
+    def test_F9_zenodo_json_whose_content_changed_is_refused_when_the_journal_is_trustworthy(self):
+        jp, new = self.published_unsaved()
+        set_ids(new, web_url="https://other.example/x")
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIn("no longer has the content", code)
+        self.assertFalse(decision_of(jp).exists())
+
+    def test_F9_a_missing_or_unreadable_zenodo_json_is_refused(self):
+        jp, new = self.published_unsaved()
+        (new / "zenodo.json").write_text("{not json")
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIn("cannot be read", code)
+        (new / "zenodo.json").write_text("[1]")
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIn("not a JSON object", code)
+        os.remove(new / "zenodo.json")
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIn("cannot be read", code)
+        self.assertFalse(decision_of(jp).exists())
+
+    # -- the journal does not know the ids: the operator supplies them
+    def test_F9_a_journal_that_does_not_know_the_ids_needs_them_from_the_operator(self):
+        jp, new = self.published_unsaved(concept_id=None, concept_doi=None, record_id=None, doi=None)
+        set_ids(new)
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new))
+        self.assertIn("does not record the concept id and DOI", code)
+        self.assertFalse(decision_of(jp).exists())
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new), "--record-id", "301", "--concept-id", "5",
+                                   "--concept-doi", GOOD_DOI)
+        self.assertIsNone(code, code)
+        r = json.loads(decision_of(jp).read_text())["identity_restored"]
+        self.assertEqual((r["concept_id"], r["doi"], r["record_id"]), ("5", GOOD_DOI, "301"))
+
+    def test_F9_operator_ids_are_validated_like_a_reconcile(self):
+        jp, new = self.published_unsaved(concept_id=None, concept_doi=None, record_id=None, doi=None)
+        set_ids(new)
+        for extra in (["--concept-id", "05", "--concept-doi", GOOD_DOI], ["--concept-id", "5\u0665", "--concept-doi", GOOD_DOI],
+                      ["--concept-id", "5", "--concept-doi", "10.5281/zenodo.50"], ["--concept-id", "5", "--concept-doi", "10.9999/x"],
+                      ["--concept-id", "5", "--concept-doi", "10.5072/zenodo.5"], ["--record-id", "-3", "--concept-id", "5",
+                                                                                  "--concept-doi", GOOD_DOI]):
+            code, out, err = self.lift_cli(jp, "--paper-dir", str(new), *extra)
+            self.assertIsInstance(code, str, extra)
+            self.assertNotIn("Traceback", out + err)
+            self.assertFalse(decision_of(jp).exists(), extra)
+
+    def test_F9_operator_ids_that_differ_from_the_journals_are_refused(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        for extra in (["--concept-id", "6"], ["--concept-doi", "10.5281/zenodo.6", "--concept-id", "6"], ["--record-id", "302"]):
+            code, _, _ = self.lift_cli(jp, "--paper-dir", str(new), *extra)
+            self.assertIn("must be equal", str(code), extra)
+            self.assertFalse(decision_of(jp).exists(), extra)
+
+    def test_F9_equal_operator_ids_are_accepted(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        code, _, _ = self.lift_cli(jp, "--paper-dir", str(new), "--record-id", "301", "--concept-id", "5", "--concept-doi", GOOD_DOI)
+        self.assertIsNone(code, code)
+
+    def test_F9_garbage_ids_recorded_in_the_journal_are_refused_without_a_traceback(self):
+        for field, bad in (("concept_id", "abc"), ("concept_id", "007"), ("concept_doi", "10.9999/evil"), ("record_id", "x")):
+            root, paper = workspace(zenodo_id=None, doi=None)
+            j = make_blocking_journal(root, paper, outcome="PUBLISHED-UNSAVED", **{**PUB, field: bad})
+            new = paper.parent / "moved"
+            os.rename(paper, new)
+            set_ids(new)
+            code, out, err = run_main(["--lift-block", str(j.path), "--i-checked-the-account", "--reason", REASON,
+                                       "--paper-dir", str(new)], {}, root)
+            self.assertIsInstance(code, str, field)
+            self.assertNotIn("Traceback", out + err)
+            self.assertFalse(decision_of(j.path).exists(), field)
+
+    # -- the other kinds of publication-recording journals
+    def test_F9_unreconciled_and_a_sent_publish_request_need_the_ids_too(self):
+        for label, extra in (("UNRECONCILED", dict(outcome="UNRECONCILED")),
+                             ("RUNNING with the publish call as last write",
+                              dict(outcome="RUNNING", last_write="POST /api/deposit/depositions/301/actions/publish")),
+                             ("RUNNING with a record id", dict(outcome="RUNNING", record_id=301)),
+                             ("RUNNING with a doi", dict(outcome="RUNNING", doi="10.5281/zenodo.301"))):
+            root, paper = workspace(zenodo_id=None, doi=None)
+            j = make_blocking_journal(root, paper, **{**dict(concept_id="5", concept_doi=GOOD_DOI), **extra})
+            new = paper.parent / "moved"
+            os.rename(paper, new)
+            self.assertTrue(zp.journal_records_publication(json.loads(j.path.read_text())), label)
+            code, _, _ = run_main(["--lift-block", str(j.path), "--i-checked-the-account", "--reason", REASON,
+                                   "--paper-dir", str(new)], {}, root)
+            self.assertIn("published identity is not restored", str(code), label)
+            set_ids(new)
+            code, _, _ = run_main(["--lift-block", str(j.path), "--i-checked-the-account", "--reason", REASON,
+                                   "--paper-dir", str(new)], {}, root)
+            self.assertIsNone(code, (label, code))
+
+    def test_F9_a_journal_that_proves_nothing_was_published_keeps_the_earlier_rules(self):
+        for label, extra in (("RUNNING no write", dict(outcome="RUNNING")),
+                             ("RUNNING after a draft was created", dict(outcome="RUNNING", writes_sent=2,
+                                                                         last_write="POST /api/deposit/depositions")),
+                             ("DRAFT-LEFT-BEHIND", dict(outcome="DRAFT-LEFT-BEHIND"))):
+            root, paper = workspace(zenodo_id=None, doi=None)
+            j = make_blocking_journal(root, paper, **extra)
+            self.assertFalse(zp.journal_records_publication(json.loads(j.path.read_text())), label)
+            new = paper.parent / "moved"
+            os.rename(paper, new)
+            code, out, err = run_main(["--lift-block", str(j.path), "--i-checked-the-account", "--reason", REASON], {}, root)
+            self.assertIsNone(code, (label, code))
+            d = json.loads(decision_of(j.path).read_text())
+            self.assertIsNone(d["identity_restored"], label)
+            self.assertFalse(d["records_publication"], label)
+            f = Factory()
+            code2, _, _ = run_main([str(new), "--skip-checks", "--dry-run"], PROD_ONLY, root, f)
+            if label == "DRAFT-LEFT-BEHIND":
+                self.assertIn("discard it BY HAND", out)
+
+    def test_F9_the_block_message_of_a_draft_left_behind_says_to_discard_it_first(self):
+        root, paper = workspace(zenodo_id=None, doi=None)
+        j = make_blocking_journal(root, paper, outcome="DRAFT-LEFT-BEHIND")
+        tamper(j.path, bib_key="Changed")
+        code, _, _ = run_main([str(paper), "--skip-checks"], PROD_ONLY, root, Factory())
+        self.assertIn("discard it BY HAND", str(code))
+
+    def test_F9_the_block_message_of_a_published_journal_says_what_to_restore(self):
+        jp, new = self.published_unsaved()
+        f, code, _ = self.blocked_run(new)
+        self.assertIn("RESTORED first", code)
+        self.assertIn('"zenodo_id"', code)
+        self.assertIn("--paper-dir DIR", code)
+
+    # -- the scenario: a first publication after a lift is impossible
+    def test_F9_after_a_lift_a_run_publishes_a_new_version_never_a_first_deposition(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        self.assertIsNone(self.lift_cli(jp, "--paper-dir", str(new))[0])
+        f = Factory()
+        code, out, err = run_main([str(new), "--skip-checks", "--no-cascade"], PROD_ONLY, self.root, f)
+        names = f.client.names()
+        self.assertNotIn("create", names, (code, names))
+        self.assertIn("newversion", names, (code, names))
+
+    def test_F9_without_the_ids_the_run_stays_blocked_whatever_decision_file_is_planted(self):
+        jp, new = self.published_unsaved()
+        # an operator (or an older tool) writes the decision by hand, without any verified identity
+        raw = jp.read_bytes()
+        planted = {"schema": 1, "decision": "UNBLOCK", "journal": jp.name, "journal_sha256": hashlib.sha256(raw).hexdigest(),
+                   "block_kind": "directory", "reason": "looked at everything, believe me"}
+        decision_of(jp).write_text(json.dumps(planted))
+        f, code, _ = self.blocked_run(new)
+        self.assertIn("REFUSING TO START", code)
+        self.assertIn("no verified restoration", code)
+        self.assertEqual(f.client.calls, [])
+        planted["identity_restored"] = {"concept_id": "5", "doi": GOOD_DOI}
+        decision_of(jp).write_text(json.dumps(planted))
+        f, code, _ = self.blocked_run(new)        # the claim is checked against zenodo.json, which has no ids
+        self.assertIn("REFUSING TO START", code)
+        self.assertEqual(f.client.calls, [])
+
+    def test_F9_a_decision_for_another_concept_than_the_journals_does_not_unblock(self):
+        jp, new = self.published_unsaved()
+        set_ids(new, zenodo_id=6, doi="10.5281/zenodo.6")
+        planted = {"schema": 1, "decision": "UNBLOCK", "journal": jp.name, "journal_sha256": sha(jp),
+                   "block_kind": "directory", "identity_restored": {"concept_id": "6", "doi": "10.5281/zenodo.6"}}
+        decision_of(jp).write_text(json.dumps(planted))
+        f, code, _ = self.blocked_run(new)
+        self.assertIn("REFUSING TO START", code)
+        self.assertIn("not the one the decision verified", code)
+
+    def test_F9_a_copy_of_the_paper_without_ids_stays_blocked_even_when_the_original_holds_them(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        self.assertIsNone(self.lift_cli(jp, "--paper-dir", str(new))[0])
+        copy_dir = self.root / "copy-of-paper"
+        copy_dir.mkdir()
+        cfg = json.loads((new / "zenodo.json").read_text())
+        cfg.update(zenodo_id=None, doi=None)
+        (copy_dir / "zenodo.json").write_text(json.dumps(cfg))
+        import shutil as _sh
+        _sh.copytree(new / "tex", copy_dir / "tex")
+        _sh.copytree(new / "out", copy_dir / "out")
+        f = Factory()
+        code, _, _ = run_main([str(copy_dir), "--skip-checks"], PROD_ONLY, self.root, f)
+        self.assertIn("REFUSING TO START", str(code))
+        self.assertEqual(f.client.calls, [])
+
+    # -- the decision file is checked on its own: planted decisions, no directory, a directory that is none
+    def test_F9_a_decision_checked_without_the_directory_of_the_run_is_not_honoured(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        self.assertIsNone(self.lift_cli(jp, "--paper-dir", str(new))[0])
+        data = json.loads(jp.read_text())
+        self.assertTrue(zp.journal_lift_decision_ok(jp, data, new))
+        self.assertFalse(zp.journal_lift_decision_ok(jp, data))
+        self.assertFalse(zp.journal_lift_decision_ok(jp, data, None))
+        self.assertIn("no paper directory", zp.journal_lift_decision_problem(jp, data, None))
+
+    def planted(self, jp, new, restored, **journal_ids):
+        """A decision file written by hand for the journal's exact bytes, with the given identity claim."""
+        decision = {"schema": 1, "decision": "UNBLOCK", "journal": jp.name, "journal_sha256": sha(jp),
+                    "block_kind": "directory", "identity_restored": restored}
+        decision_of(jp).write_text(json.dumps(decision))
+
+    def test_F9_a_planted_decision_whose_concept_id_is_not_the_journals_stays_blocked(self):
+        # only the concept id disagrees: the journal records no concept DOI
+        jp, new = self.published_unsaved(concept_doi=None)
+        set_ids(new, zenodo_id=6, doi="10.5281/zenodo.6")
+        self.planted(jp, new, {"concept_id": "6", "doi": "10.5281/zenodo.6"})
+        f, code, _ = self.blocked_run(new)
+        self.assertIn("REFUSING TO START", code)
+        self.assertIn("concept id '5' is not the one the decision verified", code)
+        self.assertEqual(f.client.calls, [])
+
+    def test_F9_a_planted_decision_whose_concept_doi_is_not_the_journals_stays_blocked(self):
+        # only the concept DOI disagrees: the journal records no concept id
+        jp, new = self.published_unsaved(concept_id=None)
+        set_ids(new, zenodo_id=6, doi="10.5281/zenodo.6")
+        self.planted(jp, new, {"concept_id": "6", "doi": "10.5281/zenodo.6"})
+        f, code, _ = self.blocked_run(new)
+        self.assertIn("REFUSING TO START", code)
+        self.assertIn("concept DOI", code)
+        self.assertIn("is not the one the decision verified", code)
+        self.assertEqual(f.client.calls, [])
+
+    def test_F9_a_planted_decision_that_matches_a_journal_without_ids_is_honoured_only_with_a_well_formed_identity(self):
+        jp, new = self.published_unsaved(concept_id=None, concept_doi=None)
+        for restored, why in (({"concept_id": "5", "doi": "10.9999/zenodo.5"}, "exact DOI"),
+                              ({"concept_id": "5", "doi": "evil"}, "exact DOI"),
+                              ({"concept_id": "5", "doi": "10.5281/zenodo.50"}, "exact DOI"),
+                              ({"concept_id": "05", "doi": "10.5281/zenodo.05"}, "exact DOI"),
+                              ({"concept_id": "5", "doi": GOOD_DOI.upper()}, "exact DOI"),
+                              ({"concept_id": 5, "doi": GOOD_DOI}, "exact DOI")):
+            set_ids(new, zenodo_id=restored["concept_id"], doi=restored["doi"])
+            self.planted(jp, new, restored)
+            f, code, _ = self.blocked_run(new)
+            self.assertIn("REFUSING TO START", code, restored)
+            self.assertIn(why, code, restored)
+            self.assertEqual(f.client.calls, [], restored)
+        set_ids(new)                                              # the well-formed claim is honoured (the control)
+        self.planted(jp, new, {"concept_id": "5", "doi": GOOD_DOI})
+        f, code, _ = self.blocked_run(new)
+        self.assertNotIn("REFUSING TO START", code)
+
+    def test_F9_a_paper_dir_that_is_not_a_directory_is_refused_as_such(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        for bad in (self.root / "missing-dir", new / "zenodo.json"):
+            code, _, _ = self.lift_cli(jp, "--paper-dir", str(bad))
+            self.assertIn("is not a directory", str(code), bad)
+        self.assertFalse(decision_of(jp).exists())
+
+    # -- sandbox journals and unreadable journals
+    def test_F9_a_sandbox_journal_is_lifted_without_identity_and_refuses_ids(self):
+        root, paper = workspace(zenodo_id=None, doi=None)
+        j = make_blocking_journal(root, paper, outcome="PUBLISHED-UNSAVED", host="sandbox.zenodo.org", sandbox=True)
+        new = paper.parent / "moved"
+        os.rename(paper, new)
+        code, out, _ = run_main(["--lift-block", str(j.path), "--i-checked-the-account", "--reason", REASON], {}, root)
+        self.assertIsNone(code, code)
+        self.assertIsNone(json.loads(decision_of(j.path).read_text())["identity_restored"])
+        self.assertIn("SANDBOX", out)
+        root2, paper2 = workspace(zenodo_id=None, doi=None)
+        j2 = make_blocking_journal(root2, paper2, outcome="PUBLISHED-UNSAVED", host="sandbox.zenodo.org", sandbox=True)
+        os.rename(paper2, paper2.parent / "moved")
+        code, _, _ = run_main(["--lift-block", str(j2.path), "--i-checked-the-account", "--reason", REASON,
+                               "--concept-id", "5"], {}, root2)
+        self.assertIn("SANDBOX", str(code))
+        self.assertFalse(decision_of(j2.path).exists())
+
+    def test_F9_an_unreadable_journal_keeps_the_earlier_rules_and_verifies_ids_when_given(self):
+        jp = state_dir_for(self.root) / f"paper-20260101T000000Z-1-{os.urandom(3).hex()}.run.json"
+        jp.write_bytes(b"{trunc")
+        code, _, _ = self.lift_cli(jp)
+        self.assertIsNone(code, code)
+        self.assertIsNone(json.loads(decision_of(jp).read_text())["identity_restored"])
+        jp2 = state_dir_for(self.root) / f"paper-20260101T000000Z-2-{os.urandom(3).hex()}.run.json"
+        jp2.write_bytes(b"{trunc")
+        code, _, _ = self.lift_cli(jp2, "--concept-id", "5", "--concept-doi", GOOD_DOI)      # no directory known
+        self.assertIn("does not exist", str(code))
+        code, _, _ = self.lift_cli(jp2, "--concept-id", "5", "--concept-doi", GOOD_DOI, "--paper-dir", str(self.paper))
+        self.assertIn("published identity is not restored", str(code))
+        set_ids(self.paper)
+        code, _, _ = self.lift_cli(jp2, "--concept-id", "5", "--concept-doi", GOOD_DOI, "--paper-dir", str(self.paper))
+        self.assertIsNone(code, code)
+
+    # -- command line
+    def test_F9_paper_dir_flag_and_positional_must_agree_and_the_flag_needs_lift_block(self):
+        jp, new = self.published_unsaved()
+        other = self.root / "other"
+        other.mkdir()
+        code, _, _ = self.lift_cli(jp, str(other), "--paper-dir", str(new))
+        self.assertEqual(code, 2)
+        code, out, err = run_main([str(new), "--paper-dir", str(new), "--dry-run"], {}, self.root)
+        self.assertEqual(code, 2)
+        self.assertIn("--paper-dir only makes sense with --lift-block", err)
+
+    def test_F9_lift_block_still_refuses_reconcile_options(self):
+        jp, new = self.published_unsaved()
+        code, _, _ = self.lift_cli(jp, "--outcome", "published")
+        self.assertEqual(code, 2)
+        code, _, _ = run_main(["--backup-journal", str(jp), "--concept-id", "5"], {}, self.root)
+        self.assertEqual(code, 2)
+
+    def test_F9_the_decision_file_stays_valid_json_and_never_holds_a_registered_token(self):
+        jp, new = self.published_unsaved()
+        set_ids(new)
+        with mock.patch.object(zp, "_SECRETS", set()):
+            code, out, err = run_main(["--lift-block", str(jp), "--i-checked-the-account", "--reason",
+                                       f"checked, token {PROD_TOKEN} is not recorded here", "--paper-dir", str(new)],
+                                      {"ZENODO_TOKEN": PROD_TOKEN}, self.root)
+        self.assertIsNone(code, code)
+        text = decision_of(jp).read_text()
+        json.loads(text)
+        self.assertNotIn(PROD_TOKEN, text + out + err)
+
+
+# ── F-5: the survivors Z5, Z47, Z49 (and Z9, equivalent by design) ───────────────────────────────────────
+
+class SurvivorsOfTheReviewersOwnMutants(unittest.TestCase):
+    def setUp(self):
+        self.root, self.paper = workspace(zenodo_id=None, doi=None)
+
+    def test_Z5_identical_ids_already_in_zenodo_json_are_not_rewritten(self):
+        j = make_blocking_journal(self.root, self.paper)
+        cfg_path = self.paper / "zenodo.json"
+        cfg = json.loads(cfg_path.read_text())
+        cfg.update(zenodo_id=5, doi=GOOD_DOI)
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        st = cfg_path.stat()
+        os.utime(cfg_path, ns=(st.st_atime_ns, st.st_mtime_ns - 5_000_000_000))      # an earlier mtime a rewrite would change
+        st = cfg_path.stat()
+        before = (cfg_path.read_bytes(), st.st_mtime_ns, st.st_ino)
+        code, out, err = reconcile(j.path, *published_args(), root=self.root)
+        self.assertIsNone(code, code)
+        st = cfg_path.stat()
+        self.assertEqual((cfg_path.read_bytes(), st.st_mtime_ns, st.st_ino), before)
+        self.assertEqual(json.loads(j.path.read_text())["outcome"], "PUBLISHED-RECONCILED")
+        self.assertEqual(json.loads(j.path.read_text())["operator_evidence"]["config_written"], str(cfg_path))
+
+    def test_Z5_empty_or_absent_ids_are_filled_and_the_file_is_rewritten(self):
+        j = make_blocking_journal(self.root, self.paper)
+        cfg_path = self.paper / "zenodo.json"
+        st = cfg_path.stat()
+        os.utime(cfg_path, ns=(st.st_atime_ns, st.st_mtime_ns - 5_000_000_000))
+        mtime = cfg_path.stat().st_mtime_ns
+        code, _, _ = reconcile(j.path, *published_args(), root=self.root)
+        self.assertIsNone(code, code)
+        self.assertNotEqual(cfg_path.stat().st_mtime_ns, mtime)
+        cfg = json.loads(cfg_path.read_text())
+        self.assertEqual((cfg["zenodo_id"], cfg["doi"]), (5, GOOD_DOI))
+
+    def test_Z5_an_identical_zenodo_id_with_an_empty_doi_is_completed(self):
+        j = make_blocking_journal(self.root, self.paper)
+        cfg_path = self.paper / "zenodo.json"
+        cfg = json.loads(cfg_path.read_text())
+        cfg.update(zenodo_id=5, doi=None)
+        cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        code, _, _ = reconcile(j.path, *published_args(), root=self.root)
+        self.assertIsNone(code, code)
+        self.assertEqual(json.loads(cfg_path.read_text())["doi"], GOOD_DOI)
+
+    def test_Z47_a_garbage_concept_doi_is_refused_before_anything_for_every_outcome(self):
+        j = make_blocking_journal(self.root, self.paper)
+        snap = Bytes(self.paper / "zenodo.json", j.path)
+        for bad in ("garbage", "10.5281/zenodo.", "10.9999/zenodo.5", "10.5281/ZENODO.5", ""):
+            if not bad:
+                continue
+            code, out, err = reconcile(j.path, "--outcome", "not-published", "--i-checked-the-account", "--reason", REASON,
+                                       "--concept-doi", bad, root=self.root)
+            self.assertIsInstance(code, str, bad)
+            self.assertTrue("--concept-doi must be exactly" in code or "positive integer" in code, (bad, code))
+            self.assertNotIn("Traceback", out + err)
+            self.assertTrue(snap.unchanged(), bad)
+        code, _, _ = reconcile(j.path, "--outcome", "not-published", "--i-checked-the-account", "--reason", REASON,
+                               "--concept-doi", GOOD_DOI, root=self.root)
+        self.assertIsNone(code, code)
+
+    def test_Z47_a_doi_whose_number_differs_from_the_given_concept_id_is_refused_for_not_published_too(self):
+        j = make_blocking_journal(self.root, self.paper)
+        code, _, _ = reconcile(j.path, "--outcome", "not-published", "--i-checked-the-account", "--reason", REASON,
+                               "--concept-id", "5", "--concept-doi", "10.5281/zenodo.6", root=self.root)
+        self.assertIn("must be equal", str(code))
+        self.assertEqual(json.loads(j.path.read_text())["outcome"], "UNRECONCILED")
+
+    def test_Z49_a_symbolic_link_given_on_the_command_line_is_refused_not_followed(self):
+        j = make_blocking_journal(self.root, self.paper, outcome="RUNNING")
+        tamper(j.path, title="An edited title")                     # identity kind: liftable
+        link = j.path.parent / "link.run.json"
+        os.symlink(j.path, link)
+        before = sorted(p.name for p in j.path.parent.iterdir())
+        for flag in ("--lift-block", "--backup-journal"):
+            argv = [flag, str(link)]
+            if flag == "--lift-block":
+                argv += ["--i-checked-the-account", "--reason", REASON]
+            code, out, err = run_main(argv, {}, self.root)
+            self.assertIsInstance(code, str, flag)
+            self.assertIn("symbolic link", code, flag)
+            self.assertIn(str(j.path), code, flag)
+            self.assertNotIn("Traceback", out + err)
+        self.assertEqual(sorted(p.name for p in j.path.parent.iterdir()), before)
+
+    def test_Z49_the_guard_is_also_tested_directly(self):
+        j = make_blocking_journal(self.root, self.paper)
+        link = j.path.parent / "l2.run.json"
+        os.symlink(j.path, link)
+        with self.assertRaises(zp.ReconcileRefused) as cm:
+            zp._read_journal_bytes(link)
+        self.assertIn("symbolic link", str(cm.exception))
+        d = j.path.parent / "dir.run.json"
+        d.mkdir()
+        with self.assertRaises(zp.ReconcileRefused) as cm:
+            zp._read_journal_bytes(d)
+        self.assertIn("not a regular file", str(cm.exception))
+        self.assertEqual(zp._read_journal_bytes(j.path), j.path.read_bytes())
+
+    def test_Z49_a_relative_path_and_a_tilde_path_still_work(self):
+        j = make_blocking_journal(self.root, self.paper, outcome="RUNNING")
+        tamper(j.path, title="An edited title")
+        cwd = os.getcwd()
+        try:
+            os.chdir(j.path.parent)
+            code, _, _ = run_main(["--backup-journal", j.path.name], {}, self.root)
+        finally:
+            os.chdir(cwd)
+        self.assertIsNone(code, code)
+        self.assertTrue(list(j.path.parent.glob("*.quarantine-copy-*")))
+
+    def test_Z9_every_order_of_the_three_pattern_passes_is_complete_on_its_own(self):
+        # equivalent by design: the scheme pass applied last instead of first changes nothing, because each pass
+        # masks what it is responsible for without relying on another one having run
+        for text in ("Authorization: Bearer ABCDEF", "Authorization=ApiKey ABCDEF&x=1", "auth_token=ABCDEF", "Bearer: ABCDEF",
+                     '{"api_secret": "ABCDEF"}', "access%5Ftoken=ABCDEF", "Basic ABCDEF", "Cookie: sid=ABCDEF; a=b"):
+            outs = {zp.redact(text, passes=order) for order in itertools.permutations(zp._PATTERN_PASSES)}
+            self.assertEqual(len(outs), 1, (text, outs))
+            self.assertNotIn("ABCDEF", outs.pop(), text)
+
+
+class BareNounsStayReadableInProse(unittest.TestCase):
+    """A bare ``signature`` / ``credential(s)`` is also ordinary physics or admin prose (the Lorentzian signature of a
+    metric in an abstract that --dry-run prints): masked only where a field name can stand, never after a word."""
+
+    def setUp(self):
+        self._p = mock.patch.object(zp, "_SECRETS", set())
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def test_prose_with_a_bare_noun_and_a_colon_or_equals_is_untouched(self):
+        for text in ("the Lorentzian signature: (-,+,+,+) in the abstract", "metric signature = diag(-1,1,1,1)",
+                     "see credentials: none needed", "a signature: opposite sign", "with signature=(3,1)"):
+            self.assertEqual(zp.redact(text), text)
+
+    def test_the_same_nouns_are_masked_where_a_field_name_stands(self):
+        for text, expect in (("Signature=abc&x=1", "Signature=[REDACTED]&x=1"), ("&signature=abc", "&signature=[REDACTED]"),
+                             ("?a=1&credentials=u:p", "?a=1&credentials=[REDACTED]"),
+                             ('{"signature": "abc"}', '{"signature": "[REDACTED]"}'),
+                             ("signature: abc", "signature: [REDACTED]"), ("line\nsignature: abc", "line\nsignature: [REDACTED]"),
+                             ("a, signature: abc", "a, signature: [REDACTED]"), ("x-amz-signature: v", "x-amz-signature: [REDACTED]"),
+                             ("request_signature=v", "request_signature=[REDACTED]"), ("see aws_credentials: x", "see aws_credentials: [REDACTED]")):
+            self.assertEqual(zp.redact(text), expect, text)
+
+    def test_a_dry_run_metadata_print_keeps_a_physics_abstract_readable(self):
+        meta = {"description": "We fix the Lorentzian signature: (-,+,+,+) and show that the signature = (3,1) is stable.",
+                "title": "T"}
+        printed = zp.redact(json.dumps(meta, indent=2))
+        self.assertIn("Lorentzian signature: (-,+,+,+)", printed)
+        self.assertIn("signature = (3,1)", printed)
+
+
+# ── documentation pinned to the code (computed, not asserted) ──────────────────────────────────────────────
+
+class DocsOfTheSixthPass(unittest.TestCase):
+    README = (TOOLS / "README.md").read_text(encoding="utf-8")
+    PILOT = (TOOLS / "pilot" / "README-PILOT.md").read_text(encoding="utf-8")
+
+    def test_every_name_of_the_allow_list_is_documented_and_no_other_variable_is_claimed_passed(self):
+        for name in sorted(pc.CHILD_ENV_ALLOW):
+            self.assertIn(f"`{name}`", self.README, name)
+        for name in zp._GIT_ENV_KEEP:
+            self.assertIn(f"`{name}`", self.README, name)
+
+    def test_the_survivor_claims_are_the_ones_of_the_scripts(self):
+        import importlib
+        mc = importlib.import_module("mutation_check")
+        mcr = importlib.import_module("mutation_check_review")
+        self.assertEqual(mc.EQUIVALENT_SURVIVORS, {"M16b"})
+        self.assertEqual(mcr.EQUIVALENT_SURVIVORS, {"Y1"})
+        flat = " ".join(self.README.split())
+        self.assertIn("exactly one survivor, `M16b`", flat)
+        self.assertIn("only documented equivalent is `Y1`", flat)
+        self.assertNotIn("E1", mc.EQUIVALENT_SURVIVORS)
+        # E1 is a real, killed mutant of the choke point
+        self.assertIn("E1", [m[0] for m in mc.MUTANTS])
+        e1 = [m for m in mc.MUTANTS if m[0] == "E1"][0]
+        self.assertTrue("_builtins.print(redact(" in e1[2] and "sys.stderr" in e1[3], e1)
+
+    def test_no_surface_mentions_previous_web_url_as_a_feature(self):
+        for name, text in (("docstring", zp.__doc__), ("help", zp.build_parser().format_help()),
+                           ("example", (TOOLS / "zenodo.example.json").read_text())):
+            self.assertNotIn("previous_web_url", text, name)
+        flat = " ".join(self.README.split())
+        self.assertIn("ignored: it is no longer read", flat)
+        for m in re.finditer(r"previous_web_url", self.README):
+            self.assertIn("older", self.README[max(0, m.start() - 120): m.end() + 120])
+
+    def test_the_lift_rule_for_a_published_journal_is_in_the_help_the_docstring_and_the_readme(self):
+        flat_help = " ".join(zp.build_parser().format_help().split())
+        for needle in ("--paper-dir", "records a publication", "REFUSED", "--record-id/--concept-id/--concept-doi"):
+            self.assertIn(needle, flat_help, needle)
+        flat_doc = " ".join(zp.__doc__.split())
+        for needle in ("records a CONFIRMED or LIKELY publication", "--paper-dir DIR"):
+            self.assertIn(needle, flat_doc, needle)
+        flat = " ".join(self.README.split())
+        for needle in ("needs the published identity", "never a first publication", "STILL holds those ids"):
+            self.assertIn(needle, flat, needle)
+        self.assertIn("allow-list", " ".join(self.PILOT.split()))
+
+    def test_the_replace_related_identifier_help_states_the_role_restriction(self):
+        flat = " ".join(zp.build_parser().format_help().split())
+        for needle in ("relation isSupplementedBy, scheme url", "isReferencedBy", "never replaceable"):
+            self.assertIn(needle, flat, needle)
+
+
 if __name__ == "__main__":
     unittest.main()
