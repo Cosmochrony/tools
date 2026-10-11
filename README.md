@@ -103,12 +103,13 @@ name as well as by value.
   it), no other registrant. A `zenodo.json` that already holds a different `doi` or `zenodo_id` is refused with both
   values (an identical value is accepted and not rewritten); a DOI is never silently replaced.
 * `--set-web-url` replaces a related identifier only when it is `isSupplementedBy`, scheme `url`, resource type
-  `other` AND on `cosmochrony.org`, or equal to the new value, or equal to a `previous_web_url` of the paper's
-  `zenodo.json` (a string or a list, written by hand). A same-role entry on another host is KEPT (the run says so) and
-  the web entry is appended; `cites` DOIs and every other entry are always kept.
-  `--replace-related-identifier IDENTIFIER` is the only way to replace anything else: exactly one live entry must
-  match the identifier exactly, a `cites` / `isCitedBy` / `references` entry or a DOI-scheme entry is refused, and the
-  replaced entry is printed with the diff.
+  `other` AND on `cosmochrony.org`, or equal to the new value. A same-role entry on another host is KEPT (the run says
+  so) and the web entry is appended; `cites` DOIs and every other entry are always kept. For a CHANGE of host use
+  `--replace-related-identifier OLD_IDENTIFIER`: exactly one live entry must match the identifier exactly AND be of the
+  web entry's own role (relation `isSupplementedBy`, scheme `url`); a `cites` / `isCitedBy` / `references` /
+  `isReferencedBy` entry, a DOI-scheme entry and every other relation or scheme (`isVersionOf`, `isPartOf`, `hasPart`,
+  handle, urn, ...) is refused; the replaced entry is printed with the diff. (A `previous_web_url` key that an older
+  `zenodo.json` may still hold is ignored: it is no longer read.)
 * Redaction (below) applies scheme words first, decodes percent-encoded names, knows `X-Auth-Token`, `X-Access-Token`,
   `Private-Token` and `ZENODO_TOKEN=` / `ZENODO_SANDBOX_TOKEN=`, never registers a blank secret, masks a registered
   secret shorter than 8 characters only as a whole token, registers the environment tokens before the arguments are
@@ -133,7 +134,7 @@ python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome published|not-pu
 Run in the foreground, from the version branch (the branch name is the version label), after the
 pre-deposit checks and the independent review. `python3 -m unittest discover -s tests` runs the offline
 suite (over 500 tests, no network: a socket guard fails any real connection). `python3 tests/mutation_check.py`
-re-applies the in-memory mutants (267 mutants in all, of which 73 new in the fifth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
+re-applies the in-memory mutants (264 mutants in all, of which 4 new in the sixth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
 processes, or `--only-new` / `--ids ID1,ID2` for a subset; `--count` prints these numbers from the script); **its expected result is: every mutant killed except
 exactly one survivor, `M16b`, a documented equivalent mutant** (it removes an unreachable defensive assertion; its
 reachable counterpart M16 is killed). The script exits 0 only in that case and 1 for any other survivor, skipped
@@ -334,11 +335,12 @@ confirmation. (A `--dry-run` prints the verdict as `REFUSED, a real run would st
 (**only the web-page entry** of the related identifiers is replaced or inserted; `cites` and every other entry are
 kept. The live entry with the same identifier and relation is replaced in place; otherwise the candidates are the
 entries with the same relation (`isSupplementedBy`), scheme (`url`) and `resource_type` (`other`) that are on
-`cosmochrony.org`, equal to the new value or equal to a `previous_web_url` recorded in `zenodo.json`; several are
+`cosmochrony.org` or equal to the new value; several are
 refused as ambiguous; a single candidate **without `resource_type` is never replaced implicitly**: the run is refused
 naming it, and you pass `--replace-related-identifier <IDENTIFIER>` if it is the web entry; an entry of another host is
 KEPT, the run says so and the web entry is appended. `--replace-related-identifier` needs exactly ONE live entry with
-that exact identifier (none or several: refused) and never replaces a `cites` / `isCitedBy` / `references` or DOI entry;
+that exact identifier (none or several: refused), of relation `isSupplementedBy` and scheme `url` only (never a `cites` /
+`isCitedBy` / `references` / `isReferencedBy`, DOI, `isVersionOf`, `isPartOf`... entry);
 the replaced entry is printed and appears in the diff), `--set-publication-type`,
 `--set-code-url` (the repository field, other `custom` keys kept),
 or `--apply-local-metadata=version,title,...`. With none of them the run is refused. **Before anything is created**

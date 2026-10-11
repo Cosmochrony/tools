@@ -669,9 +669,18 @@ class WebUrlNeverReplacedImplicitly(unittest.TestCase):
         with self.assertRaises(ValueError):
             zp.merge_related_web_url(dup, ENTRY, "https://a")
 
-    def test_the_explicit_identifier_replaces_whatever_the_relation_or_type(self):
-        live = [{"identifier": "https://a", "relation": "isDocumentedBy", "scheme": "url", "resource_type": "software"}]
+    def test_the_explicit_identifier_replaces_whatever_the_resource_type_of_the_web_role(self):
+        live = [{"identifier": "https://a", "relation": "isSupplementedBy", "scheme": "url", "resource_type": "software"}]
         self.assertEqual(zp.merge_related_web_url(live, ENTRY, "https://a"), [ENTRY])
+        typeless = [{"identifier": "https://a", "relation": "isSupplementedBy", "scheme": "url"}]
+        self.assertEqual(zp.merge_related_web_url(typeless, ENTRY, "https://a"), [ENTRY])
+
+    def test_the_explicit_identifier_refuses_any_other_relation_or_scheme(self):
+        for rel, scheme in (("isDocumentedBy", "url"), ("isVersionOf", "url"), ("isPartOf", "url"), ("hasPart", "url"),
+                            ("isSupplementedBy", "handle"), ("isSupplementedBy", "doi"), ("isSupplementTo", "url")):
+            live = [{"identifier": "https://a", "relation": rel, "scheme": scheme, "resource_type": "other"}]
+            with self.assertRaises(ValueError, msg=(rel, scheme)):
+                zp.merge_related_web_url(live, ENTRY, "https://a")
 
     def test_replace_related_identifier_needs_set_web_url(self):
         c = LiveClient()

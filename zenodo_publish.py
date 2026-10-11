@@ -53,10 +53,11 @@ Guards (all offline-tested; the server semantics they rely on are listed as UNPR
     --set-version/--set-title/--set-abstract/--set-keywords/--set-notes/--set-web-url/--set-publication-type/
     --set-code-url (or --apply-local-metadata=a,b) replaced (--set-web-url replaces only the web-page entry of
     related_identifiers: same identifier+relation, or the single isSupplementedBy/url/"other" entry on
-    cosmochrony.org, equal to the new value or to a previous_web_url of zenodo.json; an entry of another host is
-    kept and the web entry appended; an entry with NO resource_type is never replaced implicitly - the run is
-    refused naming it; --replace-related-identifier IDENTIFIER is the operator's explicit choice: exactly one
-    live entry, never a cites/isCitedBy/references or DOI entry, the replaced entry shown); the
+    cosmochrony.org or equal to the new value; an entry of another host is kept and the web entry appended; an
+    entry with NO resource_type is never replaced implicitly - the run is refused naming it;
+    --replace-related-identifier IDENTIFIER is the operator's explicit choice, for a change of host: exactly one
+    live entry, of relation isSupplementedBy and scheme url only (never a cites/isCitedBy/references/isReferencedBy
+    entry, a DOI entry or any other relation), the replaced entry shown); the
     whole-metadata diff is printed first and --yes-apply-diff must carry at least 12 hex
     characters of the sha256 of exactly that printed diff (a bare flag is refused).
   * The version label is guarded independently of the pre-deposit gate and of --skip-checks: never
@@ -2302,30 +2303,20 @@ def _is_web_host(identifier) -> bool:
     return host == WEB_HOST or host.endswith("." + WEB_HOST)
 
 
-# A related identifier of one of these relations, or a DOI-scheme one, is a citation / reference: never replaceable.
-PROTECTED_RELATIONS = ("cites", "iscitedby", "references", "isreferencedby")
-
-
-def _protected_entry(entry: dict) -> bool:
-    return (str(entry.get("relation") or "").lower() in PROTECTED_RELATIONS
-            or str(entry.get("scheme") or "").lower() == "doi")
-
-
-def merge_related_web_url(live_list, entry: dict, replace_identifier=None, previous_web_urls=(), notes=None) -> list:
+def merge_related_web_url(live_list, entry: dict, replace_identifier=None, notes=None) -> list:
     """The live ``related_identifiers`` with ONLY the web-page entry replaced or inserted; every other entry
     (cites DOIs, another host's isSupplementedBy link, ...) is kept untouched and in place. Never an implicit
     replacement of an entry whose role is not stated, nor of a foreign one (N03, N-4).
 
     1. ``replace_identifier`` (--replace-related-identifier, the operator's explicit choice): the single live entry
-       whose identifier equals it exactly is replaced; zero or several matches are refused, and so is an entry of
-       relation cites / isCitedBy / references (or of scheme doi), which is never replaceable.
+       whose identifier equals it exactly is replaced; zero or several matches are refused, and so is any entry that
+       is not of the web entry's own role (relation isSupplementedBy AND scheme url): a cites / isCitedBy /
+       references / isReferencedBy entry, a DOI entry, isVersionOf, isPartOf, a handle... is never replaceable.
     2. The live entry with the same identifier AND relation is replaced in place.
     3. A candidate is admissible when ALL hold: the same relation (isSupplementedBy), scheme (url) and resource_type
-       (other) as the web entry, AND its identifier is on cosmochrony.org, or equals the new value, or equals a
-       previously recorded web_url of this paper (``previous_web_urls``). One admissible candidate is replaced,
-       several are refused as ambiguous. An entry of that relation/scheme that states NO resource_type is never
-       replaced implicitly (refused, naming it) unless it is on cosmochrony.org / the new value / a previous value
-       and is then treated as a candidate that must be named.
+       (other) as the web entry, AND its identifier is on cosmochrony.org or equals the new value. One admissible
+       candidate is replaced, several are refused as ambiguous. An entry of that relation/scheme that states NO
+       resource_type is never replaced implicitly (refused, naming it).
     4. Otherwise the entry is appended; a same-role entry of another host is kept (reported in ``notes``)."""
     items = copy.deepcopy(live_list) if isinstance(live_list, list) else []
     dicts = [i for i, e in enumerate(items) if isinstance(e, dict)]
@@ -2335,10 +2326,14 @@ def merge_related_web_url(live_list, entry: dict, replace_identifier=None, previ
         if len(named) != 1:
             raise ValueError(f"--replace-related-identifier {replace_identifier!r} matches {len(named)} live "
                              "related identifiers (it must match exactly one)")
-        if _protected_entry(items[named[0]]):
+        target = items[named[0]]
+        # The role test is exact and complete: every citation / reference relation, every DOI entry and every other
+        # relation or scheme differs from (isSupplementedBy, url), so none of them is ever replaceable.
+        if target.get("relation") != entry.get("relation") or target.get("scheme") != entry.get("scheme"):
             raise ValueError(f"--replace-related-identifier {replace_identifier!r} designates an entry of relation "
-                             f"{items[named[0]].get('relation')!r} / scheme {items[named[0]].get('scheme')!r}: a "
-                             "citation, a reference or a DOI is never replaceable")
+                             f"{target.get('relation')!r} / scheme {target.get('scheme')!r}: only an entry of the web "
+                             f"page's own role (relation {entry.get('relation')!r}, scheme {entry.get('scheme')!r}) "
+                             "is replaceable, this one is never replaceable (a citation, a reference, a DOI or any other link)")
         notes.append(f"replacing the related identifier {json.dumps(items[named[0]], ensure_ascii=False, sort_keys=True)}")
         items[named[0]] = copy.deepcopy(entry)
         return items
@@ -2347,7 +2342,7 @@ def merge_related_web_url(live_list, entry: dict, replace_identifier=None, previ
     if exact:
         items[exact[0]] = copy.deepcopy(entry)
         return items
-    known = {entry.get("identifier"), *(u for u in previous_web_urls if isinstance(u, str) and u)}
+    known = {entry.get("identifier")}
     same_role = [i for i in dicts if items[i].get("relation") == entry.get("relation")
                  and items[i].get("scheme") == entry.get("scheme")
                  and items[i].get("resource_type") in (None, entry.get("resource_type"))]
@@ -2355,7 +2350,7 @@ def merge_related_web_url(live_list, entry: dict, replace_identifier=None, previ
     if web_like:
         if len(web_like) > 1:
             raise ValueError(f"{len(web_like)} live related identifiers have the same relation/scheme/resource_type "
-                             "as the web page entry and are on cosmochrony.org or are known web urls of this paper: "
+                             "as the web page entry and are on cosmochrony.org or equal to the new value: "
                              "cannot tell which one is the web url; edit it by hand, or name it with "
                              "--replace-related-identifier IDENTIFIER")
         target = items[web_like[0]]
@@ -2386,7 +2381,7 @@ def merge_related_web_url(live_list, entry: dict, replace_identifier=None, previ
 
 
 def build_update_payload(live: dict, built: dict, fields, code_url: str = "", replace_identifier=None,
-                         previous_web_urls=(), notes=None) -> dict:
+                         notes=None) -> dict:
     """The metadata to PUT: a deep copy of ``live`` with ONLY the requested fields replaced."""
     payload = copy.deepcopy(live)
     for field in sorted(fields):
@@ -2401,8 +2396,7 @@ def build_update_payload(live: dict, built: dict, fields, code_url: str = "", re
             entries = built.get("related_identifiers") or []
             if len(entries) != 1:
                 raise ValueError("field 'web-url' was requested but the local state has no web_url")
-            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier,
-                                                 previous_web_urls, notes)
+            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier, notes)
         elif key in built:
             payload[key] = copy.deepcopy(built[key])
         else:
@@ -2818,18 +2812,9 @@ def verify_upload_answer(answer, digest: dict):
     return f"{name} {value} matches the bytes sent"
 
 
-def previous_web_urls_of(config: dict) -> tuple:
-    """The web page url(s) this paper had before the current ``web_url``, as recorded by hand in zenodo.json
-    (``previous_web_url``: a string or a list of strings); they identify the paper's own live web entry when its url
-    changed (the only way a non-cosmochrony.org entry is replaced without --replace-related-identifier)."""
-    raw = config.get("previous_web_url") if isinstance(config, dict) else None
-    values = [raw] if isinstance(raw, str) else list(raw) if isinstance(raw, list) else []
-    return tuple(v for v in values if isinstance(v, str) and v)
-
-
 def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, env_label: str,
-                   host: str, on_published=None, fields=(), confirm=None, replace_identifier=None,
-                   previous_web_urls=()) -> tuple[int, str | None]:
+                   host: str, on_published=None, fields=(), confirm=None,
+                   replace_identifier=None) -> tuple[int, str | None]:
     """--update: metadata-only edit in place. Returns (dep_id, doi).
 
     The PUT is the LIVE metadata with ONLY ``fields`` replaced. Before anything is created the whole-metadata
@@ -2851,8 +2836,7 @@ def deposit_update(client, metadata_built: dict, code_url: str, zenodo_id: int, 
             "from anything else. Nothing was created.")
     notices: list = []
     try:
-        payload = build_update_payload(live, metadata_built, fields, code_url, replace_identifier,
-                                       previous_web_urls, notices)
+        payload = build_update_payload(live, metadata_built, fields, code_url, replace_identifier, notices)
     except ValueError as exc:
         die(f"Error: {exc}. Nothing was created.")
     for notice in notices:
@@ -3137,11 +3121,13 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument(f"--set-{field}", action="store_true", dest="set_" + field.replace("-", "_"),
                             help=f"--update: replace the live {UPDATABLE_FIELDS[field]!r} with the local value")
     parser.add_argument("--replace-related-identifier", metavar="IDENTIFIER",
-                        help="--update --set-web-url: the exact identifier of the ONE live related identifier to replace "
-                             "by the web page entry when it is not recognised as the web entry (it must match exactly "
-                             "one live entry, otherwise the run is refused; a cites / isCitedBy / references entry or "
-                             "a DOI entry is never replaceable). Without it a foreign entry is kept and the web entry "
-                             "is appended; an entry with no resource_type is never replaced implicitly")
+                        help="--update --set-web-url, for a change of host: the exact identifier of the ONE live related "
+                             "identifier to replace by the web page entry. It must match exactly one live entry, "
+                             "otherwise the run is refused, and that entry must be of the web entry's own role "
+                             "(relation isSupplementedBy, scheme url): a cites / isCitedBy / references / "
+                             "isReferencedBy entry, a DOI entry or any other relation is never replaceable. Without "
+                             "it an entry of another host is kept and the web entry is appended; an entry with no "
+                             "resource_type is never replaced implicitly")
     parser.add_argument("--apply-local-metadata", metavar="F1,F2", default="",
                         help="--update: comma list of fields to take from local state "
                              f"({', '.join(UPDATABLE_FIELDS)}); equivalent to the --set-* flags")
@@ -3458,7 +3444,7 @@ def main(argv=None):
                 try:
                     notices: list = []
                     payload = build_update_payload(live, dry_meta, fields, code_url, args.replace_related_identifier,
-                                                   previous_web_urls_of(config), notices)
+                                                   notices)
                     for notice in notices:
                         print(f"  Note: {notice}")
                     diff, digest = metadata_diff(live, payload)
@@ -3644,8 +3630,7 @@ def main(argv=None):
                 dep_id, doi = deposit_update(client, metadata, code_url, int(zenodo_id), env_label, host,
                                              on_published=save_sandbox_state if args.sandbox else settle_update,
                                              fields=fields, confirm=args.yes_apply_diff,
-                                             replace_identifier=args.replace_related_identifier,
-                                             previous_web_urls=previous_web_urls_of(config))
+                                             replace_identifier=args.replace_related_identifier)
             except NothingToUpdate as exc:
                 print(f"Nothing to update: {exc}.")
                 finalize_journal(journal, client)

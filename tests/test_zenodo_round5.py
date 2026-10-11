@@ -865,25 +865,21 @@ class RelatedIdentifiersAreKept(unittest.TestCase):
             live = [entry("10.1/x", "cites", "doi", None), entry(host), entry("https://github.com/x/y")]
             self.assertEqual(zp.merge_related_web_url(live, ENTRY), [live[0], ENTRY, live[2]], host)
 
-    def test_N4_an_entry_equal_to_a_previously_recorded_web_url_is_replaced_even_on_another_host(self):
+    def test_previous_web_url_is_gone_and_a_leftover_key_is_harmless(self):
+        self.assertFalse(hasattr(zp, "previous_web_urls_of"))
         live = [entry("https://old.example/page"), entry("https://github.com/x/y")]
-        self.assertEqual(zp.merge_related_web_url(live, ENTRY, previous_web_urls=("https://old.example/page",)),
-                         [ENTRY, live[1]])
-        self.assertEqual(zp.merge_related_web_url(live, ENTRY, previous_web_urls=("https://other.example/",)), live + [ENTRY])
-        self.assertEqual(zp.merge_related_web_url(live, ENTRY), live + [ENTRY])
-
-    def test_N4_the_previous_web_urls_come_from_zenodo_json(self):
-        self.assertEqual(zp.previous_web_urls_of({"previous_web_url": "https://a/"}), ("https://a/",))
-        self.assertEqual(zp.previous_web_urls_of({"previous_web_url": ["https://a/", 5, "", "https://b/"]}),
-                         ("https://a/", "https://b/"))
-        self.assertEqual(zp.previous_web_urls_of({}), ())
-        self.assertEqual(zp.previous_web_urls_of({"previous_web_url": 5}), ())
-        live = [entry("https://old.example/page")]
         c = LiveClient(live={**LIVE, "related_identifiers": live})
         root, paper, (code, out, _) = update_cli(c, "--set-web-url", "--yes-apply-diff",
                                                  cfg={"web_url": "https://new.example", "previous_web_url": "https://old.example/page"})
         self.assertIsNone(code, code)
-        self.assertEqual(c.meta_put["related_identifiers"], [ENTRY])
+        # the key is ignored: the entry of another host is KEPT and the web entry appended
+        self.assertEqual(c.meta_put["related_identifiers"], live + [ENTRY])
+        for junk in (5, ["https://old.example/page"], {"a": 1}, None):
+            c2 = LiveClient(live={**LIVE, "related_identifiers": live})
+            root, paper, (code, out, _) = update_cli(c2, "--set-web-url", "--yes-apply-diff",
+                                                     cfg={"web_url": "https://new.example", "previous_web_url": junk})
+            self.assertIsNone(code, (junk, code))
+            self.assertEqual(c2.meta_put["related_identifiers"], live + [ENTRY], junk)
 
     def test_N4_a_typed_entry_must_also_match_relation_scheme_and_type(self):
         for other in (entry("https://cosmochrony.org/x", "isDocumentedBy"), entry("https://cosmochrony.org/x", scheme="doi"),
@@ -934,8 +930,17 @@ class RelatedIdentifiersAreKept(unittest.TestCase):
             with self.assertRaises(ValueError, msg=e) as cm:
                 zp.merge_related_web_url([e], ENTRY, e["identifier"])
             self.assertIn("never replaceable", str(cm.exception))
-        ok = entry("https://a.example/x", "isDocumentedBy")
+        ok = entry("https://a.example/x", "isSupplementedBy", resource_type="software")
         self.assertEqual(zp.merge_related_web_url([ok], ENTRY, ok["identifier"]), [ENTRY])
+        for rel in ("isDocumentedBy", "isVersionOf", "isPartOf", "hasPart", "isDerivedFrom", "compiles"):
+            other = entry("https://a.example/x", rel)
+            with self.assertRaises(ValueError, msg=rel) as cm:
+                zp.merge_related_web_url([other], ENTRY, other["identifier"])
+            self.assertIn("never replaceable", str(cm.exception))
+        for scheme in ("handle", "urn", "arxiv", "isbn"):
+            other = entry("x/y", scheme=scheme)
+            with self.assertRaises(ValueError, msg=scheme):
+                zp.merge_related_web_url([other], ENTRY, other["identifier"])
 
     def test_N5_the_refusal_reaches_the_operator_and_nothing_is_edited(self):
         live = [entry("10.1/abc", "cites", "doi", None)]
@@ -947,7 +952,7 @@ class RelatedIdentifiersAreKept(unittest.TestCase):
         self.assertNotIn("put", c.names())
 
     def test_N5_the_explicit_replacement_shows_the_replaced_entry_in_the_diff(self):
-        live = [entry("https://a.example/x", "isDocumentedBy")]
+        live = [entry("https://a.example/x", "isSupplementedBy")]
         c = LiveClient(live={**LIVE, "related_identifiers": live})
         root, paper, (code, out, _) = update_cli(c, "--set-web-url", "--replace-related-identifier", "https://a.example/x",
                                                  cfg={"web_url": "https://new.example"}, raw_confirm=True)
@@ -1148,7 +1153,7 @@ class DocsMatchTheCode(unittest.TestCase):
 
     def test_the_doi_rule_and_the_related_identifier_rules_are_documented(self):
         flat = " ".join(self.README.split())
-        for needle in ("10.5281/zenodo.<concept id>", "never replaced", "--replace-related-identifier", "previous_web_url"):
+        for needle in ("10.5281/zenodo.<concept id>", "never replaced", "--replace-related-identifier"):
             self.assertIn(needle, flat, needle)
 
     def test_the_mutant_counts_in_the_readme_are_the_ones_computed_from_the_script(self):

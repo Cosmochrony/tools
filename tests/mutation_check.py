@@ -199,7 +199,7 @@ MUTANTS = [
     ("B9", "upper bounds not enforced", "        if maximum is not None and value > maximum:", "        if False:"),
     # --update
     ('W1', '--set-web-url replaces the whole related_identifiers list',
-     '            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier,\n                                                 previous_web_urls, notes)',
+     '            payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier, notes)',
      '            payload[key] = copy.deepcopy(entries)'),
     ("W2", "an ambiguous web entry is guessed", "    if len(same_role) > 1:", "    if False:"),
     ("W3", "an entry with the same identifier is not replaced in place", "    if exact:\n        items[exact[0]]", "    if False:\n        items[exact[0]]"),
@@ -384,18 +384,9 @@ NEW5_MUTANTS = [
     ("N5V23", "a published-unsaved lift prints no consequence", '    if info.get("outcome_at_decision") == UNSAVED_OUTCOME:', "    if False:"),
     # N-4 / N-5: related identifiers
     ("N5W2", "a same-role entry of any host is replaced implicitly (old behaviour)", 'web_like = [i for i in same_role if _is_web_host(items[i].get("identifier")) or items[i].get("identifier") in known]', "web_like = list(same_role)"),
-    ("N5W3", "previous web urls are ignored", ' or items[i].get("identifier") in known]', "]"),
-    ("N5W4", "a citation can be replaced by name", "        if _protected_entry(items[named[0]]):", "        if False:"),
-    ("N5W5", "protected relations are matched case-sensitively", 'str(entry.get("relation") or "").lower() in PROTECTED_RELATIONS', 'str(entry.get("relation") or "") in PROTECTED_RELATIONS'),
-    ("N5W6", "a DOI-scheme entry can be replaced by name", 'or str(entry.get("scheme") or "").lower() == "doi")', "or False)"),
     ("N5W7", "the kept foreign entry is not reported", "    for i in same_role:\n        notes.append(", "    for i in []:\n        notes.append("),
-    ("N5W8", "previous_web_url is not forwarded to the merge", "payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier,\n                                                 previous_web_urls, notes)",
-     "payload[key] = merge_related_web_url(live.get(key), entries[0], replace_identifier,\n                                                 (), notes)"),
-    ("N5W9", "previous_web_url is not read from zenodo.json in a real update", "previous_web_urls=previous_web_urls_of(config))", "previous_web_urls=())"),
     ("N5W10", "the replaced entry is not reported", '        notes.append(f"replacing the related identifier', '        (lambda *_: None)(f"replacing the related identifier'),
     ("N5W11", "a lone typeless foreign entry is appended instead of refused", "    if typeless:\n        if len(same_role) > 1:", "    if False:\n        if len(same_role) > 1:"),
-    ("N5W12", "previous_web_url accepts any type", '    values = [raw] if isinstance(raw, str) else list(raw) if isinstance(raw, list) else []', '    values = [raw] if isinstance(raw, str) else list(raw) if isinstance(raw, (list, int)) else []'),
-    # N-7: scrubbed environment of every child
     ("N5X1", "the battery's sh() hands the whole environment to its child", "text=True, env=child_env())\n    return r.returncode, r.stdout.strip()", "text=True)\n    return r.returncode, r.stdout.strip()", PC),
     ("N5X2", "the battery's sh_raw() hands the whole environment to its child", 'text=True, env=child_env())\n    return r.returncode, r.stdout.rstrip("\\n")', 'text=True)\n    return r.returncode, r.stdout.rstrip("\\n")', PC),
     ("N5X3", "pdfinfo gets the whole environment", "            check=False,\n            env=child_env(),", "            check=False,", PC),
@@ -414,8 +405,17 @@ NEW5_MUTANTS = [
 ]
 NEW5_IDS = {m[0] for m in NEW5_MUTANTS}
 
-NEW_IDS = NEW5_IDS                                # --only-new: the fifth-pass mutants
-MUTANTS = MUTANTS + NEW_MUTANTS + NEW5_MUTANTS
+# ── sixth corrective pass (review round 22): every new behaviour is mutated ──
+NEW6_MUTANTS = [
+    ("N6W1", "the explicit replacement does not check the relation of the named entry", '        if target.get("relation") != entry.get("relation") or target.get("scheme") != entry.get("scheme"):', '        if target.get("scheme") != entry.get("scheme"):'),
+    ("N6W2", "the explicit replacement does not check the scheme of the named entry", '        if target.get("relation") != entry.get("relation") or target.get("scheme") != entry.get("scheme"):', '        if target.get("relation") != entry.get("relation"):'),
+    ("N6W3", "the explicit replacement is not refused at all", '        if target.get("relation") != entry.get("relation") or target.get("scheme") != entry.get("scheme"):', "        if False:"),
+    ("N6W4", "the explicit replacement compares the relation case-insensitively", '        if target.get("relation") != entry.get("relation") or target.get("scheme") != entry.get("scheme"):', '        if str(target.get("relation")).lower() != str(entry.get("relation")).lower() or target.get("scheme") != entry.get("scheme"):'),
+]
+NEW6_IDS = {m[0] for m in NEW6_MUTANTS}
+
+NEW_IDS = NEW6_IDS                                # --only-new: the sixth-pass mutants
+MUTANTS = MUTANTS + NEW_MUTANTS + NEW5_MUTANTS + NEW6_MUTANTS
 
 
 def load_mutated(src: str, name: str = "zenodo_publish", path: Path = SRC_PATH):
