@@ -133,13 +133,18 @@ python3 tools/zenodo_publish.py --reconcile <JOURNAL> --outcome published|not-pu
 
 Run in the foreground, from the version branch (the branch name is the version label), after the
 pre-deposit checks and the independent review. `python3 -m unittest discover -s tests` runs the offline
-suite (over 500 tests, no network: a socket guard fails any real connection). `python3 tests/mutation_check.py`
-re-applies the in-memory mutants (348 mutants in all, of which 95 new in the sixth pass; a full run takes more than an hour: use `--shard K/N` to spread it over
-processes, or `--only-new` / `--ids ID1,ID2` for a subset; `--count` prints these numbers from the script); **its expected result is: every mutant killed except
+suite (680 tests, no network: a socket guard fails any real connection). `python3 tests/mutation_check.py`
+re-applies the in-memory mutants (403 mutants in all, of which 55 new in the seventh pass; `--count` prints these numbers from
+the script as `mutants: 403, new: 55`; a full run takes more than an hour: use `--shard K/N` to spread it over processes, or
+`--only-new` / `--ids ID1,ID2` for a subset); **its expected result is: every mutant killed except
 exactly one survivor, `M16b`, a documented equivalent mutant** (it removes an unreachable defensive assertion; its
 reachable counterpart M16 is killed). The script exits 0 only in that case and 1 for any other survivor, skipped
-pattern or red baseline. `python3 tests/mutation_check_review.py` re-applies the 43 mutants of independent review
-round 19 (Y1-Y38, Z1-Z5) onto the current code; its only documented equivalent is `Y1` (see the script).
+pattern or red baseline. No mutant has been added to the allowed survivors since: a survivor that is equivalent in
+outcome but not in message (N6V1, N6V3, N6V6 of the sixth pass) is killed by a test that pins the message, because the
+message names the cure. `python3 tests/mutation_check_review.py` re-applies the 43 mutants of the reviewer's round 19
+(Y1-Y38, Z1-Z5) onto the current code; its only documented equivalent is `Y1` (see the script).
+`python3 tests/mutation_check_review21.py` re-applies the 40 mutants of the reviewer's round 21; it has no
+documented equivalent.
 
 ### Environment variables
 
@@ -160,49 +165,86 @@ them, including the production token, into the shell that runs the command; for 
 line: a token typed in an argument vector is visible to `ps`).
 A missing or empty token stops the run before anything is parsed or sent. A token must be printable ASCII
 without whitespace; one containing a newline, a space or a control character is refused **without being shown**.
-A token is **masked by value and by field name**, not guaranteed absent: every exception text, HTTP body and URL that
-reaches the console, and every value written to a run journal, goes through one function (`redact`) that masks (a) the
-exact value of every registered secret: both `ZENODO_TOKEN` and `ZENODO_SANDBOX_TOKEN` as soon as either is present,
-whatever their length (an empty value is never registered), (b) any `Bearer ...`, `Bearer: ...` or `Basic ...` string, (c) the ENTIRE value of any `Authorization` /
-`Proxy-Authorization` field, whatever its scheme (`Bearer`, `Basic`, `Digest`, `Negotiate`, `Token`, `ApiKey`, `OAuth`,
-`GitHub`, `AWS4-HMAC-SHA256 Credential=..., Signature=...`, any other word, or a bare credential), in the `Name: value`,
+A token is **masked by value and by field name** (and by shape and by URL), not guaranteed absent: every exception text,
+HTTP body and URL that reaches the console, and every value written to a run journal, goes through one function
+(`redact`) that masks (a) the exact value of every registered secret: both `ZENODO_TOKEN` and `ZENODO_SANDBOX_TOKEN` as
+soon as either is present, whatever their length (an empty value is never registered), (b) any `Bearer ...`,
+`Bearer: ...` or `Basic ...` string, (c) the ENTIRE value of any `Authorization` / `Proxy-Authorization` field, whatever
+its scheme (`Bearer`, `Basic`, `Digest`, `Negotiate`, `Token`, `ApiKey`, `OAuth`, `GitHub`,
+`AWS4-HMAC-SHA256 Credential=..., Signature=...`, any other word, or a bare credential), in the `Name: value`,
 `Name=value`, quoted, JSON and repr forms, up to the end of the header value (a line end, a literal `\r`/`\n` in a repr,
-the closing quote, or `&` in a query string) without eating the field that follows, and (d) the value of any field whose
-NAME is a credential name by this rule (case-insensitive; the name is split into words on `_`, `-`, `.`, spaces and
-camelCase boundaries, and a name written with percent escapes such as `access%5Ftoken` is decoded first): it **ends in**
-`token`, `secret`, `password`, `passwd`, `passphrase`, `credential(s)`, `authorization`, `cookie` or `signature`, or it
-**contains** `apikey`, or two consecutive words `access|secret|private` + `key`, or it is `auth|signing|encryption|ssh|
-session|master|client|license` + `_key`. Masked, for example: `token`, `access_token`, `refresh_token`, `auth_token`,
-`id_token`, `authToken`, `bearer_token`, `x-amz-security-token`, `X-CSRF-Token`, `X-Auth-Token`, `api_secret`,
-`client_secret`, `db_password`, `gpg_passphrase`, `session_cookie`, `Set-Cookie`, `request_signature`, `credentials`,
-`x-api-key`, `API_KEY`, `api_key_id`, `apiKey`, `private_key`, `ssh_private_key`, `AWS_SECRET_ACCESS_KEY`,
-`accessKeyId`, `signing_key`, `ZENODO_TOKEN=` and `ZENODO_SANDBOX_TOKEN=` assignments (a colon after those two names
-is ordinary prose in this tool's messages and is left readable). NOT masked, on purpose (ordinary bibliographic or
-technical text): a bare `key`, `bib_key`, `sort_key`, `cache_key`, `primary_key`, `public_key`, `zenodo_id`, `doi`,
-`keywords`, `publication_date`, `token_count`, `tokens`, `max_tokens`, `author`, `authorization_url`, `cookies`,
-`signature_algorithm`, `password_policy`, `secretary`. The unquoted value of a field written `Name=value` runs to the end
-of the line or the next `&`: a field written after it on the same line, separated by a space, is masked with it
-(documented over-masking, the price of a value that may hold spaces). A bare `signature`, `credential` or `credentials` is also ordinary prose (the Lorentzian signature of a metric, in an abstract that `--dry-run` prints): written alone it is masked only where a field name can stand (start of the text or of a line, after a quote, a brace, a comma, `&`, `?`), never after a word and a space; the compound names (`x-amz-signature`, `request_signature`, `aws_credentials`) are masked everywhere. The scheme patterns are applied first, and each
-pass is complete on its own, so the result does not depend on their order. Every `print` of the tool, every message of
-`sys.exit`, every argument-parsing error and every exception that escapes `main()` passes through the same function (the
-environment tokens are registered before the arguments are parsed, and the redacting `excepthook` is installed by
-`main()` itself, not only under `__main__`, because `sandbox_launch.py` and `inject_failures.py` import the module and
-call it); the only raw output calls of the module are the three that redact, and a test pins that by AST. The
-journal is redacted before the file is written (all its strings, its keys, and the value of every credential-named key).
+the closing quote, or `&` in a query string) without eating the field that follows; an `Authorization` value is also
+cut neither by an escaped pair (`Digest username=\"u\", response=\"S\"` inside a JSON string), nor by a FOLDED
+continuation line (a *folded* header: a line that begins with a space or a tab continues the value of the line before); a
+value that opens an *unclosed* quote (a truncated message) is masked to the end of the line, (d) the value of any field
+whose NAME is a credential name by this rule (case-insensitive; the name is split into words on `_`, `-`, `.`, spaces and
+camelCase boundaries, so a dotted name is judged by its last word; a name written with percent escapes such as
+`access%5Ftoken` or `my.x%2Dapi%2Dkey` is decoded first, once for each level of encoding, three at most: `%252D` too):
+it **ends in** `token`, `secret`, `password`, `passwd`, `passphrase`, `credential(s)`, `authorization`, `cookie` or
+`signature`, or it **contains** `apikey`, or two consecutive words `access|secret|private` + `key`, or `session` + `id`,
+or it is `auth|signing|encryption|ssh|session|master|client|license` + `_key`, or its LAST word (or the whole name) is
+`jwt`, `auth`, `oauth`, `pwd` or `csrf`, or the whole name is `session`. Masked, for example: `token`, `access_token`,
+`refresh_token`, `auth_token`, `id_token`, `authToken`, `bearer_token`, `x-amz-security-token`, `X-CSRF-Token`,
+`X-Auth-Token`, `api_secret`, `client_secret`, `db_password`, `gpg_passphrase`, `session_cookie`, `Set-Cookie`,
+`request_signature`, `credentials`, `x-api-key`, `API_KEY`, `api_key_id`, `apiKey`, `private_key`, `ssh_private_key`,
+`AWS_SECRET_ACCESS_KEY`, `accessKeyId`, `signing_key`, `jwt`, `auth`, `HTTP_AUTH`, `oauth`, `pwd`, `db_pwd`, `csrf`,
+`session`, `session_id`, `sessionId`, `ZENODO_TOKEN=` and `ZENODO_SANDBOX_TOKEN=` assignments (a colon after those two
+names is ordinary prose in this tool's messages and is left readable). The separators and the blanks around them may
+be any Unicode blank (no-break space, en and em spaces, narrow no-break space, ideographic space, tab, ...): `token`, NBSP,
+`=` is as masked as `token=`. (e) A bare token SHAPE, wherever it stands, with no field name: `ghp_`, `gho_`, `ghu_`,
+`ghs_`, `ghr_` followed by at least 16 letters or digits; `github_pat_`, `glpat-` and `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-`/
+`xoxs-` followed by at least 16 token characters; `AKIA` or `ASIA` followed by exactly 16 capitals or digits;
+`sk-` followed by at least 20 token characters of which one is a digit (so a hyphenated word that starts with `sk-`
+is not taken for a key); none of them when glued to a letter on the left. (f) The USERINFO of a URL, in any printed
+text and journal: `https://user:password@host/p` is printed `https://user:***@host/p`, a token-only
+`https://TOKEN@github.com/o/r` is printed `https://***@github.com/o/r`, `x-access-token:TOKEN@` and a percent-encoded
+userinfo likewise, also in a text cut right after the `@`; scheme, host and path stay readable; the conventional
+`ssh://git@host` is kept. NOT masked, on purpose (ordinary bibliographic or technical text): a bare `key`, `bib_key`,
+`sort_key`, `cache_key`, `primary_key`, `public_key`, `zenodo_id`, `doi`, `keywords`, `publication_date`, `token_count`,
+`tokens`, `max_tokens`, `author`, `authors`, `authorization_url`, `cookies`, `signature_algorithm`, `password_policy`,
+`secretary`, `obsession`, `session_count`, `edit-session`, `x_session`, `auth_url`, `oauth_scope`, and `ghp_short`. The
+unquoted value of a field written `Name=value` runs to the end of the line or the next `&`: a field written after it on
+the same line, separated by a space, is masked with it (documented over-masking, the price of a value that may hold
+spaces; `Authorization=<value>` consumes the rest of its line, and `Authorization: X, Content-Type: y` masks to the end of
+the line). A bare `signature`, `credential`, `credentials`, `auth`, `session` or `pwd` is also ordinary prose (the
+Lorentzian signature of a metric, in an abstract that `--dry-run` prints; an edit session): written alone it is masked
+only where a field name can stand (start of the text or of a line, after a quote, a brace, a comma, `&`, `?`), never
+after a word and a blank; the compound names (`x-amz-signature`, `request_signature`, `x_auth`) are masked everywhere. The
+three name-based passes, the scheme pass, the URL pass and the shape pass are each complete on its own, so the result does
+not depend on their order. Every `print` of the tool, every message of `sys.exit`, every argument-parsing error and every
+exception that escapes `main()` passes through the same function (the environment tokens are registered before the
+arguments are parsed, and the redacting `excepthook` is installed by `main()` itself, not only under `__main__`, because
+`sandbox_launch.py` and `inject_failures.py` import the module and call it; both print the exit code of the tool through
+`redact`); the only raw output calls of the module are the three that redact, and a test pins that by AST. The journal is
+redacted before the file is written (all its strings, its keys, and the value of every credential-named key).
+**Used values are never redacted.** The mask applies to what is PRINTED and to what is WRITTEN INTO A JOURNAL. The URL of
+a request, the host check of the client, the metadata sent to Zenodo and the payload of a PUT never pass through it (a
+test spies on the HTTP layer and on the redaction function separately and compares the URL byte for byte; mutants send
+a redacted request URL, host check, `code_url` of the metadata and of the payload, and are killed). **One used value is
+changed, on purpose, as a safety fix:** a `code_url` that carries credentials (`https://user:TOKEN@github.com/...`) is
+never sent to Zenodo. A `code_url` WRITTEN in `zenodo.json` with a userinfo is refused (`Error: ... carries credentials`);
+a code URL DERIVED from the git remote of a paper that has a `code/` directory is derived from the remote WITHOUT its
+userinfo and the tool says so (`Note: the git remote of this paper carries credentials; the code URL is derived without
+them`); before, the first was sent as written and the second ended in an error that printed the remote with its password.
 **Single choke point.** An exception text leaves the process by `print` / `die` / the argument parser / the journal
 serialiser / the excepthook only, and each of them redacts: `redact(exc)` written at a call site is a second line of
 defence, which is why mutating that one argument alone (`tests/mutation_check.py`, historical mutant E1) was an
-EQUIVALENT mutation; E1 now mutates the choke point (the module `print` on stderr) and is killed. **Limits:** a secret that is
-neither registered nor attached to one of those names (for instance a token printed bare, a differently named field such as `session` or
-`auth`, or a token typed in a `--reason`) is not recognised; a name built from words glued without a separator and
-without a listed ending (`mytok`) is not either; a registered secret
-**shorter than 8 characters** is masked only as a whole token (not preceded or followed by a letter, digit or
-underscore) and never inside a dictionary key, because a blind substring replacement of a one- or two-character secret
-would mangle every other text and the keys of a journal: such a secret glued to other characters is not masked. The
-output of `predeposit_check.py` run as its own command is not redacted (it prints paths and log lines of the paper, and
-never reads a token). The client refuses to be built with a token equal to the other host's
-variable, and refuses to send a request (bucket upload links included) to any host but its own, so the
-production token cannot reach the sandbox, nor the sandbox token production.
+EQUIVALENT mutation; E1 now mutates the choke point (the module `print` on stderr) and is killed. The excepthook is tested
+with a registered token through `zenodo_publish.main`, `sandbox_launch.py` and `inject_failures.py`, with a constructed
+exception and with a run that really raises. **Limits (kept):** a secret that is neither registered nor attached to one of
+those names, shapes or URLs (a token typed elsewhere, for instance in a `--reason`, or a PEM private-key block) is not
+recognised; a differently named field whose name has no listed ending or last word (`mytok`, `x_session`, `pass`, `sid`, `PAT`) is not
+either; a
+credential written in prose after its noun (`Authorization header "Foo X"`, `headers["Authorization"] = "Foo X"`) and
+`bearer:X` without a space are not masked; a registered secret **shorter than 8 characters** is masked only as a whole
+token (not preceded or followed by a letter, digit or underscore) and never inside a dictionary key, because a blind
+substring replacement of a one- or two-character secret would mangle every other text and the keys of a journal: such a
+secret glued to other characters is not masked. The output channels that this module does not use are not redacted
+either: `threading` excepthook, unraisable exceptions, `atexit` callbacks, `warnings` and `logging`. The output of
+`predeposit_check.py` run as its own command is not redacted (it prints paths and log lines of the paper, and never reads
+a token). The client refuses to be built with a token equal to the other host's variable, and refuses to send a request
+(bucket upload links included) to any host but its own, so the production token cannot reach the sandbox, nor the sandbox
+token production.
 
 ### The environment of the child processes (an allow-list)
 
@@ -226,7 +268,7 @@ Deliberately NOT passed: the proxy variables (a proxy URL may embed a password; 
 https remote), `SSL_CERT_*` / `CURL_CA_BUNDLE`, `SSH_AUTH_SOCK` (an agent socket is a credential: verify an ssh remote by
 hand), `LD_LIBRARY_PATH` / `DYLD_*` / `LD_PRELOAD` (they change which code a child loads), and every `GIT_*` name not in
 the table. A prefix is never an allow rule (`TEXMF_SECRET`, `PYTHONSECRET_X`, `LC_SECRET`, `GIT_SECRET_THING` are not
-passed); tests prove: the 26 names the review listed and 27 more do not reach a child, a custom variable does not, every
+passed); tests prove: the 26 names the review listed and 34 more do not reach a child, a custom variable does not, every
 allowed name that is set is passed, the allow-list holds no secret-looking name, the git names of the two lists agree,
 and `pdflatex` + `bibtex` still build a small paper. `desync_audit.py` and `repo_metadata_sync.py` are separate scripts
 (local `git` / `find` only, never reached from a deposit) and keep their own behaviour.
@@ -328,6 +370,20 @@ writes any `zenodo.json`. If the journal cannot be written before a write reques
 journal file is created exclusively (written under a unique temp name, then hard-linked: never over an existing
 file, never partial). `Ctrl-C` right after `publish` returns, or any case where publication cannot be excluded,
 prints the same "DO NOT RE-RUN" instruction and re-raises.
+
+**Corrective pass 7 (review round 23).** (1) Redaction: an Authorization or `*token` value that opens a quote the text never
+closes, one that holds escaped pairs, one that continues on the following lines, and a separator written with a Unicode
+blank are masked again (the fifth pass masked them, the sixth leaked them); names `jwt`, `auth`, `oauth`, `pwd`,
+`csrf`, `session`, `session_id`; bare token shapes; the userinfo of a URL; a percent-encoded name is decoded once per level
+of encoding. (2) **Behaviour change of a used value:** a `code_url` with credentials is refused, and one derived from a git
+remote with credentials is derived without them (see "Used values are never redacted"). (3) The seven survivors of the
+sixth pass are killed by tests; the README survivor sentence is the one the scripts compute. **Limits that remain,
+together:** an unreadable journal or one with an unknown outcome and **without a record id** or DOI is lifted on the
+operator's word (`--i-checked-the-account` or a record URL) alone, because nothing is recorded to verify; sandbox journals are lifted
+without any identity check (a sandbox has no production identity); the digest of a journal and the decision file are
+unauthenticated (an unkeyed sha256 that anyone who can write the state directory can recompute: they detect accident, not
+an attacker); two simultaneous runs are not serialised by a lock; the output channels listed under the redaction limits;
+and everything under "What is still UNPROVEN".
 
 ### Guards of a production deposit
 

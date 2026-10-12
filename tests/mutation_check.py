@@ -166,18 +166,18 @@ MUTANTS = [
     # secrets
     ("S1", "journal values not redacted before writing", '    out = redact_obj(data)\n    out["identity_sha256"]', '    out = dict(data)\n    out["identity_sha256"]'),
     ('S2', 'bare Bearer / Basic credentials are no longer masked',
-     '_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)',
-     '_PATTERN_PASSES = (_pass_field_colon, _pass_field_eq)'),
+     '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_colon, _pass_field_eq)',
+     '_PATTERN_PASSES = (_pass_userinfo, _pass_token_shapes, _pass_field_colon, _pass_field_eq)'),
     ('S3', 'access_token query strings (name=value) no longer masked',
-     '_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)',
-     '_PATTERN_PASSES = (_pass_scheme, _pass_field_colon)'),
+     '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_colon, _pass_field_eq)',
+     '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_colon)'),
     ('S4', 'the tokens loaded in the process are not registered',
      '    register_environment_secrets()        # BEFORE the arguments are parsed: an argparse error echoes the values it refuses',
      '    pass'),
     ("S5", "locate_own_state returns an unredacted exception text", "return \"unknown\", None, [rid], f\"cannot read record {rid} ({redact(exc)})\"", "return \"unknown\", None, [rid], f\"cannot read record {rid} ({exc})\""),
     ('S6', 'Authorization header values (name: value) no longer masked',
-     '_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)',
-     '_PATTERN_PASSES = (_pass_scheme, _pass_field_eq)'),
+     '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_colon, _pass_field_eq)',
+     '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_eq)'),
     # archive
     ("A1c", "an existing archive is judged by size only", "        if existing[\"sha256\"] == src[\"sha256\"]:", "        if existing[\"size\"] == src[\"size\"]:"),
     ("A5", "a symlink at the archive destination is followed", "    if dest.is_symlink():\n        raise ArchiveRefused(f\"{dest} is a symbolic link: refusing", "    if False:\n        raise ArchiveRefused(f\"{dest} is a symbolic link: refusing"),
@@ -344,7 +344,7 @@ NEW5_MUTANTS = [
     ("N5U11", "a journal host that is not a string is not refused", "    if not isinstance(host, str):\n        raise ReconcileRefused(f\"the journal {path.name} records a host",
      "    if False:\n        raise ReconcileRefused(f\"the journal {path.name} records a host"),
     # N-2 / N-5 / N-6: redaction
-    ('N5U13', 'name=value masks the scheme word only (the credential after it leaks)', '_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)[ \\t]+)?[^&\\s\\"\'<>]+", re.IGNORECASE)', '_TOKEN_EQ = re.compile(r"[^&\\s\\"\'<>]+", re.IGNORECASE)'),
+    ('N5U13', 'name=value masks the scheme word only (the credential after it leaks)', '_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)" + _BLANK + r"+)?[^&\\s\\"\'<>]+", re.IGNORECASE)', '_TOKEN_EQ = re.compile(r"[^&\\s\\"\'<>]+", re.IGNORECASE)'),
     ('N5U14', 'Basic credentials are not recognised as a scheme', '(?P<scheme>bearer:?|basic)', '(?P<scheme>bearer:?)'),
     ('N5U15', 'percent-encoded names are not decoded', '    return decoded if re.fullmatch(r"[\\w.-]+", decoded) else m.group("enc")', '    return m.group("enc")'),
     ('N5U18', 'ZENODO_TOKEN: in prose is masked too', '_PROSE_NAMES = ("zenodo_token", "zenodo_sandbox_token")', '_PROSE_NAMES = ()'),
@@ -358,7 +358,7 @@ NEW5_MUTANTS = [
     ("N5U24", "print does not redact", "    _builtins.print(redact(sep.join(str(a) for a in args)), end=", "    _builtins.print((sep.join(str(a) for a in args)), end="),
     ("N5U25", "die does not redact", "    sys.exit(redact(message))", "    sys.exit(message)"),
     ("N5U26", "the blind-substitution threshold is one character", "MIN_BLIND_SECRET = 8 ", "MIN_BLIND_SECRET = 1 "),
-    ("N5U27", "the scheme pass is the only pattern pass", "_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)", "_PATTERN_PASSES = (_pass_scheme,)"),
+    ('N5U27', 'the scheme pass is the only pattern pass', '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_colon, _pass_field_eq)', '_PATTERN_PASSES = (_pass_scheme,)'),
     ("N5U28", "a whitespace-only environment token is registered", "            register_secret(raw.strip())\n", "            register_secret(raw.strip()); _SECRETS.add(raw)\n"),
     # N-3: --backup-journal / --lift-block (decision-file mechanism)
     ("N5V1", "the digest of the journal is not compared with the decision's", 'and decision["journal_sha256"] == current)', "and True)"),
@@ -412,7 +412,7 @@ NEW6_MUTANTS = [
     ("N6V5", "a lift does not validate the concept DOI", '    if cdoi:\n        validate_concept_doi(cdoi, cid, host, "--concept-doi" if concept_doi else "the concept DOI recorded in the journal")\n    if not cid or not cdoi:', '    if cdoi:\n        pass\n    if not cid or not cdoi:'),
     ("N6V6", "a lift does not validate the operator\'s --concept-doi shape before merging", '    if concept_doi not in (None, ""):\n        validate_concept_doi(concept_doi, cid_arg, host)\n    jrid', '    if concept_doi not in (None, ""):\n        pass\n    jrid'),
     ('N6R27', 'a bare signature / credential in prose is masked (the abstract of a metric becomes unreadable)', '                and _AFTER_WORD.search(text[max(0, m.start("name") - 8):m.start("name")]):', '                and False:'),
-    ('N6R28', 'the prose guard also protects a real field written after a word', '_AFTER_WORD = re.compile(r"[A-Za-z0-9][ \\t]+$")', '_AFTER_WORD = re.compile(r"[A-Za-z0-9,&?\\"\'{][ \\t]*$")'),
+    ('N6R28', 'the prose guard also protects a real field written after a word', '_AFTER_WORD = re.compile(r"[A-Za-z0-9]" + _BLANK + r"+$")', '_AFTER_WORD = re.compile(r"[A-Za-z0-9,&?\\"\'{][ \\t]*$")'),
     ('N6L1', 'a journal that records a publication is lifted without the published identity', '    elif journal_records_publication(data) or given:', '    elif given:'),
     ('N6L2', 'the published zenodo_id is not compared with zenodo.json', '    if zid_text != str(concept_id):', '    if False:'),
     ('N6L3', 'the published doi is not compared with zenodo.json', '    if cfg.get("doi") != concept_doi:', '    if False:'),
@@ -468,10 +468,10 @@ NEW6_MUTANTS = [
     ('N6E11', 'SOURCE_DATE_EPOCH is not passed (reproducible builds)', '"SOURCE_DATE_EPOCH", "FORCE_SOURCE_DATE",', '"FORCE_SOURCE_DATE",', PC),
     ('N6E12', 'git_env passes every GIT_* variable (askpass, ssh command, config parameters)', '    return {k: v for k, v in environ.items() if k in _GIT_ENV_KEEP}', '    return {k: v for k, v in environ.items() if k in _GIT_ENV_KEEP or k.startswith("GIT_")}'),
     ('N6E13', 'git_env passes the SSH agent socket', '"LOGNAME",\n                 # the GIT_*', '"LOGNAME", "SSH_AUTH_SOCK",\n                 # the GIT_*'),
-    ('N6R1', 'Authorization=<scheme> credential: the value stops at the first space', '_HEADER_EQ = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\&<>])*")', '_HEADER_EQ = re.compile(r"[^\\s\\"\'&<>]*")'),
-    ('N6R2', 'Authorization: <scheme> credential: the value stops at the first space', '_HEADER_COLON = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\])*")', '_HEADER_COLON = re.compile(r"[^\\s\\"\']*")'),
-    ('N6R3', 'the header value does not stop at an escaped line end (\\r \\n written as text)', '_HEADER_COLON = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\])*")', '_HEADER_COLON = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|[^\\r\\n\\"\'])*")'),
-    ('N6R4', 'Authorization=value does not stop at an ampersand', '_HEADER_EQ = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\&<>])*")', '_HEADER_EQ = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\<>])*")'),
+    ('N6R1', 'Authorization=<scheme> credential: the value stops at the first space', '_HEADER_EQ = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + _ESC_PAIR + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\&<>])*" + _FOLD)', '_HEADER_EQ = re.compile(r"[^\\s\\"\'&<>]*")'),
+    ('N6R2', 'Authorization: <scheme> credential: the value stops at the first space', '_HEADER_COLON = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + _ESC_PAIR + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\])*" + _FOLD)', '_HEADER_COLON = re.compile(r"[^\\s\\"\']*")'),
+    ('N6R3', 'the header value does not stop at an escaped line end (\\r \\n written as text)', '_HEADER_COLON = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + _ESC_PAIR + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\])*" + _FOLD)', '_HEADER_COLON = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + _ESC_PAIR + r"|[^\\r\\n\\"\'])*" + _FOLD)'),
+    ('N6R4', 'Authorization=value does not stop at an ampersand', '_HEADER_EQ = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + _ESC_PAIR + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\&<>])*" + _FOLD)', '_HEADER_EQ = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + _ESC_PAIR + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\<>])*" + _FOLD)'),
     ('N6R5', 'a name that is not sensitive swallows its value (a credential field after it is missed)', '        if not sensitive:\n            pos = m.end()\n            continue', '        if not sensitive:\n            pos = _value_end(text, m.end(), colon, False)\n            continue'),
     ('N6R6', 'the suffix rule only matches the exact names', '    if joined.endswith(CREDENTIAL_SUFFIXES) or "apikey" in joined:', '    if joined in CREDENTIAL_SUFFIXES or "apikey" in joined:'),
     ('N6R7', 'access/secret/private + key pairs are not recognised', '    if any(pair in CREDENTIAL_KEY_PAIRS for pair in zip(words, words[1:])):', '    if False:'),
@@ -483,16 +483,16 @@ NEW6_MUTANTS = [
     ('N6R13', 'ZENODO_TOKEN= assignments are not masked (the prose exception also applies to the = form)', '(colon and "_".join(words) in _PROSE_NAMES)', '("_".join(words) in _PROSE_NAMES)'),
     ('N6R14', 'Bearer: X (colon) is not recognised', '(?P<scheme>bearer:?|basic)', '(?P<scheme>bearer|basic)'),
     ('N6R15', 'a bare scheme credential runs on across an escaped line end', '_SCHEME = re.compile(r"(?i)\\b(?P<scheme>bearer:?|basic)\\s+(?P<cred>[^\\s\\\\\\"\'&<>,;]+)")', '_SCHEME = re.compile(r"(?i)\\b(?P<scheme>bearer:?|basic)\\s+(?P<cred>[^\\s\\"\'&<>,;]+)")'),
-    ('N6R16', 'the separator may span a line end (an empty value eats the next line)', '_HEAD_COLON = re.compile(r"(?<![\\w.-])(?P<name>\\w[\\w.-]*)(?P<kq>\\\\?[\\"\']?)(?P<sep>[ \\t]*:[ \\t]*|%3[Aa][ \\t]*)")', '_HEAD_COLON = re.compile(r"(?<![\\w.-])(?P<name>\\w[\\w.-]*)(?P<kq>\\\\?[\\"\']?)(?P<sep>\\s*:\\s*|%3[Aa]\\s*)")'),
+    ('N6R16', 'the separator may span a line end (an empty value eats the next line)', '_HEAD_COLON = re.compile(r"(?<![\\w.-])(?<!://)(?P<name>\\w[\\w.-]*)(?P<kq>\\\\?[\\"\']?)(?P<sep>" + _BLANK + r"*:" + _BLANK + r"*|%3[Aa]" + _BLANK + r"*)")', '_HEAD_COLON = re.compile(r"(?<![\\w.-])(?<!://)(?P<name>\\w[\\w.-]*)(?P<kq>\\\\?[\\"\']?)(?P<sep>\\s*:\\s*|%3[Aa]\\s*)")'),
     ('N6R17', 'a quoted value is not recognised as a unit', '    q = _QUOTED.match(text, pos)\n    if q:\n        return q.end()', '    q = None\n    if q:\n        return q.end()'),
     ('N6R18', 'the Authorization name is not given the whole-value rule', '_value_end(text, m.end(), colon, _is_auth_name(name))', '_value_end(text, m.end(), colon, False)'),
     ('N6R19', 'an escaped-quote JSON value is not recognised', '_QUOTED = re.compile(r"\\"(?:[^\\"\\\\]|\\\\.)*\\"|\'[^\']*\'|\\\\\\"(?:[^\\\\]|\\\\(?!\\"))*\\\\\\"")', '_QUOTED = re.compile(r"\\"(?:[^\\"\\\\]|\\\\.)*\\"|\'[^\']*\'")'),
     ('N6R20', 'passphrase is not a credential name', 'CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd", "passphrase",', 'CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd",'),
     ('N6R21', 'signature is not a credential name', '"authorization", "cookie", "signature")', '"authorization", "cookie")'),
-    ('N6R22', 'credentials (plural) is not a credential name', '"credential", "credentials",', '"credential",'),
+    ('N6R22', 'credentials (plural) is not a credential name', '"credential", "credentials",\n                       "authorization"', '"credential",\n                       "authorization"'),
     ('N6R23', 'passwd is not a credential name', 'CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd",', 'CREDENTIAL_SUFFIXES = ("token", "secret", "password",'),
     ('N6R24', 'dots are not allowed in a percent-encoded name', '_ENCODED_NAME = re.compile(r"(?<![\\w.%-])(?P<enc>[\\w.-]*(?:%[0-9A-Fa-f]{2}[\\w.-]*)+)(?=[\\"\']?(?:\\s*[:=]|%3[AaDd]))")', '_ENCODED_NAME = re.compile(r"(?<![\\w.%-])(?P<enc>[\\w-]*(?:%[0-9A-Fa-f]{2}[\\w-]*)+)(?=[\\"\']?(?:\\s*[:=]|%3[AaDd]))")'),
-    ('N6R25', 'the scheme word of a generic name=value is not consumed', '_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)[ \\t]+)?[^&\\s\\"\'<>]+", re.IGNORECASE)', '_TOKEN_EQ = re.compile(r"[^&\\s\\"\'<>]+", re.IGNORECASE)'),
+    ('N6R25', 'the scheme word of a generic name=value is not consumed', '_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)" + _BLANK + r"+)?[^&\\s\\"\'<>]+", re.IGNORECASE)', '_TOKEN_EQ = re.compile(r"[^&\\s\\"\'<>]+", re.IGNORECASE)'),
     ('N6R26', 'a dictionary key is masked only when written exactly (not decoded)', '    return is_credential_name(unquote(key).strip().strip("\\"\'"))', '    return is_credential_name(key)'),
     ('N6X1', 'main() does not install the redacting excepthook', '    sys.excepthook = _redacting_excepthook\n    register_environment_secrets()', '    register_environment_secrets()'),
     ('N6X2', 'the excepthook prints the traceback unredacted', '    print(redact("".join(traceback.format_exception(etype, value, tb))), file=sys.stderr)', '    _builtins.print("".join(traceback.format_exception(etype, value, tb)), file=sys.stderr)'),
@@ -503,8 +503,89 @@ NEW6_MUTANTS = [
 ]
 NEW6_IDS = {m[0] for m in NEW6_MUTANTS}
 
-NEW_IDS = NEW6_IDS                                # --only-new: the sixth-pass mutants
-MUTANTS = MUTANTS + NEW_MUTANTS + NEW5_MUTANTS + NEW6_MUTANTS
+# ── seventh corrective pass (review round 23): the survivors of the sixth pass are killed by TESTS (not allowed) and
+# every new behaviour is mutated: unclosed quotes, escaped pairs, folded lines, Unicode blanks, percent decoding, the new
+# names, the token shapes, the URL userinfo, the code URL, the URLs that are USED, the launchers.
+#
+# PROOFS about the survivors of review round 23 (all seven are now killed; none is added to EQUIVALENT_SURVIVORS):
+#   N6V6 (the first validate_concept_doi of the operator's DOI in verify_published_identity) and N6V1 (--concept-id not
+#   validated before it is merged) and N6V3 (the journal's concept id not validated before it is merged) are
+#   OUTCOME-EQUIVALENT, not equivalent: for every input the ACCEPT/REFUSE decision is the same, because every identifier
+#   they let through is refused later, by the same predicate, on the merged value (cid = merge(cid_arg, jcid) is
+#   validated through validate_concept_doi(cdoi, cid, ...) whose number must equal str(cid), and a malformed cid
+#   cannot equal the digits of a validated DOI number; cdoi is validated whole on the merged value). They differ in the
+#   MESSAGE (the operator is told "--concept-id must be a positive integer" or "the concept id recorded in the journal
+#   must be ..." instead of "they must be equal" or "does not record the concept id and DOI"), and the message names the
+#   cure, which is part of the operator safety contract. tests/test_zenodo_round7.LiftValidationNamesTheCure pins each
+#   message, so the three mutants die; the proof of outcome-equivalence is kept here to say what the tests defend.
+#   N6V5 (the merged concept DOI not validated at the lift) is NOT equivalent: a journal edited to hold a malformed DOI
+#   that zenodo.json also holds is lifted without it (the run stays blocked because the block check validates the
+#   decision, which is the second line of defence this test pins from the lift side).
+#   N5V2 (a decision honoured for any journal kind) was killed by a round-5 test that lost its anchor when the helper
+#   defaults changed; the anchor is back (every blocking outcome, with and without a planted restored identity).
+#   N6X2 (excepthook unredacted) had no test running the hook with a registered secret; it has them now.
+#   N6R24 (dots in a percent-encoded name) had no test with a dotted name; it has them now.
+NEW7_MUTANTS = [
+    ('N7A1', 'an unclosed leading quote is not masked to the end of the line', '    if text.startswith((\'"\', "\'", \'\\\\"\'), pos):\n        return _REST_OF_LINE.match(text, pos).end()', '    if False:\n        return _REST_OF_LINE.match(text, pos).end()'),
+    ('N7A2', 'only a double quote opening is taken for an unclosed value (single and escaped quotes leak)', '(\'"\', "\'", \'\\\\"\')', '(\'"\',)'),
+    ('N7A3', 'an escaped balanced pair is no part of a colon-form header value', '_HEADER_COLON = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + _ESC_PAIR + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\])*" + _FOLD)', '_HEADER_COLON = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\])*" + _FOLD)'),
+    ('N7A4', 'an escaped balanced pair is no part of a name=value header value', '_HEADER_EQ = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + _ESC_PAIR + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\&<>])*" + _FOLD)', '_HEADER_EQ = re.compile(r"(?:[\\w.-]+=\\"[^\\"\\r\\n]*\\"|[\\w.-]+=\'[^\'\\r\\n]*\'|" + r"|\\\\(?![rn\\"\'])|[^\\r\\n\\"\'\\\\&<>])*" + _FOLD)'),
+    ('N7A5', 'folded continuation lines are not part of a header value', '_FOLD = r"(?:\\r?\\n[ \\t]+[^\\r\\n]*)*"', '_FOLD = r""'),
+    ('N7A6', 'every following line is taken for a continuation (the next header is eaten)', '_FOLD = r"(?:\\r?\\n[ \\t]+[^\\r\\n]*)*"', '_FOLD = r"(?:\\r?\\n[^\\r\\n]*)*"'),
+    ('N7A7', 'only a space (not a tab) starts a continuation line', '_FOLD = r"(?:\\r?\\n[ \\t]+[^\\r\\n]*)*"', '_FOLD = r"(?:\\r?\\n[ ]+[^\\r\\n]*)*"'),
+    ('N7A8', 'the blank of a separator is a space or a tab only', '_BLANK = "[ \\\\t\\\\x0b\\\\x0c\\\\u00a0\\\\u1680\\\\u2000-\\\\u200b\\\\u202f\\\\u205f\\\\u3000]"', '_BLANK = "[ \\\\t]"'),
+    ('N7A9', 'the blank misses the typographic spaces U+2000..U+200B', '_BLANK = "[ \\\\t\\\\x0b\\\\x0c\\\\u00a0\\\\u1680\\\\u2000-\\\\u200b\\\\u202f\\\\u205f\\\\u3000]"', '_BLANK = "[ \\\\t\\\\x0b\\\\x0c\\\\u00a0\\\\u1680\\\\u202f\\\\u205f\\\\u3000]"'),
+    ('N7A10', 'a Unicode blank before a bare noun is not a word break (prose masked)', '_AFTER_WORD = re.compile(r"[A-Za-z0-9]" + _BLANK + r"+$")', '_AFTER_WORD = re.compile(r"[A-Za-z0-9][ \\t]+$")'),
+    ('N7A11', 'a scheme word of a generic name=value is followed by a space or tab only', '_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)" + _BLANK + r"+)?[^&\\s\\"\'<>]+", re.IGNORECASE)', '_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)[ \\t]+)?[^&\\s\\"\'<>]+", re.IGNORECASE)'),
+    ('N7A12', 'a name right after :// is a field (the host of x-access-token:TOKEN@host is eaten)', '_HEAD_COLON = re.compile(r"(?<![\\w.-])(?<!://)(?P<name>\\w[\\w.-]*)(?P<kq>\\\\?[\\"\']?)(?P<sep>" + _BLANK + r"*:" + _BLANK + r"*|%3[Aa]" + _BLANK + r"*)")', '_HEAD_COLON = re.compile(r"(?<![\\w.-])(?P<name>\\w[\\w.-]*)(?P<kq>\\\\?[\\"\']?)(?P<sep>" + _BLANK + r"*:" + _BLANK + r"*|%3[Aa]" + _BLANK + r"*)")'),
+    ('N7A13', 'a value that opens a quote is cut after the first word instead of the line end', '        return _REST_OF_LINE.match(text, pos).end()\n    if colon:', '        return re.compile(r"\\S*").match(text, pos).end()\n    if colon:'),
+    ('N7P1', 'a name encoded more than once is decoded once', '    for _ in range(3):                 # a name encoded twice', '    for _ in range(1):                 # a name encoded twice'),
+    ('N7P2', 'decoding stops at the first round even for a name encoded once', '        if once == decoded:\n            break\n        decoded = once', '        decoded = once\n        break'),
+    ('N7N1', 'jwt/auth/oauth/pwd/csrf are not credential names', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd", "csrf")', 'CREDENTIAL_LAST_WORDS = ()'),
+    ('N7N2', 'jwt is not a credential name', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd", "csrf")', 'CREDENTIAL_LAST_WORDS = ("auth", "oauth", "pwd", "csrf")'),
+    ('N7N3', 'pwd is not a credential name', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd", "csrf")', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "csrf")'),
+    ('N7N4', 'csrf is not a credential name', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd", "csrf")', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd")'),
+    ('N7N5', 'auth is not a credential name', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd", "csrf")', 'CREDENTIAL_LAST_WORDS = ("jwt", "oauth", "pwd", "csrf")'),
+    ('N7N6', 'a bare session is not a credential name', '    if words[-1] in CREDENTIAL_LAST_WORDS or words == ["session"]:', '    if words[-1] in CREDENTIAL_LAST_WORDS:'),
+    ('N7N7', 'session+id is not a credential pair', 'CREDENTIAL_KEY_PAIRS = (("access", "key"), ("secret", "key"), ("private", "key"), ("session", "id"))', 'CREDENTIAL_KEY_PAIRS = (("access", "key"), ("secret", "key"), ("private", "key"))'),
+    ('N7N8', 'any word of the name (not only the last) may be a credential last word', '    if words[-1] in CREDENTIAL_LAST_WORDS or words == ["session"]:', '    if any(w in CREDENTIAL_LAST_WORDS for w in words) or words == ["session"]:'),
+    ('N7N9', 'a bare auth and session are not protected in prose', '_PROSE_NOUNS = ("signature", "credential", "credentials", "auth", "session", "pwd")', '_PROSE_NOUNS = ("signature", "credential", "credentials", "pwd")'),
+    ('N7N10', 'a bare pwd is not protected in prose', '_PROSE_NOUNS = ("signature", "credential", "credentials", "auth", "session", "pwd")', '_PROSE_NOUNS = ("signature", "credential", "credentials", "auth", "session")'),
+    ('N7N11', 'session as a last word (edit-session becomes a credential)', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd", "csrf")', 'CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd", "csrf", "session")'),
+    ('N7S1', 'the token-shape pass is not applied', '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_colon, _pass_field_eq)', '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_field_colon, _pass_field_eq)'),
+    ('N7S2', 'a GitHub token is masked from 1 token character on (prose over-masked)', 'r"gh[pousr]_[A-Za-z0-9]{16,}"', 'r"gh[pousr]_[A-Za-z0-9]{1,}"'),
+    ('N7S3', 'a shape glued to letters is masked too', '    r"(?<![A-Za-z0-9_])(?:"', '    r"(?:"'),
+    ('N7S4', 'the sk- shape needs no digit', '(?=[A-Za-z0-9_-]{0,200}[0-9])', ''),
+    ('N7S5', 'an AWS key id is masked from 1 character on', '(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])', '(?:AKIA|ASIA)[A-Z0-9]{1,}(?![A-Za-z0-9])'),
+    ('N7S6', 'github_pat_ is not a shape', '    r"|github_pat_[A-Za-z0-9_]{16,}"\n', ''),
+    ('N7S7', 'glpat- is not a shape', '    r"|glpat-[A-Za-z0-9_-]{16,}"\n', ''),
+    ('N7S8', 'xox tokens are not a shape', '    r"|xox[abprs]-[A-Za-z0-9-]{16,}"\n', ''),
+    ('N7S9', 'sk- is masked from 1 character on', 'sk-(?=[A-Za-z0-9_-]{0,200}[0-9])[A-Za-z0-9_-]{20,}', 'sk-(?=[A-Za-z0-9_-]{0,200}[0-9])[A-Za-z0-9_-]{1,}'),
+    ('N7S10', 'the ghp_ family is reduced to ghp_ only', 'gh[pousr]_', 'ghp_'),
+    ('N7U1', 'the userinfo pass is not applied', '_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_colon, _pass_field_eq)', '_PATTERN_PASSES = (_pass_scheme, _pass_token_shapes, _pass_field_colon, _pass_field_eq)'),
+    ('N7U2', 'the password of a URL is kept', '    return f"{m.group(\'scheme\')}{m.group(\'user\')}:***@" if m.group("pw") is not None else f"{m.group(\'scheme\')}***@"', '    return m.group(0) if m.group("pw") is not None else f"{m.group(\'scheme\')}***@"'),
+    ('N7U3', 'a token-only userinfo is kept', '    return f"{m.group(\'scheme\')}{m.group(\'user\')}:***@" if m.group("pw") is not None else f"{m.group(\'scheme\')}***@"', '    return f"{m.group(\'scheme\')}{m.group(\'user\')}:***@" if m.group("pw") is not None else m.group(0)'),
+    ('N7U4', 'the conventional ssh user git is masked too', '    if m.group("user") == "git" and m.group("pw") is None:', '    if False:'),
+    ('N7U5', 'the scheme of a URL is dropped from the printed text', '    return f"{m.group(\'scheme\')}{m.group(\'user\')}:***@" if m.group("pw") is not None else f"{m.group(\'scheme\')}***@"', '    return f"{m.group(\'user\')}:***@" if m.group("pw") is not None else f"{m.group(\'scheme\')}***@"'),
+    ('N7U6', 'the scheme may start inside a word (quadratic scan)', '(?P<scheme>(?<![A-Za-z0-9+.-])[A-Za-z]', '(?P<scheme>\\b[A-Za-z]'),
+    ('N7U7', 'a user name is restricted to plain characters (a percent-escaped user leaks the password)', '(?P<user>[^/\\s\\"\'<>?#@:]*)', '(?P<user>[A-Za-z0-9._-]*)'),
+    ('N7U8', 'a password may not contain an at sign (the part after it leaks)', '(?P<pw>:[^/\\s\\"\'<>?#]*)?@', '(?P<pw>:[^/\\s\\"\'<>?#@]*)?@'),
+    ('N7C1', 'a configured code_url with credentials is sent', '        if url_has_userinfo(code_url):', '        if False:'),
+    ('N7C2', 'the derived code URL keeps the credentials of the remote', '        remote = strip_url_userinfo(remote)', '        pass'),
+    ('N7C3', 'strip_url_userinfo strips nothing', '    return _URL_USERINFO.sub(lambda m: m.group("scheme"), url)', '    return url'),
+    ('N7C4', 'the operator is not told that the remote carries credentials', '        print("  Note: the git remote of this paper carries credentials; the code URL is derived without them.")', '        pass'),
+    ('N7C5', 'url_has_userinfo never finds one', '    return isinstance(url, str) and _URL_USERINFO.search(url) is not None', '    return False'),
+    ('N7C6', 'the request URL is redacted before it is sent', '                resp = fn(url, **kw)', '                resp = fn(redact(url), **kw)'),
+    ('N7C7', 'the host check is made on the redacted URL', '        self._check_url(url)\n        if method != "GET" and self.journal is not None:', '        self._check_url(redact(url))\n        if method != "GET" and self.journal is not None:'),
+    ('N7C8', 'the code URL of the metadata is redacted', '        meta["custom"] = {CODE_REPOSITORY_FIELD: code_url}', '        meta["custom"] = {CODE_REPOSITORY_FIELD: redact(code_url)}'),
+    ('N7C9', 'the code URL of the PUT payload is redacted', '            payload["custom"] = {**(live.get("custom") or {}), CODE_REPOSITORY_FIELD: code_url}', '            payload["custom"] = {**(live.get("custom") or {}), CODE_REPOSITORY_FIELD: redact(code_url)}'),
+    ('N7X3', 'the sandbox launcher prints the exit code of the tool unredacted', 'print(zp.redact(exc.code), file=sys.stderr)', 'print(exc.code, file=sys.stderr)', 'pilot/sandbox_launch.py'),
+    ('N7X4', 'the injection harness prints the exit code of the tool unredacted', '{zp.redact(repr(exc.code))}', '{repr(exc.code)}', 'pilot/inject_failures.py'),
+]
+NEW7_IDS = {m[0] for m in NEW7_MUTANTS}
+
+NEW_IDS = NEW7_IDS                                # --only-new: the seventh-pass mutants
+MUTANTS = MUTANTS + NEW_MUTANTS + NEW5_MUTANTS + NEW6_MUTANTS + NEW7_MUTANTS
 
 
 def load_mutated(src: str, name: str = "zenodo_publish", path: Path = SRC_PATH):

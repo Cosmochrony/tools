@@ -430,7 +430,7 @@ class Journals:
         return j.path
 
     @staticmethod
-    def identity(root, paper, how="edit", outcome="RUNNING"):
+    def identity(root, paper, how="edit", *, outcome):
         j = make_blocking_journal(root, paper, outcome=outcome)
         if how == "edit":
             tamper(j.path, bib_key="SomethingElse")
@@ -441,7 +441,7 @@ class Journals:
         return j.path
 
     @staticmethod
-    def moved(root, paper, outcome="RUNNING"):
+    def moved(root, paper, *, outcome):
         j = make_blocking_journal(root, paper, outcome=outcome)
         moved = paper.parent / "paper-moved"
         os.rename(paper, moved)
@@ -564,23 +564,27 @@ class LiftBlock(unittest.TestCase):
         return out
 
     def test_each_liftable_kind_is_lifted_by_a_decision_and_the_journal_is_never_touched(self):
-        cases = {
-            "unreadable": Journals.unreadable(self.root, self.paper),
-            "unknown-outcome": None, "identity-edit": None, "identity-no-digest": None,
-        }
-        for kind in cases:
-            root, paper = workspace()
-            self.root, self.paper = root, paper
-            jp = {"unreadable": lambda: Journals.unreadable(root, paper),
-                  "unknown-outcome": lambda: Journals.unknown_outcome(root, paper),
-                  "identity-edit": lambda: Journals.identity(root, paper, "edit"),
-                  "identity-no-digest": lambda: Journals.identity(root, paper, "no-digest")}[kind]()
-            self.assert_lifts(jp)
+        # the outcomes that prove nothing was published are lifted without ids; those that record a publication
+        # (UNRECONCILED, PUBLISHED-UNSAVED) need the published identity: tests/test_zenodo_round7.py walks the whole matrix
+        for kind in ("unreadable", "unknown-outcome", "identity-edit", "identity-no-digest"):
+            for outcome in ("RUNNING", "DRAFT-LEFT-BEHIND"):
+                if kind in ("unreadable", "unknown-outcome") and outcome != "RUNNING":
+                    continue
+                root, paper = workspace()
+                self.root, self.paper = root, paper
+                jp = {"unreadable": lambda: Journals.unreadable(root, paper),
+                      "unknown-outcome": lambda: Journals.unknown_outcome(root, paper),
+                      "identity-edit": lambda: Journals.identity(root, paper, "edit", outcome=outcome),
+                      "identity-no-digest": lambda: Journals.identity(root, paper, "no-digest", outcome=outcome)}[kind]()
+                self.assert_lifts(jp)
 
     def test_a_journal_whose_directory_moved_is_lifted(self):
-        jp, moved = Journals.moved(self.root, self.paper)
-        self.paper = moved
-        self.assert_lifts(jp)
+        for outcome in ("RUNNING", "DRAFT-LEFT-BEHIND"):
+            root, paper = workspace()
+            self.root = root
+            jp, moved = Journals.moved(root, paper, outcome=outcome)
+            self.paper = moved
+            self.assert_lifts(jp)
 
     def test_the_decision_file_records_who_when_why_the_evidence_and_the_digest(self):
         jp = Journals.unknown_outcome(self.root, self.paper)
@@ -697,18 +701,23 @@ class LiftBlock(unittest.TestCase):
             self.assertTrue(blocked(self.root, self.paper)[0], content)
 
     def test_a_decision_never_lifts_a_journal_that_has_a_known_outcome_and_a_consistent_identity(self):
-        jp = Journals.normal(self.root, self.paper)
-        code, _, _ = lift(jp, self.root)
-        self.assertIn("reconcile", str(code))
-        self.assertFalse(decision_of(jp).exists())
-        self.assertEqual(list(jp.parent.glob("*.quarantine-copy-*")), [])
-        # a hand-written decision for it is ignored as well
-        d = {"decision": "UNBLOCK", "journal": jp.name, "journal_sha256": sha(jp), "block_kind": None}
-        decision_of(jp).write_text(json.dumps(d))
-        self.assertTrue(blocked(self.root, self.paper)[0])
-        d["block_kind"] = "identity"
-        decision_of(jp).write_text(json.dumps(d))
-        self.assertTrue(blocked(self.root, self.paper)[0])
+        # EVERY blocking outcome: the anchor of the mutant "a decision is honoured for any journal kind" is a planted
+        # decision for a journal that proves nothing was published (RUNNING before the publish request,
+        # DRAFT-LEFT-BEHIND), which no other check of the decision stops
+        for outcome in zp.BLOCKING_OUTCOMES:
+            root, paper = workspace()
+            jp = make_blocking_journal(root, paper, outcome=outcome).path
+            code, _, _ = lift(jp, root)
+            self.assertIn("reconcile", str(code), outcome)
+            self.assertFalse(decision_of(jp).exists(), outcome)
+            self.assertEqual(list(jp.parent.glob("*.quarantine-copy-*")), [], outcome)
+            # a hand-written decision for it is ignored as well
+            d = {"decision": "UNBLOCK", "journal": jp.name, "journal_sha256": sha(jp), "block_kind": None}
+            decision_of(jp).write_text(json.dumps(d))
+            self.assertTrue(blocked(root, paper)[0], outcome)
+            d["block_kind"] = "identity"
+            decision_of(jp).write_text(json.dumps(d))
+            self.assertTrue(blocked(root, paper)[0], outcome)
 
     def test_a_non_blocking_journal_is_not_liftable(self):
         j = make_blocking_journal(self.root, self.paper, outcome="PUBLISHED")
@@ -798,7 +807,8 @@ class LiftBlockKindsAndConsequences(unittest.TestCase):
 
     def test_the_blocking_message_names_the_right_cure_for_each_kind(self):
         for kind, build in (("unreadable", Journals.unreadable), ("unknown", Journals.unknown_outcome),
-                            ("identity", Journals.identity)):
+                            ("identity", lambda r, p: Journals.identity(r, p, outcome="RUNNING")),
+                            ("identity-after-a-publication", lambda r, p: Journals.identity(r, p, outcome="UNRECONCILED"))):
             root, paper = workspace()
             jp = build(root, paper)
             _, msg = blocked(root, paper)
