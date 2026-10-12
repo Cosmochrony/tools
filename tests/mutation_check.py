@@ -510,7 +510,7 @@ NEW6_IDS = {m[0] for m in NEW6_MUTANTS}
 # PROOFS about the survivors of review round 23 (all seven are now killed; none is added to EQUIVALENT_SURVIVORS):
 #   N6V6 (the first validate_concept_doi of the operator's DOI in verify_published_identity) and N6V1 (--concept-id not
 #   validated before it is merged) and N6V3 (the journal's concept id not validated before it is merged) are
-#   OUTCOME-EQUIVALENT, not equivalent: for every input the ACCEPT/REFUSE decision is the same, because every identifier
+#   OUTCOME-EQUIVALENT, not equivalent: on string inputs, for every input the ACCEPT/REFUSE decision is the same, because every identifier
 #   they let through is refused later, by the same predicate, on the merged value (cid = merge(cid_arg, jcid) is
 #   validated through validate_concept_doi(cdoi, cid, ...) whose number must equal str(cid), and a malformed cid
 #   cannot equal the digits of a validated DOI number; cdoi is validated whole on the merged value). They differ in the
@@ -518,6 +518,9 @@ NEW6_IDS = {m[0] for m in NEW6_MUTANTS}
 #   must be ..." instead of "they must be equal" or "does not record the concept id and DOI"), and the message names the
 #   cure, which is part of the operator safety contract. tests/test_zenodo_round7.LiftValidationNamesTheCure pins each
 #   message, so the three mutants die; the proof of outcome-equivalence is kept here to say what the tests defend.
+#   "On string inputs": the only difference found (differential test, 445,500 combinations) is the Python type of the
+#   returned concept_id (int instead of str): unreachable from the command line and from tool-written journals, reachable
+#   with a hand-edited journal holding an int concept_id (the block check then refuses to honour it: fail closed).
 #   N6V5 (the merged concept DOI not validated at the lift) is NOT equivalent: a journal edited to hold a malformed DOI
 #   that zenodo.json also holds is lifted without it (the run stays blocked because the block check validates the
 #   decision, which is the second line of defence this test pins from the lift side).

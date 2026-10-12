@@ -190,8 +190,9 @@ or it is `auth|signing|encryption|ssh|session|master|client|license` + `_key`, o
 `AWS_SECRET_ACCESS_KEY`, `accessKeyId`, `signing_key`, `jwt`, `auth`, `HTTP_AUTH`, `oauth`, `pwd`, `db_pwd`, `csrf`,
 `session`, `session_id`, `sessionId`, `ZENODO_TOKEN=` and `ZENODO_SANDBOX_TOKEN=` assignments (a colon after those two
 names is ordinary prose in this tool's messages and is left readable). The separators and the blanks around them may
-be any Unicode blank (no-break space, en and em spaces, narrow no-break space, ideographic space, tab, ...): `token`, NBSP,
-`=` is as masked as `token=`. (e) A bare token SHAPE, wherever it stands, with no field name: `ghp_`, `gho_`, `ghu_`,
+be any of the listed Unicode blanks (space, tab, vertical tab, form feed, U+00A0, U+1680, U+2000-U+200B, U+202F, U+205F,
+U+3000): `token`, NBSP, `=` is as masked as `token=`; a zero-width character (U+200C, U+200D, U+2060, U+FEFF, soft
+hyphen) written before the separator or inside the name is NOT recognised. (e) A bare token SHAPE, wherever it stands, with no field name: `ghp_`, `gho_`, `ghu_`,
 `ghs_`, `ghr_` followed by at least 16 letters or digits; `github_pat_`, `glpat-` and `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-`/
 `xoxs-` followed by at least 16 token characters; `AKIA` or `ASIA` followed by exactly 16 capitals or digits;
 `sk-` followed by at least 20 token characters of which one is a digit (so a hyphenated word that starts with `sk-`
@@ -236,7 +237,14 @@ those names, shapes or URLs (a token typed elsewhere, for instance in a `--reaso
 recognised; a differently named field whose name has no listed ending or last word (`mytok`, `x_session`, `pass`, `sid`, `PAT`) is not
 either; a
 credential written in prose after its noun (`Authorization header "Foo X"`, `headers["Authorization"] = "Foo X"`) and
-`bearer:X` without a space are not masked; a registered secret **shorter than 8 characters** is masked only as a whole
+`bearer:X` without a space are not masked; the bytes form `b'Token X'` (a bytes VALUE after an Authorization or credential
+name: the mask stops at the quote and the credential stays); a token used as the user name of a URL
+(`https://TOKEN:x-oauth-basic@host`: only the password is masked; a prefixed token is caught by its shape); a URL
+password with an unencoded `?`, `#`, `/`, space, `"` or `<` (`https://u:pa?ss@host/x` is printed unchanged); `token = `
+followed by a blank line and an indented value (the empty value is masked, the next line stays); names `PHPSESSID`,
+`xsrf`, `x-session` (no listed ending or last word); token shapes outside the list (`xoxe-`, `npm_`, `AIza`, `sk_live_`);
+a name percent-encoded in a fourth round (only three are decoded); cosmetic: `ssh://git@host/...` prints the false note
+"carries credentials" (the remote is refused as non-GitHub either way, as before); a registered secret **shorter than 8 characters** is masked only as a whole
 token (not preceded or followed by a letter, digit or underscore) and never inside a dictionary key, because a blind
 substring replacement of a one- or two-character secret would mangle every other text and the keys of a journal: such a
 secret glued to other characters is not masked. The output channels that this module does not use are not redacted
@@ -374,7 +382,7 @@ prints the same "DO NOT RE-RUN" instruction and re-raises.
 **Corrective pass 7 (review round 23).** (1) Redaction: an Authorization or `*token` value that opens a quote the text never
 closes, one that holds escaped pairs, one that continues on the following lines, and a separator written with a Unicode
 blank are masked again (the fifth pass masked them, the sixth leaked them); names `jwt`, `auth`, `oauth`, `pwd`,
-`csrf`, `session`, `session_id`; bare token shapes; the userinfo of a URL; a percent-encoded name is decoded once per level
+`csrf`, `session`, `session_id`; bare token shapes; the userinfo of a URL; a percent-encoded name is decoded up to three rounds
 of encoding. (2) **Behaviour change of a used value:** a `code_url` with credentials is refused, and one derived from a git
 remote with credentials is derived without them (see "Used values are never redacted"). (3) The seven survivors of the
 sixth pass are killed by tests; the README survivor sentence is the one the scripts compute. **Limits that remain,

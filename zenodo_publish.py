@@ -93,8 +93,9 @@ Guards (all offline-tested; the server semantics they rely on are listed as UNPR
     api_secret, client_secret, session_cookie, x-amz-security-token, private_key, X-Api-Key, access_token ...; words are
     split on _ - . and camelCase). A bare ``key`` and any other <word>_key (bib_key), zenodo_id, keywords, token_count,
     max_tokens are NOT masked; the whole name or last word jwt, auth, oauth, pwd, csrf, the name session and the pair
-    session+id ARE. Names are case-insensitive, percent-encoded names are decoded (once per level of encoding), any
-    Unicode blank may surround a separator, bare token shapes (ghp_, github_pat_, glpat-, xox?-, AKIA, sk-) and the
+    session+id ARE. Names are case-insensitive, percent-encoded names are decoded (up to three rounds), the listed
+    Unicode blanks (U+00A0, U+2000-U+200B, U+202F, U+205F, U+3000, ...) may surround a separator (a zero-width character
+    U+200C, U+200D, U+2060, U+FEFF or a soft hyphen is NOT recognised), bare token shapes (ghp_, github_pat_, glpat-, xox?-, AKIA, sk-) and the
     userinfo of any URL (user:***@host, ***@host) are masked in PRINTED text and journals only (a URL that is USED is
     never redacted; a code_url with credentials is refused, one derived from a git remote is derived without them),
     ZENODO_TOKEN= /
