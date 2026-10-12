@@ -86,12 +86,18 @@ Guards (all offline-tested; the server semantics they rely on are listed as UNPR
     only as a whole token), any "Bearer ..." / "Bearer: ..." / "Basic ..." credential (scheme patterns applied first),
     the ENTIRE value of any Authorization / Proxy-Authorization field whatever its scheme (Bearer, Basic, Digest,
     Negotiate, Token, ApiKey, OAuth, GitHub, AWS4-HMAC-SHA256 ..., or none), up to the end of the header value (line
-    end, closing quote, "&" in a query string), and the value of any field whose NAME ends in token, secret, password,
+    end, closing quote, "&" in a query string; an unclosed quote masks to the line end, folded continuation lines and
+    escaped pairs belong to the value), and the value of any field whose NAME ends in token, secret, password,
     passwd, passphrase, credential(s), authorization, cookie or signature, or contains apikey / access_key / secret_key /
     private_key, or is <auth|signing|encryption|ssh|session|master|client|license>_key (auth_token, id_token,
     api_secret, client_secret, session_cookie, x-amz-security-token, private_key, X-Api-Key, access_token ...; words are
     split on _ - . and camelCase). A bare ``key`` and any other <word>_key (bib_key), zenodo_id, keywords, token_count,
-    max_tokens are NOT masked. Names are case-insensitive, percent-encoded names are decoded, ZENODO_TOKEN= /
+    max_tokens are NOT masked; the whole name or last word jwt, auth, oauth, pwd, csrf, the name session and the pair
+    session+id ARE. Names are case-insensitive, percent-encoded names are decoded (once per level of encoding), any
+    Unicode blank may surround a separator, bare token shapes (ghp_, github_pat_, glpat-, xox?-, AKIA, sk-) and the
+    userinfo of any URL (user:***@host, ***@host) are masked in PRINTED text and journals only (a URL that is USED is
+    never redacted; a code_url with credentials is refused, one derived from a git remote is derived without them),
+    ZENODO_TOKEN= /
     ZENODO_SANDBOX_TOKEN= assignments are masked (a colon after them is prose); header dicts, query strings, key=value
     and JSON-looking text; before printing (every print, every exit message, every argument-parsing error, an exception
     that escapes main()) and before any journal write. A secret that is neither registered nor attached to such a
@@ -681,7 +687,13 @@ def register_secret(value) -> None:
 # ordinary bibliographic or technical text, and so are token_count, max_tokens, keywords, zenodo_id, publication_date.
 CREDENTIAL_SUFFIXES = ("token", "secret", "password", "passwd", "passphrase", "credential", "credentials",
                        "authorization", "cookie", "signature")
-CREDENTIAL_KEY_PAIRS = (("access", "key"), ("secret", "key"), ("private", "key"))
+CREDENTIAL_KEY_PAIRS = (("access", "key"), ("secret", "key"), ("private", "key"), ("session", "id"))
+# Names that are credentials when they are the WHOLE name or its LAST word (x_auth, HTTP_AUTH, my_jwt, db_pwd, csrf,
+# oauth): never when they only occur inside a longer word (author, obsession) or earlier in the name. ``session`` alone is
+# one too (the WHOLE name only: ``edit-session`` is a label of this tool, not a credential), and so are the pair
+# session+id (session_id, sessionId) and the compounds of the suffix and qualifier rules (session_token, session_cookie,
+# session_key).
+CREDENTIAL_LAST_WORDS = ("jwt", "auth", "oauth", "pwd", "csrf")
 KEY_QUALIFIERS = ("auth", "signing", "encryption", "ssh", "session", "master", "client", "license")
 # The two token variables of this tool are credential names too, but a colon after them is ordinary prose in this
 # tool's own messages ("ZENODO_TOKEN: the production token ..."): they are masked in NAME=value assignments only.
@@ -690,8 +702,12 @@ _PROSE_NAMES = ("zenodo_token", "zenodo_sandbox_token")
 # signature: (-,+,+,+)"): written alone, they are masked only where a field name can stand (start of the text or of a
 # line, after a quote, a brace, a comma, "&", "?" or ";"), not after a word and a space. Compound names (x-amz-signature,
 # request_signature) are masked everywhere.
-_PROSE_NOUNS = ("signature", "credential", "credentials")
-_AFTER_WORD = re.compile(r"[A-Za-z0-9][ \t]+$")
+_PROSE_NOUNS = ("signature", "credential", "credentials", "auth", "session", "pwd")
+# Unicode blanks that may stand where a space or a tab does (no-break space, en/em spaces ... zero width space,
+# narrow no-break space, medium mathematical space, ideographic space, vertical tab, form feed): a separator written
+# with one of them is still a separator.
+_BLANK = "[ \\t\\x0b\\x0c\\u00a0\\u1680\\u2000-\\u200b\\u202f\\u205f\\u3000]"
+_AFTER_WORD = re.compile(r"[A-Za-z0-9]" + _BLANK + r"+$")
 _NAME_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 
 
@@ -711,6 +727,8 @@ def is_credential_name(name) -> bool:
     joined = "".join(words)
     if joined.endswith(CREDENTIAL_SUFFIXES) or "apikey" in joined:
         return True
+    if words[-1] in CREDENTIAL_LAST_WORDS or words == ["session"]:
+        return True
     if any(pair in CREDENTIAL_KEY_PAIRS for pair in zip(words, words[1:])):
         return True
     return len(words) >= 2 and words[-1] == "key" and words[-2] in KEY_QUALIFIERS
@@ -719,20 +737,27 @@ def is_credential_name(name) -> bool:
 # An authentication scheme word followed by its credential. Applied FIRST (before any name=value pattern) so that
 # the credential is masked whatever the field it travels in; the credential stops at a quote or a separator.
 _SCHEME = re.compile(r"(?i)\b(?P<scheme>bearer:?|basic)\s+(?P<cred>[^\s\\\"'&<>,;]+)")
-# The head of a field: its name, an optional (possibly escaped) quote, the separator.
-_HEAD_COLON = re.compile(r"(?<![\w.-])(?P<name>\w[\w.-]*)(?P<kq>\\?[\"']?)(?P<sep>[ \t]*:[ \t]*|%3[Aa][ \t]*)")
-_HEAD_EQ = re.compile(r"(?<![\w.-])(?P<name>\w[\w.-]*)(?P<kq>\\?[\"']?)(?P<sep>[ \t]*=[ \t]*|%3[Dd])")
+# The head of a field: its name, an optional (possibly escaped) quote, the separator. A name right after ``://`` is the
+# userinfo of a URL (https://x-access-token:TOKEN@host), handled by _pass_userinfo, not a field.
+_HEAD_COLON = re.compile(r"(?<![\w.-])(?<!://)(?P<name>\w[\w.-]*)(?P<kq>\\?[\"']?)(?P<sep>" + _BLANK + r"*:" + _BLANK + r"*|%3[Aa]" + _BLANK + r"*)")
+_HEAD_EQ = re.compile(r"(?<![\w.-])(?<!://)(?P<name>\w[\w.-]*)(?P<kq>\\?[\"']?)(?P<sep>" + _BLANK + r"*=" + _BLANK + r"*|%3[Dd])")
 # A quoted value: "..." (escapes allowed), '...' or an escaped \"...\" inside JSON-looking text.
 _QUOTED = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'[^']*'|\\\"(?:[^\\]|\\(?!\"))*\\\"")
 # An UNQUOTED value that is a whole header value: it runs to the end of the line or the closing quote, whatever its
 # scheme (Bearer, ApiKey, AWS4-HMAC-SHA256 Credential=..., Digest realm="x", ...) and may hold spaces and commas, but
 # it stops at a real or escaped line end (\r, \n written as text), at an unbalanced quote (the closing quote of the
 # text that embeds it) and, in the name=value form, at "&" and "<" ">". A balanced name="value" piece is part of it.
-_HEADER_COLON = re.compile(r"(?:[\w.-]+=\"[^\"\r\n]*\"|[\w.-]+='[^'\r\n]*'|\\(?![rn\"'])|[^\r\n\"'\\])*")
-_HEADER_EQ = re.compile(r"(?:[\w.-]+=\"[^\"\r\n]*\"|[\w.-]+='[^'\r\n]*'|\\(?![rn\"'])|[^\r\n\"'\\&<>])*")
+# Also part of it: a balanced ESCAPED pair name=\"value\" (a Digest header carried inside a JSON string) and the folded
+# continuation lines of the header (a line that begins with a space or a tab continues the value of the line before).
+_ESC_PAIR = r'[\w.-]+=\\"(?:[^\\\r\n]|\\(?!"))*\\"'
+_FOLD = r"(?:\r?\n[ \t]+[^\r\n]*)*"
+_HEADER_COLON = re.compile(r"(?:[\w.-]+=\"[^\"\r\n]*\"|[\w.-]+='[^'\r\n]*'|" + _ESC_PAIR + r"|\\(?![rn\"'])|[^\r\n\"'\\])*" + _FOLD)
+_HEADER_EQ = re.compile(r"(?:[\w.-]+=\"[^\"\r\n]*\"|[\w.-]+='[^'\r\n]*'|" + _ESC_PAIR + r"|\\(?![rn\"'])|[^\r\n\"'\\&<>])*" + _FOLD)
+# A value that opens a quote the text never closes (truncated text, a cut-off message) is masked to the end of the line.
+_REST_OF_LINE = re.compile(r"[^\r\n]*")
 # A short value of any other credential name in the name=value form: (scheme word and) credential up to the next
 # separator.
-_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)[ \t]+)?[^&\s\"'<>]+", re.IGNORECASE)
+_TOKEN_EQ = re.compile(r"(?:(?:bearer|basic|digest|negotiate|token)" + _BLANK + r"+)?[^&\s\"'<>]+", re.IGNORECASE)
 # A name written with percent escapes (access%5Ftoken, X%2DApi%2DKey) followed by a separator: decoded before matching
 # so that the name rules see it. Only a decoded name made of word characters, dots and hyphens is substituted.
 _ENCODED_NAME = re.compile(r"(?<![\w.%-])(?P<enc>[\w.-]*(?:%[0-9A-Fa-f]{2}[\w.-]*)+)(?=[\"']?(?:\s*[:=]|%3[AaDd]))")
@@ -742,7 +767,12 @@ _AUTH_WORDS = ("authorization",)
 
 def _decode_encoded_name(m) -> str:
     from urllib.parse import unquote
-    decoded = unquote(m.group("enc"))
+    decoded = m.group("enc")
+    for _ in range(3):                 # a name encoded twice (%252D) is decoded as often as it is encoded, three times at most
+        once = unquote(decoded)
+        if once == decoded:
+            break
+        decoded = once
     return decoded if re.fullmatch(r"[\w.-]+", decoded) else m.group("enc")
 
 
@@ -755,6 +785,8 @@ def _value_end(text: str, pos: int, colon: bool, auth: bool) -> int:
     q = _QUOTED.match(text, pos)
     if q:
         return q.end()
+    if text.startswith(('"', "'", '\\"'), pos):
+        return _REST_OF_LINE.match(text, pos).end()
     if colon:
         return _HEADER_COLON.match(text, pos).end()
     if auth:
@@ -806,9 +838,45 @@ def _pass_field_eq(text: str) -> str:
     return _mask_fields(_ENCODED_NAME.sub(_decode_encoded_name, text), _HEAD_EQ, False)
 
 
+# Credentials embedded in a URL: ``scheme://user:password@host`` and ``scheme://TOKEN@host``. The password (or the whole
+# userinfo when it has no colon: a bare token, or a user name, which cannot be told apart) is masked; scheme, host and
+# path stay readable. This is applied to what is PRINTED or WRITTEN INTO A JOURNAL only: the URLs a request or a git
+# command is made with never go through ``redact`` (tests spy on both).
+_URL_USERINFO = re.compile(r"(?P<scheme>(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://)(?P<user>[^/\s\"'<>?#@:]*)(?P<pw>:[^/\s\"'<>?#]*)?@")
+
+
+def _mask_userinfo(m) -> str:
+    if m.group("user") == "git" and m.group("pw") is None:       # ssh://git@host: the conventional user name, no secret
+        return m.group(0)
+    return f"{m.group('scheme')}{m.group('user')}:***@" if m.group("pw") is not None else f"{m.group('scheme')}***@"
+
+
+def _pass_userinfo(text: str) -> str:
+    return _URL_USERINFO.sub(_mask_userinfo, text)
+
+
+# Well-known token SHAPES, masked wherever they stand in the text (no field name needed): a documented prefix followed
+# by enough token characters that ordinary prose cannot match it. ghp_/gho_/ghu_/ghs_/ghr_ (GitHub), github_pat_,
+# glpat- (GitLab), xoxa/b/p/r/s- (Slack), AKIA/ASIA (AWS access key id), sk- (secret keys of API providers: at least
+# 20 characters AND a digit, so that a hyphenated word starting with ``sk-`` is not taken for one).
+_TOKEN_SHAPES = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"gh[pousr]_[A-Za-z0-9]{16,}"
+    r"|github_pat_[A-Za-z0-9_]{16,}"
+    r"|glpat-[A-Za-z0-9_-]{16,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{16,}"
+    r"|(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])"
+    r"|sk-(?=[A-Za-z0-9_-]{0,200}[0-9])[A-Za-z0-9_-]{20,}"
+    r")")
+
+
+def _pass_token_shapes(text: str) -> str:
+    return _TOKEN_SHAPES.sub("[REDACTED]", text)
+
+
 # The pattern passes. Each one is complete on its own (none relies on another having run first), so that the result
 # does not depend on their order; ``redact`` applies the scheme pass first.
-_PATTERN_PASSES = (_pass_scheme, _pass_field_colon, _pass_field_eq)
+_PATTERN_PASSES = (_pass_scheme, _pass_userinfo, _pass_token_shapes, _pass_field_colon, _pass_field_eq)
 
 
 def is_sensitive_name(key) -> bool:
@@ -2410,6 +2478,17 @@ def get_git_branch(paper_dir: Path) -> str | None:
         return None
 
 
+def url_has_userinfo(url) -> bool:
+    """True when ``url`` is ``scheme://[userinfo@]host...`` with a userinfo (a user, a user:password or a token)."""
+    return isinstance(url, str) and _URL_USERINFO.search(url) is not None
+
+
+def strip_url_userinfo(url: str) -> str:
+    """``url`` without the userinfo of every ``scheme://userinfo@host`` in it (the one place a USED value is
+    sanitised: only the code URL derived from a git remote; redaction of printed text is a different mechanism)."""
+    return _URL_USERINFO.sub(lambda m: m.group("scheme"), url)
+
+
 def resolve_code_url(paper_dir: Path, config: dict) -> str:
     """Return the GitHub URL of the paper's code directory, or "" when it has none.
 
@@ -2422,6 +2501,10 @@ def resolve_code_url(paper_dir: Path, config: dict) -> str:
     code_url = (config.get("code_url") or "").strip()
     has_code_dir = (paper_dir / "code").is_dir()
     if code_url:
+        if url_has_userinfo(code_url):
+            die("Error: the \"code_url\" of zenodo.json carries credentials (a user name, a password or a token before "
+                "the host): it would be written into the public Zenodo record. Remove them from zenodo.json. "
+                "Nothing was sent.")
         return code_url
     if not has_code_dir:
         return ""
@@ -2430,6 +2513,12 @@ def resolve_code_url(paper_dir: Path, config: dict) -> str:
         ["git", "-C", str(paper_dir), "config", "--get", "remote.origin.url"],
         capture_output=True, text=True, env=git_env(),
     ).stdout.strip()
+    if url_has_userinfo(remote):
+        # A remote written with credentials (https://user:TOKEN@github.com/...) is NOT refused: the code URL is derived
+        # from the remote WITHOUT them, so that they can never reach the public record (printed text and journals
+        # show the remote with its password masked).
+        print("  Note: the git remote of this paper carries credentials; the code URL is derived without them.")
+        remote = strip_url_userinfo(remote)
     slug = re.sub(r"^(?:https://github\.com/|git@github\.com:)|(?:\.git)$", "", remote)
     if remote and re.fullmatch(r"[\w.-]+/[\w.-]+", slug):
         return f"https://github.com/{slug}/tree/main/code"
