@@ -636,7 +636,11 @@ def resolve_code_url(paper_dir: Path, config: dict) -> str:
     ).stdout.strip()
     slug = re.sub(r"^(?:https://github\.com/|git@github\.com:)|(?:\.git)$", "", remote)
     if remote and re.fullmatch(r"[\w.-]+/[\w.-]+", slug):
-        return f"https://github.com/{slug}/tree/main/code"
+        # Pin to the commit being deposited so the link keeps pointing at this version's code.
+        head = subprocess.run(["git", "-C", str(paper_dir), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        ref = head if re.fullmatch(r"[0-9a-f]{40}", head) else "main"
+        return f"https://github.com/{slug}/tree/{ref}/code"
 
     sys.exit(
         f"Error: {paper_dir.name} has a code/ directory but no resolvable code URL.\n"
@@ -672,15 +676,12 @@ def build_metadata(title: str, abstract: str, keywords: list[str], web_url: str,
             "scheme": "url",
             "resource_type": "other",
         })
-    if code_url:
-        related.append({
-            "identifier": code_url,
-            "relation": "isSupplementedBy",
-            "scheme": "url",
-            "resource_type": "software",
-        })
     if related:
         meta["related_identifiers"] = related
+    if code_url:
+        # Zenodo's Software section ("Repository URL") is the CodeMeta custom field below,
+        # not a related identifier.
+        meta["custom"] = {"code:codeRepository": code_url}
     return meta
 
 
